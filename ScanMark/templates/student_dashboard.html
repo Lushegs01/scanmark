@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container mt-5">
+    
+    <div class="row mb-5 align-items-center">
+        <div class="col-md-8">
+            <h2 class="fw-bold" style="color: var(--scanmark-green);">Student Dashboard</h2>
+            <p class="text-muted">Welcome, <span class="fw-bold text-dark">{{ current_user.full_name }}</span></p>
+        </div>
+        <div class="col-md-4 text-md-end">
+            <span class="badge bg-secondary p-2">{{ current_user.matric_no }}</span>
+        </div>
+    </div>
+
+    <div class="row justify-content-center">
+        <div class="col-md-8 col-lg-6">
+            <div class="card shadow-lg border-0 text-center p-5">
+                <div class="card-body">
+                    <div class="mb-4">
+                        <div class="bg-light rounded-circle d-inline-flex align-items-center justify-content-center" style="width: 100px; height: 100px;">
+                            <span style="font-size: 3rem;">📷</span>
+                        </div>
+                    </div>
+                    
+                    <h3 class="fw-bold mb-3">Mark Attendance</h3>
+                    <p class="text-muted mb-4">
+                        Ensure you are in the lecture hall and have granted location permissions.
+                    </p>
+
+                    <a href="/scan_page" class="btn btn-primary btn-lg w-100 py-3 shadow-sm">
+                        SCAN QR CODE
+                    </a>
+                </div>
+                <div class="card-footer bg-white border-0 mt-3">
+                    <small class="text-muted">
+                        <span class="text-success">●</span> System Online & Ready
+                    </small>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="row mt-5 justify-content-center">
+        <div class="col-md-8 text-center">
+            <p class="text-muted small">
+                Need to see your history? Ask your lecturer for the attendance log.
+            </p>
+        </div>
+    </div>
+
+</div>
+{% endblock %}

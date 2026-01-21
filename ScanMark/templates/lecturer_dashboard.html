@@ -1,0 +1,98 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container mt-5">
+    
+    <div class="d-flex justify-content-between align-items-center mb-5">
+        <div>
+            <h2 class="fw-bold" style="color: var(--scanmark-green);">Dashboard</h2>
+            <p class="text-muted">Manage your classes and attendance records</p>
+        </div>
+        
+        <button class="btn btn-primary shadow-sm" data-bs-toggle="modal" data-bs-target="#addCourseModal">
+            <span class="me-2">＋</span> Create New Class
+        </button>
+    </div>
+
+    <div class="row">
+        {% if courses|length == 0 %}
+            <div class="col-12 text-center py-5">
+                <div class="text-muted mb-3" style="font-size: 3rem;">📂</div>
+                <h4>No classes yet</h4>
+                <p class="text-muted">Click the button above to create your first class.</p>
+            </div>
+        {% else %}
+            {% for course in courses %}
+            <div class="col-md-6 col-lg-4 mb-4">
+                <div class="card h-100 shadow-sm border-0">
+                    <div class="card-header bg-white border-bottom-0 pt-4 px-4">
+                        <div class="d-flex justify-content-between align-items-start">
+                            <div>
+                                <h4 class="mb-0 fw-bold">{{ course.code }}</h4>
+                                <small class="text-muted">{{ course.title }}</small>
+                            </div>
+                            <div class="bg-light rounded-circle p-2 text-center" style="width: 40px; height: 40px;">
+                                📚
+                            </div>
+                        </div>
+                    </div>
+                    <div class="card-body px-4 pb-4">
+                        <div class="d-grid gap-2 mt-3">
+                            <a href="/course/{{ course.id }}/live" class="btn btn-primary">
+                                🚀 Start Attendance
+                            </a>
+                            
+                            <div class="row g-2 mt-2">
+                                <div class="col-4">
+                                    <a href="/course/{{ course.id }}/attendance" class="btn btn-outline-secondary w-100 btn-sm" title="View List">
+                                        📋 List
+                                    </a>
+                                </div>
+                                <div class="col-4">
+                                    <a href="/course/{{ course.id }}/download_csv" class="btn btn-outline-success w-100 btn-sm" title="Download CSV">
+                                        📥 CSV
+                                    </a>
+                                </div>
+                                <div class="col-4">
+                                    <form action="/delete_course/{{ course.id }}" method="POST" onsubmit="return confirm('Are you sure? This will delete the course and ALL its attendance records forever!');">
+                                        <button type="submit" class="btn btn-outline-danger w-100 btn-sm" title="Delete Course">
+                                            🗑 Del
+                                        </button>
+                                    </form>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            {% endfor %}
+        {% endif %}
+    </div>
+</div>
+
+<div class="modal fade" id="addCourseModal" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content border-0 shadow-lg">
+            <div class="modal-header bg-success text-white">
+                <h5 class="modal-title fw-bold">Add New Course</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <form action="/add_course" method="POST">
+                <div class="modal-body p-4">
+                    <div class="mb-3">
+                        <label class="form-label fw-bold small text-muted">COURSE CODE</label>
+                        <input type="text" name="code" class="form-control form-control-lg" placeholder="e.g. CSC 201" required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label fw-bold small text-muted">COURSE TITLE</label>
+                        <input type="text" name="title" class="form-control form-control-lg" placeholder="e.g. Intro to Computer Science" required>
+                    </div>
+                </div>
+                <div class="modal-footer border-0 p-4">
+                    <button type="submit" class="btn btn-primary w-100">Create Course</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+{% endblock %}

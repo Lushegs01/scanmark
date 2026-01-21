@@ -1,0 +1,119 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container mt-5">
+    <div class="row align-items-center justify-content-center">
+        
+        <div class="col-md-5 mb-4 d-none d-md-block">
+            <h1 class="display-4 fw-bold" style="color: var(--scanmark-green);">
+                Join <span style="color: var(--scanmark-gold);">ScanMark</span>
+            </h1>
+            <p class="lead text-muted mt-3">
+                Create your account to start managing or marking attendance instantly.
+            </p>
+            <div class="mt-4">
+                <div class="card bg-light border-0 p-3 mb-3">
+                    <div class="d-flex align-items-center">
+                        <span class="fs-4 me-3">🎓</span>
+                        <div>
+                            <h6 class="mb-0 fw-bold">For Students</h6>
+                            <small class="text-muted">Mark attendance & track your history.</small>
+                        </div>
+                    </div>
+                </div>
+                <div class="card bg-light border-0 p-3">
+                    <div class="d-flex align-items-center">
+                        <span class="fs-4 me-3">👨‍🏫</span>
+                        <div>
+                            <h6 class="mb-0 fw-bold">For Lecturers</h6>
+                            <small class="text-muted">Create classes & export CSV reports.</small>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="col-md-5">
+            <div class="card shadow-lg border-0 p-4">
+                <div class="card-body">
+                    <div class="text-center mb-4">
+                        <h3 class="fw-bold">Create Account</h3>
+                        <p class="text-muted small">Fill in your details to get started</p>
+                    </div>
+
+                    <form method="POST" action="/signup">
+                        <div class="mb-3">
+                            <label class="form-label fw-bold small text-muted">FULL NAME</label>
+                            <input type="text" name="full_name" class="form-control" placeholder="John Doe" required>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label fw-bold small text-muted">EMAIL ADDRESS</label>
+                           <input type="email" name="email" class="form-control" placeholder="name@student.funaab.edu.ng" required>
+<small class="text-muted">Must use school email (@funaab.edu.ng)</small>
+                        <div class="mb-3">
+                            <label class="form-label fw-bold small text-muted">PASSWORD</label>
+                            <input type="password" name="password" class="form-control" placeholder="••••••••" required>
+                        </div>
+
+                        <div class="mb-3">
+                            <label class="form-label fw-bold small text-muted">I AM A...</label>
+                            <select class="form-select" name="role" id="roleSelect" onchange="toggleStudentFields()" required>
+                                <option value="student">Student</option>
+                                <option value="lecturer">Lecturer</option>
+                            </select>
+                        </div>
+
+                        <div id="studentFields">
+                            <div class="row g-2 mb-3">
+                                <div class="col-7">
+                                    <label class="form-label fw-bold small text-muted">MATRIC NO</label>
+                                    <input type="text" name="matric_no" class="form-control" placeholder="2021/..." id="matricInput">
+                                </div>
+                                <div class="col-5">
+                                    <label class="form-label fw-bold small text-muted">LEVEL</label>
+                                    <select name="level" class="form-select" id="levelInput">
+                                        <option value="100">100</option>
+                                        <option value="200">200</option>
+                                        <option value="300">300</option>
+                                        <option value="400">400</option>
+                                        <option value="500">500</option>
+                                    </select>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <div class="d-grid gap-2 mt-4">
+                            <button type="submit" class="btn btn-primary btn-lg shadow-sm">
+                                Sign Up
+                            </button>
+                        </div>
+                    </form>
+
+                    <div class="text-center mt-4">
+                        <p class="small text-muted">
+                            Already have an account? <a href="/login" class="text-decoration-none fw-bold" style="color: var(--scanmark-green);">Login here</a>
+                        </p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+    </div>
+</div>
+
+<script>
+    function toggleStudentFields() {
+        const role = document.getElementById('roleSelect').value;
+        const fields = document.getElementById('studentFields');
+        const matric = document.getElementById('matricInput');
+        
+        if (role === 'student') {
+            fields.style.display = 'block';
+            matric.required = true;
+        } else {
+            fields.style.display = 'none';
+            matric.required = false;
+        }
+    }
+</script>
+{% endblock %}

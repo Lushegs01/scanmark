@@ -1,0 +1,102 @@
+/* static/style.css */
+
+/* --- 1. THE FUNAAB PALETTE --- */
+:root {
+    --scanmark-green: #005A2B; /* Deep Academic Green */
+    --scanmark-gold: #FFD700;  /* Vibrant Gold */
+    --scanmark-dark: #1a1a1a;
+    --scanmark-light: #f4f6f8;
+}
+
+/* --- 2. TYPOGRAPHY --- */
+/* We will use 'Poppins' for a modern app feel */
+body {
+    font-family: 'Poppins', sans-serif;
+    background-color: var(--scanmark-light);
+    color: var(--scanmark-dark);
+}
+
+h1, h2, h3, h4, h5, h6 {
+    font-weight: 600;
+}
+
+/* --- 3. CUSTOM NAVBAR --- */
+.navbar-custom {
+    background: var(--scanmark-green);
+    box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+    padding: 15px 0;
+}
+
+.navbar-brand {
+    font-weight: 700;
+    font-size: 1.5rem;
+    color: white !important;
+}
+
+.brand-gold {
+    color: var(--scanmark-gold);
+}
+
+.nav-link {
+    color: rgba(255,255,255,0.9) !important;
+    font-weight: 500;
+    transition: all 0.3s;
+}
+
+.nav-link:hover {
+    color: var(--scanmark-gold) !important;
+    transform: translateY(-2px);
+}
+
+/* --- 4. MODERN CARDS --- */
+.card {
+    border: none;
+    border-radius: 15px;
+    box-shadow: 0 10px 20px rgba(0,0,0,0.05);
+    overflow: hidden;
+    transition: transform 0.3s;
+}
+
+/* .card:hover {
+    transform: translateY(-5px);
+} */
+
+.card-header {
+    background-color: white;
+    border-bottom: 1px solid #eee;
+    font-weight: 700;
+    color: var(--scanmark-green);
+}
+
+/* --- 5. BETTER BUTTONS --- */
+.btn {
+    border-radius: 50px; /* Pill shape */
+    padding: 10px 25px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    font-size: 0.9rem;
+    transition: all 0.3s ease;
+}
+
+.btn-primary {
+    background-color: var(--scanmark-green);
+    border: 2px solid var(--scanmark-green);
+    color: white;
+}
+
+.btn-primary:hover {
+    background-color: #004420;
+    border-color: #004420;
+    box-shadow: 0 4px 15px rgba(0,90,43,0.4);
+}
+
+.btn-outline-primary {
+    color: var(--scanmark-green);
+    border-color: var(--scanmark-green);
+}
+
+.btn-outline-primary:hover {
+    background-color: var(--scanmark-green);
+    color: white;
+}
