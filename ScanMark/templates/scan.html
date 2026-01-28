@@ -1,0 +1,124 @@
+<script src="https://unpkg.com/html5-qrcode" type="text/javascript"></script>
+
+<script>
+    let html5QrCode;
+
+    function startScanner() {
+        // 1. Reveal the Camera Box
+        document.getElementById('reader').style.display = 'block';
+
+        // 2. Configure "Google Lens" Specs (4K + Autofocus)
+        const config = {
+            fps: 10,
+            qrbox: { width: 250, height: 250 },
+            videoConstraints: {
+                facingMode: "environment",
+                width: { ideal: 4096 }, // Requests Max 4K Resolution
+                height: { ideal: 2160 },
+                focusMode: "continuous" // Critical for autofocus
+            }
+        };
+
+        html5QrCode = new Html5Qrcode("reader");
+
+        // 3. Start the Camera
+        html5QrCode.start(
+            { facingMode: "environment" },
+            config,
+            (decodedText, decodedResult) => {
+                // --- SUCCESS: QR CODE FOUND ---
+                console.log(`Code Scanned: ${decodedText}`);
+
+                // Stop camera immediately so it doesn't scan 50 times
+                html5QrCode.stop().then(() => {
+                    document.getElementById('reader').style.display = 'none';
+                    document.getElementById('zoom-container').style.display = 'none';
+
+                    // Send data to your Python backend
+                    sendAttendance(decodedText);
+                });
+            },
+            (errorMessage) => {
+                // Camera is looking... ignore errors
+            }
+        ).then(() => {
+            // 4. ACTIVATE ZOOM SLIDER (If phone supports it)
+            enableZoom();
+        }).catch(err => {
+            alert("Camera Error: " + err);
+        });
+    }
+
+    function enableZoom() {
+        // Wait 1s for camera to stabilize
+        setTimeout(() => {
+            const videoElement = document.querySelector("#reader video");
+            if (!videoElement) return;
+
+            // Get the video track to control zoom
+            const track = videoElement.srcObject.getVideoTracks()[0];
+            const capabilities = track.getCapabilities();
+            const settings = track.getSettings();
+
+            // Check if hardware supports zoom
+            if (capabilities.zoom) {
+                const zoomControl = document.getElementById("zoom-slider");
+                const zoomContainer = document.getElementById("zoom-container");
+                const zoomValueDisplay = document.getElementById("zoom-value");
+
+                // Show Slider
+                zoomContainer.style.display = "block";
+                zoomControl.min = capabilities.zoom.min;
+                zoomControl.max = capabilities.zoom.max;
+                zoomControl.step = capabilities.zoom.step;
+                zoomControl.value = settings.zoom || 1;
+
+                // Listen for slider movement
+                zoomControl.oninput = function () {
+                    zoomValueDisplay.innerText = this.value + "x";
+                    track.applyConstraints({
+                        advanced: [{ zoom: parseFloat(this.value) }]
+                    });
+                };
+            }
+        }, 1000);
+    }
+
+    function sendAttendance(qrData) {
+        // Even though your Logic is in Python, JS must COLLECT the location first!
+        if (!navigator.geolocation) {
+            alert("Geolocation is not supported by your browser");
+            return;
+        }
+
+        alert("Verifying Location... 🌍");
+
+        navigator.geolocation.getCurrentPosition(position => {
+            const lat = position.coords.latitude;
+            const lon = position.coords.longitude;
+
+            // Send QR + Location to your existing app.py
+            fetch('/mark_attendance', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    qr_code: qrData,
+                    latitude: lat,
+                    longitude: lon
+                })
+            })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.status === 'success') {
+                        alert("✅ Attendance Marked!");
+                        location.reload(); // Refresh to update the table
+                    } else {
+                        alert("❌ " + data.message);
+                    }
+                });
+
+        }, () => {
+            alert("❌ Location access denied. Cannot mark attendance.");
+        });
+    }
+</script>
