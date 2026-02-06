@@ -8,13 +8,27 @@
             <p class="text-muted">Welcome back, {{ current_user.full_name }}</p>
         </div>
         <div class="col-md-4 text-end">
-            <a href="{{ url_for('scan_page') }}" class="btn btn-success btn-lg shadow-sm">
+            <button onclick="startScanner()" class="btn btn-success btn-lg shadow-sm">
                 📷 Scan QR Code
-            </a>
+            </button>
         </div>
     </div>
 
-    <div class="card shadow-sm border-0">
+    <div class="row justify-content-center">
+        <div class="col-md-8">
+            <div id="reader" style="width: 100%; border-radius: 15px; overflow: hidden; display:none; border: 3px solid #198754;"></div>
+            
+            <div id="zoom-container" style="display:none; margin-top: 15px; background: #f8f9fa; padding: 15px; border-radius: 10px; text-align: center;">
+                <label for="zoom-slider" style="font-weight: bold; color: #198754; font-size: 1.1rem;">
+                    🔍 Zoom Level: <span id="zoom-value">1.0x</span>
+                </label>
+                <br>
+                <input type="range" id="zoom-slider" min="1" max="5" step="0.1" value="1" style="width: 80%; height: 25px; accent-color: #198754; cursor: pointer;">
+            </div>
+        </div>
+    </div>
+
+    <div class="card shadow-sm border-0 mt-5">
         <div class="card-header bg-white py-3">
             <h5 class="mb-0 fw-bold text-success">📊 My Attendance Records</h5>
         </div>
@@ -50,10 +64,149 @@
             <div class="text-center py-5">
                 <span style="font-size: 3rem;">📭</span>
                 <p class="mt-3 text-muted">You haven't marked attendance for any courses yet.</p>
-                <a href="{{ url_for('scan_page') }}" class="btn btn-outline-success btn-sm">Start Scanning</a>
             </div>
             {% endif %}
         </div>
     </div>
 </div>
+
+<script src="https://unpkg.com/html5-qrcode" type="text/javascript"></script>
+
+<script>
+    let html5QrCode;
+
+    function startScanner() {
+        // Show the camera box
+        document.getElementById('reader').style.display = 'block';
+
+        // --- CONFIGURATION: The "Google Lens" Specs ---
+        const config = {
+            fps: 10,
+            qrbox: { width: 250, height: 250 },
+            
+            // 1. NATIVE ENGINE FLAG: Use Android's built-in scanner if available
+            useBarCodeDetectorIfSupported: true,
+
+            // 2. 4K RESOLUTION FORCE: Ask for maximum pixels
+            videoConstraints: {
+                facingMode: "environment", // Back Camera
+                width: { ideal: 4096 },    // 4K Width
+                height: { ideal: 2160 },   // 4K Height
+                focusMode: "continuous"    // Autofocus
+            }
+        };
+
+        html5QrCode = new Html5Qrcode("reader");
+
+        // Start the Camera
+        html5QrCode.start(
+            { facingMode: "environment" }, 
+            config,
+            (decodedText, decodedResult) => {
+                // --- SUCCESS: QR Code Found ---
+                console.log(`Code Scanned: ${decodedText}`);
+                
+                // Stop the camera immediately
+                html5QrCode.stop().then(() => {
+                    document.getElementById('reader').style.display = 'none';
+                    document.getElementById('zoom-container').style.display = 'none';
+                    
+                    // Send data to backend
+                    processAttendance(decodedText); 
+                });
+            },
+            (errorMessage) => {
+                // Scanning... ignore errors
+            }
+        ).then(() => {
+            // --- SUCCESSFUL START: NOW CHECK FOR ZOOM ---
+            enableZoom();
+        }).catch(err => {
+            alert("Camera Error: " + err);
+        });
+    }
+
+    // --- 3. MANUAL ZOOM SLIDER LOGIC ---
+    function enableZoom() {
+        // Wait 1 second for the camera hardware to wake up fully
+        setTimeout(() => {
+            const videoElement = document.querySelector("#reader video");
+            if (!videoElement) return;
+
+            // Get the video track (the connection to the hardware lens)
+            // We try two methods to ensure compatibility across browsers
+            const track = html5QrCode.scanner?.html5QrCode?.localMediaStream?.getVideoTracks()[0] 
+                       || videoElement.srcObject?.getVideoTracks()[0];
+
+            if (track) {
+                const capabilities = track.getCapabilities();
+                const settings = track.getSettings();
+
+                // Check if this specific phone supports Zoom
+                if (capabilities.zoom) {
+                    const zoomControl = document.getElementById("zoom-slider");
+                    const zoomContainer = document.getElementById("zoom-container");
+                    const zoomValueDisplay = document.getElementById("zoom-value");
+
+                    // Reveal the slider
+                    zoomContainer.style.display = "block";
+                    zoomControl.min = capabilities.zoom.min;
+                    zoomControl.max = capabilities.zoom.max;
+                    zoomControl.step = capabilities.zoom.step || 0.1;
+                    zoomControl.value = settings.zoom || 1;
+
+                    // When the user slides the bar...
+                    zoomControl.oninput = function () {
+                        zoomValueDisplay.innerText = this.value + "x";
+                        // Send the command to the hardware lens
+                        track.applyConstraints({
+                            advanced: [{ zoom: parseFloat(this.value) }]
+                        });
+                    };
+                }
+            }
+        }, 1000);
+    }
+
+    function processAttendance(qrData) {
+        // Check for GPS support
+        if (!navigator.geolocation) {
+            alert("Geolocation is not supported by your browser");
+            return;
+        }
+
+        alert("Code Scanned! Verifying Location... 🌍");
+
+        navigator.geolocation.getCurrentPosition(position => {
+            const lat = position.coords.latitude;
+            const lon = position.coords.longitude;
+
+            // Send QR + GPS to your Python Backend
+            fetch('/mark_attendance', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    qr_code: qrData,
+                    latitude: lat,
+                    longitude: lon
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    alert("✅ Success: " + data.message);
+                    location.reload(); // Refresh to see the new count
+                } else {
+                    alert("❌ Error: " + data.message);
+                }
+            })
+            .catch(error => {
+                alert("Server Error: " + error);
+            });
+
+        }, () => {
+            alert("❌ Location access denied! We cannot verify your attendance.");
+        });
+    }
+</script>
 {% endblock %}
