@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="container mt-4">
+    <h3>📊 Analytics: {{ course.code }}</h3>
+
+    <div class="row mb-4">
+        <div class="col-md-4">
+            <div class="card p-3 text-center bg-light">
+                <h1>{{ data.average }}%</h1>
+                <p>Average Attendance</p>
+            </div>
+        </div>
+        <div class="col-md-4">
+            <div class="card p-3 text-center bg-light">
+                <h1>{{ data.total_enrolled }}</h1>
+                <p>Students Enrolled</p>
+            </div>
+        </div>
+    </div>
+
+    <div class="card p-3">
+        <h5>Attendance Trend (Last 30 Days)</h5>
+        <canvas id="attendanceChart"></canvas>
+    </div>
+</div>
+
+<script>
+    const ctx = document.getElementById('attendanceChart');
+
+    new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: {{ data.dates | tojson }},  // Python List -> JS Array
+        datasets: [{
+            label: 'Students Present',
+            data: {{ data.counts | tojson }},
+        borderColor: '#0d6efd', // Bootstrap Blue
+        tension: 0.4,           // Makes the line curvy/smooth
+        fill: true,
+        backgroundColor: 'rgba(13, 110, 253, 0.1)'
+            }]
+        },
+        options: {
+        responsive: true,
+        scales: {
+            y: { beginAtZero: true, suggestedMax: {{ data.total_enrolled }} }
+            }
+        }
+    });
+</script>
+{% endblock %}

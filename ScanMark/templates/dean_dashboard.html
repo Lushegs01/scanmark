@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container mt-4">
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <div>
+            <h2 class="text-success fw-bold">🎓 Dean's Dashboard</h2>
+            <p class="text-muted">Faculty: <strong>{{ faculty }}</strong></p>
+        </div>
+    </div>
+
+    <div class="row text-center mb-5">
+        <div class="col-md-6">
+            <div class="card text-white bg-success mb-3 shadow-sm">
+                <div class="card-body">
+                    <h1 class="display-4 fw-bold">{{ courses|length }}</h1>
+                    <p class="card-text">Total Faculty Courses</p>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-6">
+            <div class="card text-white bg-secondary mb-3 shadow-sm">
+                <div class="card-body">
+                    <h1 class="display-4 fw-bold">{{ lecturers|length }}</h1>
+                    <p class="card-text">Total Lecturers</p>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
