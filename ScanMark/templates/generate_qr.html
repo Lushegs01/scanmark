@@ -5,47 +5,99 @@
     <div class="card shadow-lg p-5">
         <h2 class="mb-3">Scan to Mark Attendance</h2>
         <h4 class="text-success">{{ course.code }} - {{ course.title }}</h4>
-        <p class="text-muted">Code refreshes every 5 seconds for security.</p>
         
-        <div class="my-4">
+        <p class="text-muted">
+            Code refreshes in <span id="timer" class="fw-bold text-danger">5</span>s
+        </button>
+
+        <div class="my-4 position-relative">
             <img id="qrImage" src="{{ url_for('get_qr_image', course_id=course.id) }}" 
-                 alt="QR Code" style="width: 300px; height: 300px; border: 5px solid #198754;">
+                 alt="QR Code" style="width: 300px; height: 300px; border: 5px solid #198754; border-radius: 10px;">
+            
+            <div id="loadingSpinner" class="position-absolute top-50 start-50 translate-middle" style="display:none;">
+                <div class="spinner-border text-success" role="status"></div>
+            </div>
         </div>
 
-        <div class="alert alert-info">
-            <strong>Lecturer Location:</strong> <span id="locationStatus">Acquiring...</span>
+        <div class="alert alert-info d-flex align-items-center justify-content-center gap-2">
+            <span class="spinner-grow spinner-grow-sm text-danger" role="status"></span>
+            <strong>Lecturer Location:</strong> 
+            <span id="locationStatus">Acquiring GPS...</span>
         </div>
 
-        <a href="{{ url_for('dashboard') }}" class="btn btn-danger mt-3">Stop Attendance</a>
+        <form action="{{ url_for('end_class', course_id=course.id) }}" method="POST">
+            <button type="submit" class="btn btn-danger btn-lg mt-3 w-100">
+                🛑 End Class & Stop Tracking
+            </button>
+        </form>
     </div>
 </div>
 
 <script>
-    // 1. Refresh QR Code every 5 seconds to prevent sharing
-    setInterval(function() {
-        var img = document.getElementById('qrImage');
-        // We add a random number (?t=...) to force the browser to reload the image
-        img.src = "{{ url_for('get_qr_image', course_id=course.id) }}" + "?t=" + new Date().getTime();
-    }, 5000);
+    // --- 1. ROBUST AUTO-REFRESH LOGIC ---
+    let timeLeft = 5;
+    const timerElement = document.getElementById('timer');
+    const qrImage = document.getElementById('qrImage');
 
-    // 2. Get Lecturer's GPS Location (To set the Geofence)
-    if (navigator.geolocation) {
-        navigator.geolocation.getCurrentPosition(function(position) {
-            var lat = position.coords.latitude;
-            var lon = position.coords.longitude;
-            document.getElementById('locationStatus').innerText = "Active (" + lat.toFixed(4) + ", " + lon.toFixed(4) + ")";
-            
-            // Send location to server
-            fetch("/set_location/{{ course.id }}", {
-                method: "POST",
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({lat: lat, lon: lon})
-            });
-        }, function(error) {
-            document.getElementById('locationStatus').innerText = "GPS Error: " + error.message;
-        });
-    } else {
-        document.getElementById('locationStatus').innerText = "Geolocation not supported by this browser.";
+    // Update the countdown every second
+    setInterval(() => {
+        timeLeft--;
+        timerElement.innerText = timeLeft;
+        
+        if (timeLeft <= 0) {
+            refreshQR();
+            timeLeft = 5; // Reset timer
+        }
+    }, 1000);
+
+    function refreshQR() {
+        // Force browser to reload image by adding a random timestamp
+        const newSrc = "{{ url_for('get_qr_image', course_id=course.id) }}" + "?t=" + new Date().getTime();
+        qrImage.src = newSrc;
     }
+
+    // --- 2. GPS LOCATION (THE GEOFENCE SETTER) ---
+    function setClassLocation() {
+        if (navigator.geolocation) {
+            navigator.geolocation.getCurrentPosition(function(position) {
+                const lat = position.coords.latitude;
+                const lon = position.coords.longitude;
+
+                // Update UI
+                document.getElementById('locationStatus').innerText = 
+                    `Active (${lat.toFixed(4)}, ${lon.toFixed(4)})`;
+                document.getElementById('locationStatus').classList.add('text-success', 'fw-bold');
+
+                // Send to Server
+                fetch("/set_location/{{ course.id }}", {
+                    method: "POST",
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ lat: lat, lon: lon })
+                })
+                .then(res => res.json())
+                .then(data => console.log("✅ Location Set:", data))
+                .catch(err => console.error("❌ Location Error:", err));
+
+            }, function(error) {
+                let msg = "Unknown GPS Error";
+                if (error.code === 1) msg = "Permission Denied";
+                if (error.code === 2) msg = "Position Unavailable";
+                if (error.code === 3) msg = "Timeout";
+                
+                document.getElementById('locationStatus').innerText = "⚠️ " + msg;
+                document.getElementById('locationStatus').classList.add('text-danger');
+            }, {
+                enableHighAccuracy: true, // Request best possible GPS
+                timeout: 10000,
+                maximumAge: 0
+            });
+        } else {
+            document.getElementById('locationStatus').innerText = "Geolocation not supported.";
+        }
+    }
+
+    // Run immediately on load
+    setClassLocation();
+
 </script>
 {% endblock %}
