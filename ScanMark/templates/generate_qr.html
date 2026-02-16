@@ -10,13 +10,16 @@
             Code refreshes in <span id="timer" class="fw-bold text-danger">5</span>s
         </button>
 
-        <div class="my-4 position-relative">
+        <div class="my-4">
             <img id="qrImage" src="{{ url_for('get_qr_image', course_id=course.id) }}" 
                  alt="QR Code" style="width: 300px; height: 300px; border: 5px solid #198754; border-radius: 10px;">
             
-            <div id="loadingSpinner" class="position-absolute top-50 start-50 translate-middle" style="display:none;">
-                <div class="spinner-border text-success" role="status"></div>
-            </div>
+          
+        <div class="alert alert-info">
+            <strong>Lecturer Location:</strong> <span id="locationStatus">Acquiring...</span>
+        </div>
+
+        <a href="{{ url_for('dashboard') }}" class="btn btn-danger mt-3">Stop Attendance</a>
         </div>
 
         <div class="alert alert-info d-flex align-items-center justify-content-center gap-2">
@@ -25,7 +28,7 @@
             <span id="locationStatus">Acquiring GPS...</span>
         </div>
 
-        <form action="{{ url_for('end_class', course_id=course.id) }}" method="POST">
+        <form action="{{ url_for('dashboard', course_id=course.id) }}" method="POST">
             <button type="submit" class="btn btn-danger btn-lg mt-3 w-100">
                 🛑 End Class & Stop Tracking
             </button>
@@ -101,3 +104,4 @@
 
 </script>
 {% endblock %}
+
