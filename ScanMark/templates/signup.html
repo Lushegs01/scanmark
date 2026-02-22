@@ -1,0 +1,182 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container mt-5">
+    <div class="row align-items-center justify-content-center">
+
+        <div class="col-md-5 mb-4 d-none d-md-block">
+            <h1 class="display-4 fw-bold" style="color: var(--scanmark-green);">
+                Join <span style="color: var(--scanmark-gold);">ScanMark</span>
+            </h1>
+            <p class="lead text-muted mt-3">
+                Create your account to start managing or marking attendance instantly.
+            </p>
+            <div class="mt-4">
+                <div class="card bg-light border-0 p-3 mb-3">
+                    <div class="d-flex align-items-center">
+                        <span class="fs-4 me-3">🎓</span>
+                        <div>
+                            <h6 class="mb-0 fw-bold">For Students</h6>
+                            <small class="text-muted">Mark attendance & track your history.</small>
+                        </div>
+                    </div>
+                </div>
+                <div class="card bg-light border-0 p-3">
+                    <div class="d-flex align-items-center">
+                        <span class="fs-4 me-3">👨‍🏫</span>
+                        <div>
+                            <h6 class="mb-0 fw-bold">For Lecturers</h6>
+                            <small class="text-muted">Create classes & export CSV reports.</small>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="col-md-5">
+            <div class="card shadow-lg border-0 p-4">
+                <div class="card-body">
+                    <div class="text-center mb-4">
+                        <h3 class="fw-bold">Create Account</h3>
+                        <p class="text-muted small">Fill in your details to get started</p>
+                    </div>
+
+                    <div class="d-grid gap-2 mb-3">
+                        <a href="{{ url_for('login_google') }}"
+                            class="btn btn-outline-dark btn-lg d-flex align-items-center justify-content-center shadow-sm">
+                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 48 48"
+                                class="me-2">
+                                <path fill="#FFC107"
+                                    d="M43.611,20.083H42V20H24v8h11.303c-1.649,4.657-6.08,8-11.303,8c-6.627,0-12-5.373-12-12c0-6.627,5.373-12,12-12c3.059,0,5.842,1.154,7.961,3.039l5.657-5.657C34.046,6.053,29.268,4,24,4C12.955,4,4,12.955,4,24c0,11.045,8.955,20,20,20c11.045,0,20-8.955,20-20C44,22.659,43.862,21.35,43.611,20.083z" />
+                                <path fill="#FF3D00"
+                                    d="M6.306,14.691l6.571,4.819C14.655,15.108,18.961,12,24,12c3.059,0,5.842,1.154,7.961,3.039l5.657-5.657C34.046,6.053,29.268,4,24,4C16.318,4,9.656,8.337,6.306,14.691z" />
+                                <path fill="#4CAF50"
+                                    d="M24,44c5.166,0,9.86-1.977,13.409-5.192l-6.19-5.238C29.211,35.091,26.715,36,24,36c-5.202,0-9.619-3.317-11.283-7.946l-6.522,5.025C9.505,39.556,16.227,44,24,44z" />
+                                <path fill="#1976D2"
+                                    d="M43.611,20.083H42V20H24v8h11.303c-0.792,2.237-2.231,4.166-4.087,5.571c0.001-0.001,0.002-0.001,0.003-0.002l6.19,5.238C36.971,39.205,44,34,44,24C44,22.659,43.862,21.35,43.611,20.083z" />
+                            </svg>
+                            Sign up with Google
+                        </a>
+                    </div>
+
+                    <div class="d-flex align-items-center mb-3">
+                        <hr class="flex-grow-1">
+                        <span class="mx-3 text-muted small">OR</span>
+                        <hr class="flex-grow-1">
+                    </div>
+
+                    <form method="POST" action="/signup">
+
+                        <div class="mb-3">
+                            <label class="form-label">Full Name</label>
+                            <input type="text" name="full_name" class="form-control" placeholder="John Doe" required>
+                        </div>
+
+                        <div class="mb-3">
+                            <label class="form-label">Email Address</label>
+                            <input type="email" name="email" class="form-control" placeholder="name@funaab.edu.ng"
+                                required>
+                        </div>
+
+                        <div class="mb-3">
+                            <label class="form-label">Password</label>
+                            <div class="input-group">
+                                <input type="password" name="password" id="passwordInput" class="form-control"
+                                    placeholder="********" required>
+                                <span class="input-group-text" id="togglePassword"
+                                    style="cursor: pointer; background: white;">
+                                    <i class="fa fa-eye" id="eyeIcon"></i>
+                                </span>
+                            </div>
+                        </div>
+
+                        <div class="mb-3">
+                            <label class="form-label">I am a:</label>
+                            <select name="role" id="roleSelector" class="form-select" required
+                                onchange="toggleStudentFields()">
+                                <option value="" selected disabled>Select your role...</option>
+                                <option value="Student">Student</option>
+                                <option value="Lecturer">Lecturer</option>
+                                <option value="Course Coordinator">Course Coordinator</option>
+                            </select>
+                        </div>
+
+                        <div id="studentFields" style="display: none;">
+                            <div class="row">
+                                <div class="col-md-6 mb-3">
+                                    <label class="form-label">Matric No</label>
+                                    <input type="text" name="matric_no" id="matricInput" class="form-control"
+                                        placeholder="2021/...">
+                                </div>
+                                <div class="col-md-6 mb-3">
+                                    <label class="form-label">Level</label>
+                                    <select name="level" id="levelInput" class="form-select">
+                                        <option value="100">100</option>
+                                        <option value="200">200</option>
+                                        <option value="300">300</option>
+                                        <option value="400">400</option>
+                                        <option value="500">500</option>
+                                    </select>
+                                </div>
+                            </div>
+                        </div>
+
+                        <button type="submit" class="btn btn-success w-100">Sign Up</button>
+                    </form>
+
+                    <div class="text-center mt-4">
+                        <p class="small text-muted">
+                            Already have an account? <a href="/login" class="text-decoration-none fw-bold"
+                                style="color: var(--scanmark-green);">Login here</a>
+                        </p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+    </div>
+</div>
+
+<script>
+    // --- 1. Logic to Show/Hide Student Fields ---
+    function toggleStudentFields() {
+        var role = document.getElementById("roleSelector").value;
+        var studentDiv = document.getElementById("studentFields");
+        var matric = document.getElementById("matricInput");
+        var level = document.getElementById("levelInput");
+
+        if (role === "Student") {
+            // Show fields and make them REQUIRED
+            studentDiv.style.display = "block";
+            matric.required = true;
+            level.required = true;
+        } else {
+            // Hide fields and make them NOT required (so Staff can submit)
+            studentDiv.style.display = "none";
+            matric.required = false;
+            level.required = false;
+            matric.value = ""; // Clear any typed data
+        }
+    }
+
+    // --- 2. Logic for Password Eye Toggle ---
+    const togglePassword = document.querySelector('#togglePassword');
+    const password = document.querySelector('#passwordInput');
+    const icon = document.querySelector('#eyeIcon');
+
+    togglePassword.addEventListener('click', function (e) {
+        // Toggle the type attribute
+        const type = password.getAttribute('type') === 'password' ? 'text' : 'password';
+        password.setAttribute('type', type);
+
+        // Toggle the eye / eye-slash icon
+        if (type === 'text') {
+            icon.classList.remove('fa-eye');
+            icon.classList.add('fa-eye-slash');
+        } else {
+            icon.classList.remove('fa-eye-slash');
+            icon.classList.add('fa-eye');
+        }
+    });
+</script>
+{% endblock %}
