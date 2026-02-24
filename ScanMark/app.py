@@ -1,0 +1,891 @@
+import os
+import io
+import csv
+import time
+import math
+import pyotp
+from datetime import datetime, timedelta
+from authlib.integrations.flask_client import OAuth
+from flask import Flask, render_template, redirect, url_for, flash, request, send_file, jsonify, Response
+from flask_login import LoginManager, login_user, login_required, logout_user, current_user
+from werkzeug.security import generate_password_hash, check_password_hash
+from sqlalchemy import func
+import redis
+from flask_session import Session
+from itsdangerous import URLSafeTimedSerializer
+from flask_mail import Mail, Message
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from flask import send_from_directory
+
+from models import db, User, Course, Attendance
+
+# Initialize Flask App
+app = Flask(__name__)
+
+# --- REDIS SESSION CONFIGURATION ---
+redis_url = os.environ.get('REDIS_URL')
+
+if redis_url:
+    # Use Redis for server-side sessions (Production)
+    app.config['SESSION_TYPE'] = 'redis'
+    app.config['SESSION_PERMANENT'] = False
+    app.config['SESSION_USE_SIGNER'] = True # Adds cryptographic protection
+    app.config['SESSION_REDIS'] = redis.from_url(redis_url)
+    
+    # Initialize the session
+    Session(app)
+    print("🟢 Redis Sessions Enabled")
+else:
+    # Fallback to default secure cookies (Local Development)
+    print("🟡 No REDIS_URL found. Using default cookie sessions.")
+
+# (Keep your existing app.secret_key and other configs below this)
+
+# Store active class locations: { course_id: {'lat': x, 'lon': y} }
+active_class_locations = {}
+
+# --- RATE LIMITER CONFIGURATION ---
+# Use Redis if available (Production), otherwise use local memory (Local Testing)
+limiter_storage = os.environ.get('REDIS_URL', 'memory://')
+
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    storage_uri=limiter_storage,
+    # This acts as a global baseline for ALL routes if we don't specify one
+    default_limits=["200 per day", "50 per hour"] 
+)
+print(f"🛡️ Rate Limiter Active (Storage: {limiter_storage.split(':')[0]})")
+
+# --- FLASK-MAIL CONFIGURATION ---
+app.config['MAIL_SERVER'] = 'smtp.gmail.com'
+app.config['MAIL_PORT'] = 587
+app.config['MAIL_USE_TLS'] = True
+app.config['MAIL_USERNAME'] = os.environ.get('MAIL_USERNAME') 
+app.config['MAIL_PASSWORD'] = os.environ.get('MAIL_PASSWORD')
+app.config['MAIL_DEFAULT_SENDER'] = os.environ.get('MAIL_USERNAME')
+
+mail = Mail(app)
+# CONFIGURATION
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'local_fallback_key')
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///scanmark_v2.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['GOOGLE_CLIENT_ID'] = os.environ.get('GOOGLE_CLIENT_ID', 'paste_your_client_id_here_for_local_testing')
+app.config['GOOGLE_CLIENT_SECRET'] = os.environ.get('GOOGLE_CLIENT_SECRET', 'paste_your_secret_here_for_local_testing')
+oauth = OAuth(app)
+google = oauth.register(
+    name='google',
+    client_id=app.config['GOOGLE_CLIENT_ID'],
+    client_secret=app.config['GOOGLE_CLIENT_SECRET'],
+    server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
+    client_kwargs={
+        'scope': 'openid email profile'
+    }
+)
+
+# This creates secure, timestamped tokens using your app's secret key
+serializer = URLSafeTimedSerializer(app.config['SECRET_KEY'])
+
+# Initialize Extensions
+db.init_app(app)
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = 'login'
+
+
+@app.route('/sw.js')
+def serve_sw():
+    return send_from_directory('static', 'sw.js', mimetype='application/javascript')
+
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
+
+
+# ========== UTILITY FUNCTIONS ==========
+
+def calculate_distance(lat1, lon1, lat2, lon2):
+    """Calculate distance between two coordinates using Haversine formula"""
+    R = 6371000  # Radius of Earth in meters
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    delta_phi = math.radians(lat2 - lat1)
+    delta_lambda = math.radians(lon2 - lon1)
+
+    a = math.sin(delta_phi / 2)**2 + \
+        math.cos(phi1) * math.cos(phi2) * \
+        math.sin(delta_lambda / 2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+    return R * c  # Distance in meters
+
+
+def get_course_analytics(course_id):
+    """Returns attendance stats for a single course"""
+    course = Course.query.get(course_id)
+    if not course:
+        return None
+
+    # Total Enrolled Students
+    total_students = len(course.students) if hasattr(course, 'students') else 0
+    if total_students == 0:
+        return {"dates": [], "counts": [], "average": 0, "total_enrolled": 0}
+
+    # Get Attendance per Date
+    attendance_trends = db.session.query(
+        func.date(Attendance.timestamp), func.count(Attendance.id)
+    ).filter_by(course_id=course_id).group_by(func.date(Attendance.timestamp)).all()
+
+    dates = [str(day[0]) for day in attendance_trends]
+    counts = [day[1] for day in attendance_trends]
+
+    # Calculate Average Attendance %
+    avg_attendance = 0
+    if counts:
+        avg_attendance = (sum(counts) / len(counts) / total_students) * 100
+
+    return {
+        "dates": dates,
+        "counts": counts,
+        "average": round(avg_attendance, 1),
+        "total_enrolled": total_students
+    }
+
+
+def get_department_analytics(dept_name):
+    """Returns comparative stats for HOD"""
+    courses = Course.query.filter_by(department=dept_name).all()
+
+    course_codes = []
+    attendance_rates = []
+
+    for course in courses:
+        stats = get_course_analytics(course.id)
+        if stats:
+            course_codes.append(course.code)
+            attendance_rates.append(stats['average'])
+
+    return {
+        "labels": course_codes,
+        "data": attendance_rates
+    }
+# --- PASSWORD RESET ROUTES ---
+
+@app.route('/forgot_password', methods=['GET', 'POST'])
+def forgot_password():
+    if request.method == 'POST':
+        email = request.form.get('email')
+        user = User.query.filter_by(email=email).first()
+        
+        if user:
+            # 1. Generate a token that is safe to put in a URL
+            # We use a specific 'salt' so this token can only be used for password resets
+            token = serializer.dumps(email, salt='password-reset-salt')
+            
+            # 2. Create the reset link (_external=True makes it a full http:// link)
+            reset_url = url_for('reset_password', token=token, _external=True)
+            
+            # 3. Send the Email
+            msg = Message("Reset Your ScanMark Password",
+                          sender=app.config.get('MAIL_USERNAME'),
+                          recipients=[email])
+            
+            msg.body = f"""Hello {user.full_name},
+
+We received a request to reset your ScanMark password. 
+Click the link below to set a new password:
+
+{reset_url}
+
+This link will expire in 15 minutes. If you did not make this request, you can safely ignore this email.
+"""
+            try:
+                mail.send(msg)
+            except Exception as e:
+                print(f"Error sending email: {e}")
+                
+        # SECURITY FEATURE: Always show this message even if the email doesn't exist
+        # This prevents hackers from using the form to find out which emails are registered.
+        flash("If an account with that email exists, a password reset link has been sent.", "info")
+        return redirect(url_for('login'))
+        
+    return render_template('forgot_password.html')
+
+
+@app.route('/reset_password/<token>', methods=['GET', 'POST'])
+def reset_password(token):
+    try:
+        # Verify the token. max_age=900 means it expires in 15 minutes (900 seconds)
+        email = serializer.loads(token, salt='password-reset-salt', max_age=900)
+    except Exception:
+        # If token is expired, modified, or invalid
+        flash("The password reset link is invalid or has expired. Please request a new one.", "error")
+        return redirect(url_for('forgot_password'))
+
+    if request.method == 'POST':
+        new_password = request.form.get('password')
+        
+        # Find the user and update their password
+        user = User.query.filter_by(email=email).first()
+        if user:
+            user.password = generate_password_hash(new_password, method='pbkdf2:sha256')
+            db.session.commit()
+            
+            flash("Your password has been successfully updated! You can now log in.", "success")
+            return redirect(url_for('login'))
+            
+    return render_template('reset_password.html')
+
+# ========== AUTHENTICATION ROUTES ==========
+
+@app.route('/')
+def home():
+    if current_user.is_authenticated:
+        return redirect(url_for('dashboard'))
+    return redirect(url_for('login'))
+
+# --- GOOGLE OAUTH ROUTES ---
+
+@app.route('/login/google')
+def login_google():
+    # This generates the URL to send the user to Google's login screen
+    redirect_uri = url_for('authorize_google', _external=True)
+    return google.authorize_redirect(redirect_uri)
+
+@app.route('/authorize/google')
+def authorize_google():
+    # 1. Get the token and user info from Google
+    token = google.authorize_access_token()
+    user_info = token.get('userinfo')
+    
+    email = user_info.get('email')
+    full_name = user_info.get('name')
+
+    # 2. ENFORCE FUNAAB EMAIL DOMAINS
+    allowed_domains = ['funaab.edu.ng', 'student.funaab.edu.ng']
+    if not any(email.endswith(domain) for domain in allowed_domains):
+        flash('Access Denied: You must use your official FUNAAB email address.', 'error')
+        return redirect(url_for('login'))
+
+    # 3. Check if user exists in our database
+    user = User.query.filter_by(email=email).first()
+
+    if not user:
+        # Create a new user account automatically without a password
+        user = User(
+            full_name=full_name, 
+            email=email, 
+            password="SSO_USER_NO_PASSWORD", # Dummy password
+            role='student' # Default to student
+        )
+        db.session.add(user)
+        db.session.commit()
+        flash('Account created successfully via Google!', 'success')
+
+    # 4. Log them in
+    login_user(user)
+    
+    # 5. Route them to the correct dashboard
+    role = user.role.lower() if user.role else 'student'
+    if role == 'student':
+        return redirect(url_for('student_dashboard'))
+    elif role == 'lecturer' or role == 'course coordinator':
+        return redirect(url_for('lecturer_dashboard'))
+    elif role == 'hod':
+        return redirect(url_for('hod_dashboard'))
+    else:
+        return redirect(url_for('dashboard'))
+
+@app.route('/login', methods=['GET', 'POST'])
+@limiter.limit("5 per minute", error_message="Too many login attempts. Please try again later.")
+def login():
+    # If already logged in, redirect to appropriate dashboard
+    if current_user.is_authenticated:
+        role = current_user.role.lower() if current_user.role else 'student'
+
+        if role == 'student':
+            return redirect(url_for('student_dashboard'))
+        elif role == 'lecturer':
+            return redirect(url_for('lecturer_dashboard'))
+        elif role == 'course coordinator':
+            return redirect(url_for('lecturer_dashboard'))
+        elif role == 'hod':
+            return redirect(url_for('hod_dashboard'))
+        elif role == 'dean':
+            return redirect(url_for('dean_dashboard'))
+        elif role == 'dap':
+            return redirect(url_for('dap_dashboard'))
+        else:
+            flash(f"Role '{role}' not recognized. Defaulting to Student view.", "warning")
+            return redirect(url_for('student_dashboard'))
+
+    # Handle login form submission
+    if request.method == 'POST':
+        email = request.form.get('email')
+        password = request.form.get('password')
+        user = User.query.filter_by(email=email).first()
+
+        if user and check_password_hash(user.password, password):
+            login_user(user)
+
+            role = user.role.lower() if user.role else 'student'
+
+            if role == 'student':
+                return redirect(url_for('student_dashboard'))
+            elif role == 'lecturer':
+                return redirect(url_for('lecturer_dashboard'))
+            elif role == 'course coordinator':
+                return redirect(url_for('lecturer_dashboard'))
+            elif role == 'hod':
+                return redirect(url_for('hod_dashboard'))
+            elif role == 'dean':
+                return redirect(url_for('dean_dashboard'))
+            elif role == 'dap':
+                return redirect(url_for('dap_dashboard'))
+            else:
+                return redirect(url_for('student_dashboard'))
+        else:
+            flash('Invalid email or password', 'error')
+
+    return render_template('login.html')
+
+
+@app.route('/signup', methods=['GET', 'POST'])
+def signup():
+    if request.method == 'POST':
+        full_name = request.form.get('full_name')
+        email = request.form.get('email')
+        password = request.form.get('password')
+        role = request.form.get('role')
+
+        # Enforce School Email
+        allowed_domains = ['funaab.edu.ng', 'student.funaab.edu.ng']
+        if not any(email.endswith(domain) for domain in allowed_domains):
+            flash('Access Denied: You must use a FUNAAB email address.', 'error')
+            return redirect(url_for('signup'))
+
+        # Check if user already exists
+        user_exists = User.query.filter_by(email=email).first()
+        if user_exists:
+            flash('Email already exists!', 'error')
+            return redirect(url_for('signup'))
+
+        hashed_pw = generate_password_hash(password, method='scrypt')
+        new_user = User(full_name=full_name, email=email, password=hashed_pw, role=role)
+
+        # Add student-specific fields
+        if role.lower() == 'student':
+            new_user.matric_no = request.form.get('matric_no')
+            new_user.level = request.form.get('level')
+
+        db.session.add(new_user)
+        db.session.commit()
+        flash('Account created! Please login.', 'success')
+        return redirect(url_for('login'))
+
+    return render_template('signup.html')
+
+
+@app.route('/logout')
+@login_required
+def logout():
+    logout_user()
+    flash('You have been logged out.', 'info')
+    return redirect(url_for('login'))
+
+
+# ========== DASHBOARD ROUTES ==========
+
+@app.route('/dashboard')
+@login_required
+def dashboard():
+    """Generic dashboard - redirects to role-specific dashboard"""
+    role = current_user.role.lower() if current_user.role else 'student'
+
+    if role == 'student':
+        return redirect(url_for('student_dashboard'))
+    elif role in ['lecturer', 'course coordinator']:
+        return redirect(url_for('lecturer_dashboard'))
+    elif role == 'hod':
+        return redirect(url_for('hod_dashboard'))
+    elif role == 'dean':
+        return redirect(url_for('dean_dashboard'))
+    elif role == 'dap':
+        return redirect(url_for('dap_dashboard'))
+    else:
+        return redirect(url_for('student_dashboard'))
+
+
+@app.route('/student_dashboard')
+@login_required
+def student_dashboard():
+    if current_user.role.lower() != 'student':
+        return redirect(url_for('dashboard'))
+
+    # Get all courses and attendance data
+    all_courses = Course.query.all()
+    attendance_data = []
+
+    for course in all_courses:
+        my_count = Attendance.query.filter_by(
+            student_id=current_user.id,
+            course_id=course.id
+        ).count()
+
+        if my_count > 0:
+            attendance_data.append({
+                'code': course.code,
+                'title': course.title,
+                'count': my_count
+            })
+
+    # Get enrolled courses
+    enrolled_courses = current_user.enrolled_courses if hasattr(current_user, 'enrolled_courses') else []
+
+    return render_template('student_dashboard.html',
+                           attendance_data=attendance_data,
+                           enrolled_courses=enrolled_courses)
+
+
+@app.route('/lecturer_dashboard')
+@login_required
+def lecturer_dashboard():
+    role = current_user.role.lower() if current_user.role else ''
+
+    if role not in ['lecturer', 'course coordinator']:
+        return redirect(url_for('dashboard'))
+
+    # Course Coordinators can create courses
+    if role == 'course coordinator':
+        my_courses = Course.query.filter_by(coordinator_id=current_user.id).all()
+        can_create = True
+    else:
+        # Lecturers see courses they are assigned to
+        my_courses = current_user.teaching_courses if hasattr(current_user, 'teaching_courses') else []
+        can_create = False
+
+    return render_template('lecturer_dashboard.html', courses=my_courses, can_create=can_create)
+
+
+@app.route('/hod_dashboard')
+@login_required
+def hod_dashboard():
+    if current_user.role.lower() != 'hod':
+        return redirect(url_for('login'))
+
+    # Show only courses in the HOD's department
+    my_dept = current_user.department
+    courses = Course.query.filter_by(department=my_dept).all()
+
+    return render_template('hod_dashboard.html', courses=courses, dept=my_dept)
+
+
+@app.route('/hod_analytics')
+@login_required
+def hod_analytics():
+    if current_user.role.lower() != 'hod':
+        return redirect(url_for('login'))
+
+    data = get_department_analytics(current_user.department)
+
+    return render_template('analytics_hod.html', dept=current_user.department, data=data)
+
+
+@app.route('/dean_dashboard')
+@login_required
+def dean_dashboard():
+    if current_user.role.lower() != 'dean':
+        return redirect(url_for('login'))
+
+    # Find all courses in this Dean's Faculty
+    my_faculty = current_user.faculty
+    courses = Course.query.filter_by(faculty=my_faculty).all()
+
+    # Get total lecturers in this faculty
+    lecturers = User.query.filter_by(role='lecturer', faculty=my_faculty).all()
+
+    return render_template('dean_dashboard.html',
+                           faculty=my_faculty,
+                           courses=courses,
+                           lecturers=lecturers)
+
+
+@app.route('/dap_dashboard')
+@login_required
+def dap_dashboard():
+    if current_user.role.lower() != 'dap':
+        return redirect(url_for('login'))
+
+    # DAP sees everything
+    total_students = User.query.filter_by(role='student').count()
+    total_courses = Course.query.count()
+    all_courses = Course.query.all()
+
+    return render_template('dap_dashboard.html',
+                           total_students=total_students,
+                           total_courses=total_courses,
+                           courses=all_courses)
+
+
+@app.route('/dap_analytics')
+@login_required
+def dap_analytics():
+    if current_user.role.lower() != 'dap':
+        return redirect(url_for('login'))
+
+    # Count attendance grouped by Faculty
+    results = db.session.query(
+        Course.faculty, func.count(Attendance.id)
+    ).join(Attendance).group_by(Course.faculty).all()
+
+    labels = [row[0] for row in results]
+    data = [row[1] for row in results]
+
+    return render_template('analytics_dap.html', labels=labels, data=data)
+
+
+# ========== COURSE MANAGEMENT ROUTES ==========
+
+@app.route('/add_course', methods=['POST'])
+@login_required
+def add_course():
+    # Get Form Data
+    code = request.form.get('code')
+    title = request.form.get('title')
+
+    # Validation
+    if not code or not title:
+        flash("Course code and title are required!", "error")
+        return redirect(url_for('dashboard'))
+
+    # Create the Course
+    new_course = Course(
+        code=code,
+        title=title,
+        coordinator_id=current_user.id,
+        department=current_user.department if hasattr(current_user, 'department') else None,
+        faculty=current_user.faculty if hasattr(current_user, 'faculty') else None
+    )
+
+    db.session.add(new_course)
+    db.session.commit()
+
+    flash(f"Course {code} created successfully!", "success")
+    return redirect(url_for('dashboard'))
+
+
+@app.route('/delete_course/<int:course_id>', methods=['GET', 'POST'])
+@login_required
+def delete_course(course_id):
+    course = Course.query.get_or_404(course_id)
+
+    # Security check: Only coordinator can delete
+    if course.coordinator_id != current_user.id:
+        flash('Unauthorized Action! Only the creator can delete this course.', 'error')
+        return redirect(url_for('dashboard'))
+
+    # Delete all attendance records first
+    Attendance.query.filter_by(course_id=course_id).delete()
+
+    # Delete the course
+    db.session.delete(course)
+    db.session.commit()
+
+    flash(f'Course "{course.code}" has been deleted.', 'success')
+    return redirect(url_for('dashboard'))
+
+
+@app.route('/add_instructor', methods=['POST'])
+@login_required
+def add_instructor():
+    # Security: Only Course Coordinator can add instructors
+    if current_user.role.lower() != 'course coordinator':
+        flash("Unauthorized", "error")
+        return redirect(url_for('dashboard'))
+
+    course_id = request.form.get('course_id')
+    lecturer_email = request.form.get('lecturer_email')
+
+    course = Course.query.get(course_id)
+    lecturer = User.query.filter_by(email=lecturer_email).first()
+
+    if course and lecturer:
+        if hasattr(course, 'instructors'):
+            if lecturer not in course.instructors:
+                course.instructors.append(lecturer)
+                db.session.commit()
+                flash(f"Added {lecturer.full_name} to {course.code}", "success")
+            else:
+                flash("User is already an instructor", "info")
+        else:
+            flash("Course instructors relationship not configured", "error")
+    else:
+        flash("Course or lecturer not found", "error")
+
+    return redirect(url_for('dashboard'))
+
+
+@app.route('/register_course', methods=['POST'])
+@login_required
+def register_course():
+    course_code = request.form.get('course_code')
+    course = Course.query.filter_by(code=course_code).first()
+
+    if not course:
+        flash("Course not found!", "error")
+        return redirect(url_for('student_dashboard'))
+
+    # Check if already registered
+    if hasattr(current_user, 'enrolled_courses'):
+        if course in current_user.enrolled_courses:
+            flash(f"You are already registered for {course.code}", "info")
+        else:
+            current_user.enrolled_courses.append(course)
+            db.session.commit()
+            flash(f"✅ Successfully registered for {course.code}", "success")
+    else:
+        flash("Enrollment system not configured", "error")
+
+    return redirect(url_for('student_dashboard'))
+
+
+# ========== QR CODE ROUTES ==========
+
+@app.route('/generate_qr/<int:course_id>')
+@login_required
+def generate_qr(course_id):
+    course = Course.query.get_or_404(course_id)
+
+    # Check authorization
+    is_coordinator = (course.coordinator_id == current_user.id)
+    is_instructor = hasattr(course, 'instructors') and (current_user in course.instructors)
+
+    if not (is_coordinator or is_instructor):
+        flash('Unauthorized Access', 'error')
+        return redirect(url_for('dashboard'))
+
+    return render_template('generate_qr.html', course=course)
+
+
+@app.route('/api/qr_data/<int:course_id>')
+@login_required
+def get_qr_data(course_id):
+    course = Course.query.get_or_404(course_id)
+
+    # Check authorization
+    is_coordinator = (course.coordinator_id == current_user.id)
+    is_instructor = hasattr(course, 'instructors') and (current_user in course.instructors)
+
+    if not (is_coordinator or is_instructor):
+        return jsonify({"error": "Unauthorized"}), 403
+
+    timestamp = int(time.time())
+    qr_text = f"{course_id}|{timestamp}"
+    return jsonify({"qr_text": qr_text})
+
+
+@app.route('/course/<int:course_id>/live')
+@login_required
+def get_qr_image(course_id):
+    course = Course.query.get_or_404(course_id)
+
+    # Security check
+    is_coordinator = (course.coordinator_id == current_user.id)
+    is_instructor = hasattr(course, 'instructors') and (current_user in course.instructors)
+
+    if not (is_coordinator or is_instructor):
+        return "Unauthorized", 403
+
+    # Create QR code
+    timestamp = int(time.time())
+    data = f"{course_id}|{timestamp}"
+
+    try:
+        import qrcode
+        img = qrcode.make(data)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        buf.seek(0)
+        return send_file(buf, mimetype='image/png')
+    except ImportError:
+        return "QR code library not installed", 500
+
+
+@app.route('/scan_page')
+@login_required
+def scan_page():
+    return render_template('scan.html')
+
+
+@app.route('/set_location/<int:course_id>', methods=['POST'])
+@login_required
+def set_location(course_id):
+    data = request.get_json()
+    # Save the lecturer's location for this course
+    active_class_locations[course_id] = {
+        'lat': data['lat'],
+        'lon': data['lon']
+    }
+    print(f"--- LOCATION SET: Course {course_id} is at {data['lat']}, {data['lon']} ---")
+    return jsonify({"status": "ok"})
+
+
+# ========== ATTENDANCE ROUTES ==========
+
+@app.route('/mark_attendance', methods=['POST'])
+@limiter.limit("10 per minute", error_message="Too many scan attempts. Please wait.")
+@login_required
+def mark_attendance():
+    data = request.get_json()
+    qr_text = data.get('qr_data')
+    student_lat = data.get('lat')
+    student_lon = data.get('lon')
+
+    try:
+        if not qr_text:
+            return jsonify({"status": "error", "message": "No QR data provided"})
+
+        # Parse QR code
+        parts = qr_text.split('|')
+        if len(parts) != 2:
+            return jsonify({"status": "error", "message": "Invalid QR code format"})
+
+        course_id = int(parts[0])
+        timestamp = int(parts[1])
+
+        # Find the course
+        course = Course.query.get(course_id)
+        if not course:
+            return jsonify({"status": "error", "message": "Invalid QR Code: Course not found"})
+
+        # Check if student is registered for this course
+        if hasattr(current_user, 'enrolled_courses'):
+            if course not in current_user.enrolled_courses:
+                return jsonify({
+                    "status": "error",
+                    "message": f"🚫 Access Denied: You are not registered for {course.code}"
+                })
+
+        # CHECK 1: EXPIRATION (15 Seconds)
+        if int(time.time()) - timestamp > 15:
+            return jsonify({"status": "error", "message": "Code expired! Scan faster."})
+
+        # CHECK 2: DUPLICATE ENTRY (One-Scan Rule)
+        time_limit = datetime.utcnow() - timedelta(hours=2)
+        existing_record = Attendance.query.filter(
+            Attendance.student_id == current_user.id,
+            Attendance.course_id == course_id,
+            Attendance.timestamp > time_limit
+        ).first()
+
+        if existing_record:
+            return jsonify({
+                "status": "error",
+                "message": "You are already marked present! Double-scanning is not allowed."
+            })
+
+        # CHECK 3: GEO-FENCING (50 Meters)
+        if course_id in active_class_locations:
+            target = active_class_locations[course_id]
+            if not student_lat or not student_lon:
+                return jsonify({"status": "error", "message": "Location required! Allow GPS."})
+
+            dist = calculate_distance(
+                target['lat'], target['lon'],
+                float(student_lat), float(student_lon)
+            )
+
+            if dist > 50:  # 50 Meters Limit
+                return jsonify({
+                    "status": "error",
+                    "message": f"Too far! You are {int(dist)}m away from the classroom."
+                })
+
+        # SAVE ATTENDANCE RECORD
+        new_record = Attendance(
+            student_id=current_user.id,
+            course_id=course_id,
+            device_id=data.get('device_id', 'browser')
+        )
+        db.session.add(new_record)
+        db.session.commit()
+
+        return jsonify({"status": "success", "message": "Attendance marked successfully! ✅"})
+
+    except ValueError as e:
+        return jsonify({"status": "error", "message": f"Invalid data format: {str(e)}"})
+    except Exception as e:
+        print(f"--- SERVER ERROR: {e} ---")
+        return jsonify({"status": "error", "message": f"Server error: {str(e)}"})
+
+
+@app.route('/course/<int:course_id>/attendance')
+@login_required
+def view_attendance(course_id):
+    course = Course.query.get_or_404(course_id)
+
+    # Security check
+    is_coordinator = (course.coordinator_id == current_user.id)
+    is_instructor = hasattr(course, 'instructors') and (current_user in course.instructors)
+
+    if not (is_coordinator or is_instructor):
+        flash("Unauthorized access to attendance list.", "error")
+        return redirect(url_for('dashboard'))
+
+    records = Attendance.query.filter_by(course_id=course_id).order_by(Attendance.timestamp.desc()).all()
+    return render_template('view_attendance.html', course=course, attendees=records)
+
+
+@app.route('/course/<int:course_id>/download_csv')
+@login_required
+def download_csv(course_id):
+    course = Course.query.get_or_404(course_id)
+
+    # Security check
+    is_coordinator = (course.coordinator_id == current_user.id)
+    is_instructor = hasattr(course, 'instructors') and (current_user in course.instructors)
+
+    if not (is_coordinator or is_instructor):
+        return "Unauthorized", 403
+
+    records = Attendance.query.filter_by(course_id=course_id).order_by(Attendance.timestamp.desc()).all()
+
+    def generate():
+        yield "Matric Number,Full Name,Level,Time Scanned,Device ID\n"
+        for record in records:
+            time_str = record.timestamp.strftime('%Y-%m-%d %H:%M:%S')
+            matric = record.student.matric_no if record.student.matric_no else "N/A"
+            level = record.student.level if record.student.level else "N/A"
+            full_name = record.student.full_name if record.student.full_name else "N/A"
+            device = record.device_id if record.device_id else "N/A"
+            yield f"{matric},{full_name},{level},{time_str},{device}\n"
+
+    return Response(
+        generate(),
+        mimetype='text/csv',
+        headers={"Content-Disposition": f"attachment;filename={course.code}_attendance.csv"}
+    )
+
+
+@app.errorhandler(429)
+def ratelimit_handler(e):
+    # If the blocked request was from the QR Scanner (JSON)
+    if request.is_json:
+        return jsonify({
+            "status": "error", 
+            "message": f"Rate limit exceeded. Please slow down. ({e.description})"
+        }), 429
+        
+    # If the blocked request was a web page (like the Login form)
+    flash(f"Whoa, slow down! You are making too many requests. ({e.description})", "error")
+    return redirect(url_for('login'))
+
+
+# ========== DATABASE INITIALIZATION ==========
+
+with app.app_context():
+    db.create_all()
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True)
