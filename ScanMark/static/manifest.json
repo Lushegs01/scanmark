@@ -13,9 +13,10 @@
             "type": "image/png"
         },
         {
-            "src": "/static/icons/icon-512x512.png",
+            "src": "/logo.png",
             "sizes": "512x512",
             "type": "image/png"
         }
     ]
+
 }
