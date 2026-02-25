@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="container mt-4">
+    <h3>👨‍💼 Department Overview: {{ dept }}</h3>
+
+    <div class="card p-3 mt-4">
+        <h5>Course Performance (Avg. Attendance %)</h5>
+        <canvas id="deptChart"></canvas>
+    </div>
+</div>
+
+<script>
+    const ctx = document.getElementById('deptChart');
+
+    new Chart(ctx, {
+        type: 'bar',
+        data: {
+            labels: {{ data.labels | tojson }},
+        datasets: [{
+            label: 'Average Attendance %',
+            data: {{ data.data | tojson }},
+        backgroundColor: [
+            'rgba(75, 192, 192, 0.6)', // Green
+            'rgba(54, 162, 235, 0.6)', // Blue
+            'rgba(255, 99, 132, 0.6)', // Red
+            'rgba(255, 206, 86, 0.6)'  // Yellow
+        ],
+        borderWidth: 1
+            }]
+        },
+        options: {
+        responsive: true,
+        scales: {
+            y: { beginAtZero: true, max: 100 }
+        }
+    }
+    });
+</script>
+{% endblock %}

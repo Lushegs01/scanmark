@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="container mt-4">
+    <h3 class="text-danger">🏛️ University Attendance Distribution</h3>
+
+    <div class="row justify-content-center">
+        <div class="col-md-6">
+            <div class="card p-3">
+                <canvas id="uniChart"></canvas>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    const ctx = document.getElementById('uniChart');
+
+    new Chart(ctx, {
+        type: 'doughnut',  // Donut chart looks very modern/minimalist
+        data: {
+            labels: {{ labels | tojson }},
+        datasets: [{
+            label: 'Total Scans',
+            data: {{ data | tojson }},
+        backgroundColor: ['#FF6384', '#36A2EB', '#FFCE56', '#4BC0C0', '#9966FF'],
+        hoverOffset: 4
+            }]
+        }
+    });
+</script>
+{% endblock %}

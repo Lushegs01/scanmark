@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container mt-4">
+    <div class="d-flex justify-content-between align-items-center mb-3">
+        <div>
+            <h2>📋 {{ course.code }} Attendance Sheet</h2>
+            <p class="text-muted">Total Present: <strong>{{ attendees|length }}</strong></p>
+        </div>
+       <div>
+    <a href="/dashboard" class="btn btn-secondary">Back</a>
+    <a href="/course/{{ course.id }}/download_csv" class="btn btn-primary">📥 Download CSV</a>
+    <button class="btn btn-outline-success" onclick="window.print()">🖨️ Print View</button>
+</div>
+    </div>
+
+    <div class="card shadow">
+        <div class="card-body p-0">
+            <table class="table table-striped table-hover mb-0">
+                <thead class="bg-dark text-white">
+                    <tr>
+                        <th>#</th>
+                        <th>Full Name</th>
+                        <th>Matric No</th>
+                        <th>Level</th>
+                        <th>Time Scanned</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for record in attendees %}
+                    <tr>
+                        <td>{{ loop.index }}</td>
+                        <td>{{ record.student.full_name }}</td>
+                        <td>{{ record.student.matric_no }}</td>
+                        <td>{{ record.student.level }}L</td>
+                        <td>{{ record.timestamp.strftime('%I:%M %p') }}</td>
+                    </tr>
+                    {% else %}
+                    <tr>
+                        <td colspan="5" class="text-center py-4">
+                            <span class="text-muted">No attendance marked yet.</span>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% endblock %}
