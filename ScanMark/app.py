@@ -851,7 +851,7 @@ def mark_attendance():
                 class_loc['lat'], class_loc['lon'],
                 float(student_lat), float(student_lon)
             )
-            if dist > 50:
+            if dist > 5000:
                 return jsonify({
                     "status": "error",
                     "message": f"Too far from classroom. You are {int(dist)}m away (max 50m)."
@@ -960,4 +960,5 @@ with app.app_context():
     db.create_all()
 
 if __name__ == '__main__':
+
     app.run(host='0.0.0.0', port=5000, debug=True)
