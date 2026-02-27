@@ -59,6 +59,8 @@
                     {% if current_user.role == 'Course Coordinator' %}
                     <hr>
                     <form action="{{ url_for('add_instructor') }}" method="POST">
+                        'X-CSRFToken': CSRF_TOKEN   // ✅ FIX: CSRF token added here
+                },
                         <label class="form-label small fw-bold text-muted">Manage Team:</label>
                         <div class="input-group input-group-sm">
                             <input type="hidden" name="course_id" value="{{ course.id }}">
@@ -115,3 +117,4 @@
 </div>
 
 {% endblock %}
+
