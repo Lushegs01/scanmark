@@ -1,0 +1,243 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container mt-5">
+    <div class="row mb-4 align-items-center">
+        <div class="col-md-8">
+            <h2 class="fw-bold">My Portal</h2>
+            <p class="text-muted">Welcome back, {{ current_user.full_name }}</p>
+        </div>
+        <div class="col-md-4 text-end">
+            <button onclick="startScanner()" class="btn btn-success btn-lg shadow-sm">
+                📷 Scan QR Code
+            </button>
+        </div>
+    </div>
+
+    <div class="card mt-4">
+        <div class="card-body">
+            <h5>📝 Register for a Course</h5>
+            <form action="{{ url_for('register_course') }}" method="POST" class="d-flex gap-2">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <input type="text" name="course_code" class="form-control" placeholder="Enter Course Code (e.g. CSC301)"
+                    required>
+                <button type="submit" class="btn btn-primary">Join</button>
+            </form>
+        </div>
+    </div>
+
+    <div class="row justify-content-center mt-3">
+        <div class="col-md-8">
+            <div id="reader"
+                style="width: 100%; border-radius: 15px; overflow: hidden; display:none; border: 3px solid #198754;">
+            </div>
+
+            <div id="zoom-container"
+                style="display:none; margin-top: 15px; background: #f8f9fa; padding: 15px; border-radius: 10px; text-align: center;">
+                <label for="zoom-slider" style="font-weight: bold; color: #198754; font-size: 1.1rem;">
+                    🔍 Zoom Level: <span id="zoom-value">1.0x</span>
+                </label>
+                <br>
+                <input type="range" id="zoom-slider" min="1" max="5" step="0.1" value="1"
+                    style="width: 80%; height: 25px; accent-color: #198754; cursor: pointer;">
+            </div>
+
+            <!-- FIX: Result banner replaces ugly alert() popups -->
+            <div id="result-banner" class="alert mt-3 text-center fw-bold fs-6 d-none" role="alert"></div>
+        </div>
+    </div>
+
+    <div class="card shadow-sm border-0 mt-5">
+        <div class="card-header bg-white py-3">
+            <h5 class="mb-0 fw-bold text-success">📊 My Attendance Records</h5>
+        </div>
+        <div class="card-body p-0">
+            {% if attendance_data %}
+            <div class="table-responsive">
+                <table class="table table-hover align-middle mb-0">
+                    <thead class="bg-light">
+                        <tr>
+                            <th class="ps-4">Course Code</th>
+                            <th>Course Title</th>
+                            <th class="text-center">Classes Attended</th>
+                            <th class="text-center">Status</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for item in attendance_data %}
+                        <tr>
+                            <td class="ps-4 fw-bold">{{ item.code }}</td>
+                            <td class="text-muted">{{ item.title }}</td>
+                            <td class="text-center">
+                                <span class="badge bg-primary fs-6">{{ item.count }}</span>
+                            </td>
+                            <td class="text-center">
+                                <span class="text-success small fw-bold">Active</span>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% else %}
+            <div class="text-center py-5">
+                <span style="font-size: 3rem;">📭</span>
+                <p class="mt-3 text-muted">You haven't marked attendance for any courses yet.</p>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+</div>
+
+<script src="https://unpkg.com/html5-qrcode" type="text/javascript"></script>
+<script>
+    let html5QrCode;
+    let videoTrack = null;
+    let isZooming = false;
+    let pendingZoomLevel = null;
+
+    // FIX 1: Grab CSRF token from Flask
+    const CSRF_TOKEN = "{{ csrf_token() }}";
+
+    // Show a banner instead of ugly alert popups
+    function showResult(message, isSuccess) {
+        const banner = document.getElementById('result-banner');
+        banner.textContent = message;
+        banner.className = `alert mt-3 text-center fw-bold fs-6 ${isSuccess ? 'alert-success' : 'alert-danger'}`;
+        banner.classList.remove('d-none');
+        // Scroll to banner so user sees it
+        banner.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        // Auto-hide after 6 seconds
+        setTimeout(() => banner.classList.add('d-none'), 6000);
+    }
+
+    function startScanner() {
+        document.getElementById('reader').style.display = 'block';
+
+        const config = {
+            fps: 10,
+            qrbox: { width: 250, height: 250 },
+            useBarCodeDetectorIfSupported: true,
+            videoConstraints: {
+                facingMode: "environment",
+                width: { ideal: 4096 },
+                height: { ideal: 2160 },
+                focusMode: "continuous"
+            }
+        };
+
+        html5QrCode = new Html5Qrcode("reader");
+
+        html5QrCode.start(
+            { facingMode: "environment" },
+            config,
+            (decodedText, decodedResult) => {
+                html5QrCode.stop().then(() => {
+                    document.getElementById('reader').style.display = 'none';
+                    document.getElementById('zoom-container').style.display = 'none';
+                    processAttendance(decodedText);
+                });
+            },
+            (errorMessage) => {
+                // Ignore — fires constantly while scanning
+            }
+        ).then(() => {
+            enableZoom();
+        }).catch(err => {
+            showResult("❌ Camera Error: " + err, false);
+        });
+    }
+
+    function enableZoom() {
+        setTimeout(() => {
+            const videoElement = document.querySelector("#reader video");
+            if (!videoElement) return;
+
+            const track = html5QrCode.scanner?.html5QrCode?.localMediaStream?.getVideoTracks()[0]
+                || videoElement.srcObject?.getVideoTracks()[0];
+
+            if (track) {
+                videoTrack = track;
+                const capabilities = track.getCapabilities();
+                const settings = track.getSettings();
+
+                if (capabilities.zoom) {
+                    const zoomControl = document.getElementById("zoom-slider");
+                    const zoomContainer = document.getElementById("zoom-container");
+                    const zoomValueDisplay = document.getElementById("zoom-value");
+
+                    zoomContainer.style.display = "block";
+                    zoomControl.min = capabilities.zoom.min;
+                    zoomControl.max = capabilities.zoom.max;
+                    zoomControl.step = 0.1;
+                    zoomControl.value = settings.zoom || 1;
+
+                    zoomControl.oninput = function () {
+                        zoomValueDisplay.innerText = parseFloat(this.value).toFixed(1) + "x";
+                        track.applyConstraints({
+                            advanced: [{ zoom: parseFloat(this.value) }]
+                        });
+                    };
+                }
+            }
+        }, 1000);
+    }
+
+    function processAttendance(qrData) {
+        if (!navigator.geolocation) {
+            showResult("❌ Geolocation is not supported by your browser.", false);
+            return;
+        }
+
+        showResult("📍 Code scanned! Verifying your location...", true);
+
+        navigator.geolocation.getCurrentPosition(position => {
+            const lat = position.coords.latitude;
+            const lon = position.coords.longitude;
+
+            fetch('/mark_attendance', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRFToken': CSRF_TOKEN    // FIX 1: CSRF token
+                },
+                body: JSON.stringify({
+                    qr_data: qrData,             // FIX 2: correct field name (was qr_code)
+                    lat: lat,                    // FIX 2: correct field name (was latitude)
+                    lon: lon                     // FIX 2: correct field name (was longitude)
+                })
+            })
+                .then(response => {
+                    // FIX 3: Check content type before parsing JSON
+                    const contentType = response.headers.get('content-type');
+                    if (!contentType || !contentType.includes('application/json')) {
+                        showResult("❌ Session expired. Redirecting to login...", false);
+                        setTimeout(() => window.location.href = "/login", 2000);
+                        return null;
+                    }
+                    return response.json();
+                })
+                .then(data => {
+                    if (!data) return;
+                    if (data.status === 'success') {
+                        showResult("✅ " + data.message, true);
+                        setTimeout(() => location.reload(), 2000);
+                    } else {
+                        showResult("❌ " + data.message, false);
+                    }
+                })
+                .catch(error => {
+                    console.error("Fetch error:", error);
+                    showResult("❌ Could not reach the server. Check your connection.", false);
+                });
+
+        }, () => {
+            showResult("❌ Location access denied! Please allow GPS to mark attendance.", false);
+        }, {
+            enableHighAccuracy: true,
+            timeout: 10000,
+            maximumAge: 0
+        });
+    }
+</script>
+{% endblock %}
