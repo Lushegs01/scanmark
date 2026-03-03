@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="utf-8">
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f4f7f6;
+            margin: 0;
+            padding: 0;
+        }
+
+        .container {
+            max-width: 600px;
+            margin: 40px auto;
+            background: #ffffff;
+            border-radius: 10px;
+            overflow: hidden;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.05);
+        }
+
+        .header {
+            background-color: #198754;
+            padding: 30px 20px;
+            text-align: center;
+            color: white;
+        }
+
+        .header h1 {
+            margin: 0;
+            font-size: 28px;
+            letter-spacing: 1px;
+        }
+
+        .header p {
+            margin: 5px 0 0 0;
+            font-size: 14px;
+            opacity: 0.9;
+        }
+
+        .content {
+            padding: 40px 30px;
+            color: #333333;
+            line-height: 1.6;
+        }
+
+        .content h2 {
+            color: #198754;
+            margin-top: 0;
+        }
+
+        .details {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 25px 0;
+            border-left: 5px solid #198754;
+        }
+
+        .details strong {
+            color: #198754;
+            display: block;
+            margin-bottom: 10px;
+            font-size: 16px;
+        }
+
+        .button-container {
+            text-align: center;
+            margin: 40px 0 20px 0;
+        }
+
+        .btn {
+            background-color: #198754;
+            color: #ffffff !important;
+            padding: 14px 30px;
+            text-decoration: none;
+            border-radius: 6px;
+            font-weight: bold;
+            display: inline-block;
+            font-size: 16px;
+        }
+
+        .footer {
+            background-color: #f8f9fa;
+            padding: 20px;
+            text-align: center;
+            font-size: 12px;
+            color: #888888;
+            border-top: 1px solid #eeeeee;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>ScanMark</h1>
+            <p>Smart Geofenced Attendance for FUNAAB</p>
+        </div>
+        <div class="content">
+            <h2>Welcome to the Future of Attendance! 🎉</h2>
+            <p>Hello <strong>{{ full_name }}</strong>,</p>
+            <p>Your account has been successfully created. You can now use ScanMark to seamlessly log your attendance,
+                track your classes, and say goodbye to paper lists.</p>
+
+            <div class="details">
+                <strong>Your Account Details:</strong>
+                Role: {{ role | capitalize }}<br>
+                Email: {{ email }}<br>
+                {% if role|lower == 'student' and matric_no %}
+                Matric No: {{ matric_no }}<br>
+                {% endif %}
+            </div>
+
+            <div class="button-container">
+                <a href="{{ login_url }}" class="btn">Log In to Your Portal</a>
+            </div>
+
+            <p style="font-size: 14px; color: #666;">If you did not create this account, please ignore this email.</p>
+        </div>
+        <div class="footer">
+            &copy; {{ year }} ScanMark. Built for FUNAAB.
+        </div>
+    </div>
+</body>
+
+</html>
