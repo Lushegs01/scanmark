@@ -1,0 +1,467 @@
+{% extends "base.html" %}
+
+{% block content %}
+<style>
+    :root {
+        --sm-green: #006838;
+        --sm-green-light: #198754;
+        --sm-gold: #ffc107;
+    }
+
+    .signup-wrapper {
+        min-height: 100vh;
+        background: linear-gradient(135deg, #f0faf4 0%, #f8f9fa 60%, #fffbea 100%);
+        padding: 48px 0;
+    }
+
+    .signup-info-panel h1 {
+        font-size: 2.4rem;
+        font-weight: 900;
+        letter-spacing: -1px;
+        line-height: 1.15;
+    }
+
+    .funaab-notice {
+        background: #e8f5ed;
+        border: 1px solid #b2dfca;
+        border-left: 4px solid var(--sm-green);
+        border-radius: 8px;
+        padding: 16px 18px;
+        font-size: 0.875rem;
+        color: #1a3a2a;
+    }
+
+    .funaab-notice strong {
+        display: block;
+        margin-bottom: 6px;
+    }
+
+    .funaab-notice ul {
+        margin: 6px 0 0;
+        padding-left: 18px;
+    }
+
+    .role-card {
+        background: #fff;
+        border: 1px solid #e2e8e2;
+        border-radius: 10px;
+        padding: 14px 16px;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        transition: border-color 0.2s, box-shadow 0.2s;
+    }
+
+    .role-card:hover {
+        border-color: var(--sm-green);
+        box-shadow: 0 2px 12px rgba(0, 104, 56, 0.08);
+    }
+
+    .role-card .icon {
+        font-size: 1.6rem;
+        line-height: 1;
+    }
+
+    .role-card h6 {
+        margin: 0 0 2px;
+        font-weight: 700;
+        font-size: 0.875rem;
+        color: #1a1a1a;
+    }
+
+    .role-card small {
+        color: #777;
+        font-size: 0.78rem;
+    }
+
+    .signup-form-card {
+        background: #fff;
+        border: 1px solid #e2e8e2;
+        border-radius: 16px;
+        box-shadow: 0 8px 32px rgba(0, 104, 56, 0.08);
+        padding: 36px 32px;
+    }
+
+    .signup-form-card .card-title {
+        font-size: 1.4rem;
+        font-weight: 800;
+        letter-spacing: -0.4px;
+        color: #1a1a1a;
+        margin-bottom: 2px;
+    }
+
+    .signup-form-card .card-subtitle {
+        font-size: 0.82rem;
+        color: #888;
+    }
+
+    .btn-google {
+        background: #fff;
+        border: 1.5px solid #dadce0;
+        color: #3c4043;
+        font-weight: 600;
+        font-size: 0.9rem;
+        padding: 11px;
+        border-radius: 8px;
+        transition: background 0.15s, box-shadow 0.15s;
+        text-decoration: none;
+    }
+
+    .btn-google:hover {
+        background: #f8f9fa;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+        color: #1a1a1a;
+    }
+
+    .or-divider {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        color: #aaa;
+        font-size: 0.78rem;
+        font-weight: 600;
+        letter-spacing: 0.5px;
+        text-transform: uppercase;
+        margin: 18px 0;
+    }
+
+    .or-divider::before,
+    .or-divider::after {
+        content: '';
+        flex: 1;
+        height: 1px;
+        background: #e2e8e2;
+    }
+
+    .form-label {
+        font-size: 0.78rem;
+        font-weight: 700;
+        letter-spacing: 0.5px;
+        text-transform: uppercase;
+        color: #555;
+        margin-bottom: 5px;
+    }
+
+    .form-control,
+    .form-select {
+        border: 1.5px solid #dde3e0;
+        border-radius: 8px;
+        font-size: 0.9rem;
+        padding: 10px 13px;
+        color: #1a1a1a;
+        transition: border-color 0.2s, box-shadow 0.2s;
+    }
+
+    .form-control:focus,
+    .form-select:focus {
+        border-color: var(--sm-green);
+        box-shadow: 0 0 0 3px rgba(0, 104, 56, 0.1);
+    }
+
+    .input-group .form-control {
+        border-right: none;
+    }
+
+    .input-group-text {
+        border: 1.5px solid #dde3e0;
+        border-left: none;
+        border-radius: 0 8px 8px 0;
+        background: #fff;
+        cursor: pointer;
+        color: #888;
+        font-size: 0.85rem;
+        transition: color 0.2s;
+    }
+
+    .input-group-text:hover {
+        color: var(--sm-green);
+    }
+
+    .btn-signup {
+        background: var(--sm-green);
+        border: none;
+        color: #fff;
+        font-weight: 700;
+        font-size: 0.95rem;
+        padding: 13px;
+        border-radius: 8px;
+        transition: background 0.2s, box-shadow 0.2s, transform 0.1s;
+    }
+
+    .btn-signup:hover {
+        background: #00562e;
+        box-shadow: 0 6px 18px rgba(0, 104, 56, 0.25);
+        transform: translateY(-1px);
+        color: #fff;
+    }
+
+    .btn-signup:active {
+        transform: translateY(0);
+    }
+
+    .login-redirect {
+        font-size: 0.84rem;
+        color: #777;
+    }
+
+    .login-redirect a {
+        color: var(--sm-green);
+        font-weight: 700;
+        text-decoration: none;
+    }
+
+    .login-redirect a:hover {
+        text-decoration: underline;
+    }
+
+    .email-note {
+        background: #f0faf4;
+        border: 1px solid #b2dfca;
+        border-radius: 8px;
+        padding: 10px 14px;
+        font-size: 0.78rem;
+        color: #2d6a4f;
+        margin-top: 14px;
+        display: flex;
+        align-items: flex-start;
+        gap: 8px;
+    }
+</style>
+
+<div class="signup-wrapper">
+    <div class="container">
+        <div class="row align-items-start justify-content-center g-5">
+
+            <!-- Left Info Panel -->
+            <div class="col-md-5 d-none d-md-block pt-3">
+                <div class="signup-info-panel">
+                    <h1 style="color: var(--sm-green);">
+                        Join <span style="color: var(--sm-gold);">ScanMark</span>
+                    </h1>
+                    <p class="lead text-muted mt-3" style="font-size:1rem;line-height:1.7;">
+                        Create your account to start managing or marking attendance instantly with QR scanning.
+                    </p>
+
+                    <div class="funaab-notice mt-4">
+                        <strong>📧 FUNAAB Email Required</strong>
+                        Use your official FUNAAB email address:
+                        <ul>
+                            <li>Students: @student.funaab.edu.ng</li>
+                            <li>Staff: @staff.funaab.edu.ng</li>
+                            <li>General: @funaab.edu.ng</li>
+                        </ul>
+                    </div>
+
+                    <div class="d-flex flex-column gap-3 mt-4">
+                        <div class="role-card">
+                            <span class="icon">🎓</span>
+                            <div>
+                                <h6>For Students</h6>
+                                <small>Mark attendance &amp; track your history.</small>
+                            </div>
+                        </div>
+                        <div class="role-card">
+                            <span class="icon">👨‍🏫</span>
+                            <div>
+                                <h6>For Lecturers</h6>
+                                <small>Create classes &amp; export CSV reports.</small>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right Form Card -->
+            <div class="col-md-5">
+                <div class="signup-form-card">
+
+                    <div class="mb-4">
+                        <p class="card-title">Create Account</p>
+                        <p class="card-subtitle">Fill in your FUNAAB details to get started</p>
+                    </div>
+
+                    <a href="{{ url_for('login_google') }}"
+                        class="btn-google w-100 d-flex align-items-center justify-content-center gap-2 mb-2">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 48 48">
+                            <path fill="#FFC107"
+                                d="M43.611,20.083H42V20H24v8h11.303c-1.649,4.657-6.08,8-11.303,8c-6.627,0-12-5.373-12-12c0-6.627,5.373-12,12-12c3.059,0,5.842,1.154,7.961,3.039l5.657-5.657C34.046,6.053,29.268,4,24,4C12.955,4,4,12.955,4,24c0,11.045,8.955,20,20,20c11.045,0,20-8.955,20-20C44,22.659,43.862,21.35,43.611,20.083z" />
+                            <path fill="#FF3D00"
+                                d="M6.306,14.691l6.571,4.819C14.655,15.108,18.961,12,24,12c3.059,0,5.842,1.154,7.961,3.039l5.657-5.657C34.046,6.053,29.268,4,24,4C16.318,4,9.656,8.337,6.306,14.691z" />
+                            <path fill="#4CAF50"
+                                d="M24,44c5.166,0,9.86-1.977,13.409-5.192l-6.19-5.238C29.211,35.091,26.715,36,24,36c-5.202,0-9.619-3.317-11.283-7.946l-6.522,5.025C9.505,39.556,16.227,44,24,44z" />
+                            <path fill="#1976D2"
+                                d="M43.611,20.083H42V20H24v8h11.303c-0.792,2.237-2.231,4.166-4.087,5.571l6.19,5.238C36.971,39.205,44,34,44,24C44,22.659,43.862,21.35,43.611,20.083z" />
+                        </svg>
+                        Sign up with Google
+                    </a>
+
+                    <div class="or-divider">or</div>
+
+                    <form method="POST" action="/signup" id="signupForm">
+
+                        <div class="mb-3">
+                            <label class="form-label">Full Name</label>
+                            <input type="text" name="full_name" id="fullNameInput" class="form-control"
+                                placeholder="John Doe" required>
+                        </div>
+
+                        <div class="mb-3">
+                            <label class="form-label">FUNAAB Email Address</label>
+                            <input type="email" name="email" id="emailInput" class="form-control"
+                                placeholder="yourname@student.funaab.edu.ng" required>
+                            <small class="text-muted mt-1 d-block" id="emailHelp">
+                                Your role will be automatically detected from your email domain.
+                            </small>
+                            <div id="detectedRole" class="mt-2"></div>
+                        </div>
+
+                        <div class="mb-3" id="staffRoleSelector" style="display: none;">
+                            <label class="form-label">Select Your Role</label>
+                            <select name="staff_role" id="staffRoleInput" class="form-select">
+                                <option value="">Choose your role...</option>
+                                <option value="Lecturer">Lecturer — Teach assigned courses</option>
+                                <option value="Course Coordinator">Course Coordinator — Create &amp; manage courses
+                                </option>
+                            </select>
+                            <small class="text-muted">Course Coordinators can create courses; Lecturers can be assigned
+                                to teach.</small>
+                        </div>
+
+                        <div class="mb-3">
+                            <label class="form-label">Password</label>
+                            <div class="input-group">
+                                <input type="password" name="password" id="passwordInput" class="form-control"
+                                    placeholder="Min. 6 characters" minlength="6" required>
+                                <span class="input-group-text" id="togglePassword">
+                                    <i class="fa fa-eye" id="eyeIcon"></i>
+                                </span>
+                            </div>
+                        </div>
+
+                        <input type="hidden" name="role" id="roleField" value="student">
+
+                        <div id="studentFields" style="display: none;">
+                            <div class="row">
+                                <div class="col-6 mb-3">
+                                    <label class="form-label">Matric No</label>
+                                    <input type="text" name="matric_no" id="matricInput" class="form-control"
+                                        placeholder="2021/...">
+                                </div>
+                                <div class="col-6 mb-3">
+                                    <label class="form-label">Level</label>
+                                    <select name="level" id="levelInput" class="form-select">
+                                        <option value="">Select</option>
+                                        <option value="100">100</option>
+                                        <option value="200">200</option>
+                                        <option value="300">300</option>
+                                        <option value="400">400</option>
+                                        <option value="500">500</option>
+                                    </select>
+                                </div>
+                            </div>
+                        </div>
+
+                        <button type="submit" class="btn btn-signup w-100 mt-1">Create Account</button>
+
+                    </form>
+
+                    <div class="email-note">
+                        <span>✉️</span>
+                        <span>You'll receive a confirmation email with your account details after signing up.</span>
+                    </div>
+
+                    <p class="login-redirect text-center mt-4 mb-0">
+                        Already have an account? <a href="/login">Login here</a>
+                    </p>
+
+                </div>
+            </div>
+
+        </div>
+    </div>
+</div>
+
+<script>
+    const emailInput = document.getElementById('emailInput');
+    const detectedRoleDiv = document.getElementById('detectedRole');
+    const roleField = document.getElementById('roleField');
+    const studentFields = document.getElementById('studentFields');
+    const emailHelp = document.getElementById('emailHelp');
+    const staffRoleSelector = document.getElementById('staffRoleSelector');
+    const staffRoleInput = document.getElementById('staffRoleInput');
+
+    emailInput.addEventListener('input', function () {
+        const email = this.value.toLowerCase().trim();
+
+        if (email.includes('@student.funaab.edu.ng')) {
+            detectedRoleDiv.innerHTML = '<span class="badge bg-primary">Student</span>';
+            roleField.value = 'student';
+            studentFields.style.display = 'block';
+            staffRoleSelector.style.display = 'none';
+            staffRoleInput.required = false;
+            emailHelp.className = 'text-success mt-1 d-block';
+            emailHelp.textContent = '✓ Valid FUNAAB student email';
+        } else if (email.includes('@staff.funaab.edu.ng')) {
+            detectedRoleDiv.innerHTML = '<span class="badge bg-warning text-dark">Staff Member</span>';
+            roleField.value = 'lecturer';
+            studentFields.style.display = 'none';
+            staffRoleSelector.style.display = 'block';
+            staffRoleInput.required = true;
+            emailHelp.className = 'text-success mt-1 d-block';
+            emailHelp.textContent = '✓ Valid FUNAAB staff email — please select your role below';
+        } else if (email.endsWith('@funaab.edu.ng')) {
+            detectedRoleDiv.innerHTML = '<span class="badge bg-info text-dark">Student (General)</span>';
+            roleField.value = 'student';
+            studentFields.style.display = 'block';
+            staffRoleSelector.style.display = 'none';
+            staffRoleInput.required = false;
+            emailHelp.className = 'text-success mt-1 d-block';
+            emailHelp.textContent = '✓ Valid FUNAAB email';
+        } else if (email.includes('@')) {
+            detectedRoleDiv.innerHTML = '<span class="badge bg-danger">Invalid — must use FUNAAB email</span>';
+            roleField.value = '';
+            studentFields.style.display = 'none';
+            staffRoleSelector.style.display = 'none';
+            staffRoleInput.required = false;
+            emailHelp.className = 'text-danger mt-1 d-block';
+            emailHelp.textContent = '✗ Only FUNAAB emails are allowed';
+        } else {
+            detectedRoleDiv.textContent = '';
+            studentFields.style.display = 'none';
+            staffRoleSelector.style.display = 'none';
+            staffRoleInput.required = false;
+            emailHelp.className = 'text-muted mt-1 d-block';
+            emailHelp.textContent = 'Your role will be automatically detected from your email domain.';
+        }
+    });
+
+    if (staffRoleInput) {
+        staffRoleInput.addEventListener('change', function () {
+            if (this.value) {
+                roleField.value = this.value.toLowerCase().replace(' ', '_');
+                detectedRoleDiv.innerHTML = `<span class="badge bg-success">${this.value}</span>`;
+            } else {
+                roleField.value = 'lecturer';
+                detectedRoleDiv.innerHTML = '<span class="badge bg-warning text-dark">Staff Member</span>';
+            }
+        });
+    }
+
+    document.getElementById('togglePassword').addEventListener('click', function () {
+        const pw = document.getElementById('passwordInput');
+        const icon = document.getElementById('eyeIcon');
+        const hidden = pw.getAttribute('type') === 'password';
+        pw.setAttribute('type', hidden ? 'text' : 'password');
+        icon.className = hidden ? 'fa fa-eye-slash' : 'fa fa-eye';
+    });
+
+    document.getElementById('signupForm').addEventListener('submit', function () {
+        console.log('=== SIGNUP FORM SUBMISSION ===');
+        console.log('Full Name:', document.getElementById('fullNameInput').value);
+        console.log('Email:', document.getElementById('emailInput').value);
+        console.log('Role:', roleField.value);
+        console.log('Matric No:', document.getElementById('matricInput').value || 'N/A');
+        console.log('Level:', document.getElementById('levelInput').value || 'N/A');
+    });
+</script>
+{% endblock %}
