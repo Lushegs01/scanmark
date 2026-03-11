@@ -1,0 +1,770 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container mt-5">
+    <div class="row mb-4 align-items-center">
+        <div class="col-md-8">
+            <h2 class="fw-bold">My Portal</h2>
+            <p class="text-muted">Welcome back, {{ current_user.full_name }}</p>
+        </div>
+        <div class="col-md-4 text-end">
+            <button onclick="startScanner()" class="btn btn-success btn-lg shadow-sm">
+                ✨ Start Advanced Scanner
+            </button>
+        </div>
+    </div>
+
+    <!-- Advanced Scanner Container (Full Screen Overlay) -->
+    <div id="scanner-container" style="display: none;">
+        <div id="camera-container">
+            <video id="camera-feed" autoplay playsinline></video>
+            <canvas id="processing-canvas"></canvas>
+            <div class="loader" id="loader"></div>
+
+            <div id="scan-overlay">
+                <div class="scan-frame" id="scan-frame">
+                    <div class="corner-tl"></div>
+                    <div class="corner-tr"></div>
+                    <div class="corner-bl"></div>
+                    <div class="corner-br"></div>
+                    <div class="scan-line"></div>
+                </div>
+            </div>
+
+            <div class="scanner-header">
+                <h1>📸 ScanMark Scanner</h1>
+                <p>Point camera at QR code - works from 1-3 meters!</p>
+            </div>
+
+            <div class="status-badge scanning" id="status-badge">
+                🔍 Scanning...
+            </div>
+
+            <div class="camera-info" id="camera-info">
+                Initializing camera...
+            </div>
+
+            <div class="instructions" id="instructions">
+                💡 Hold steady and align QR code in the frame
+            </div>
+
+            <div class="zoom-control">
+                <input type="range" id="zoom-slider" class="zoom-slider" min="1" max="3" step="0.1" value="1">
+                <div class="zoom-label" id="zoom-label">1.0x</div>
+            </div>
+
+            <div class="controls">
+                <button class="control-btn" id="torch-btn" title="Flashlight">💡</button>
+                <button class="control-btn" id="focus-btn" title="Manual Focus">🎯</button>
+                <button class="control-btn" id="close-btn" title="Close Scanner" onclick="stopScanner()">❌</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Result Banner -->
+    <div id="result-banner" class="alert mt-3 text-center fw-bold fs-5 d-none" role="alert"></div>
+
+    <!-- Attendance Records Table -->
+    <div class="card shadow-sm border-0 mt-4">
+        <div class="card-header bg-white py-3">
+            <h5 class="mb-0 fw-bold text-success">📊 My Attendance Records</h5>
+        </div>
+        <div class="card-body p-0">
+            {% if attendance_data %}
+            <div class="table-responsive">
+                <table class="table table-hover align-middle mb-0">
+                    <thead class="bg-light">
+                        <tr>
+                            <th class="ps-4">Course Code</th>
+                            <th>Course Title</th>
+                            <th class="text-center">Classes Attended</th>
+                            <th class="text-center">Status</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for item in attendance_data %}
+                        <tr>
+                            <td class="ps-4 fw-bold">{{ item.code }}</td>
+                            <td class="text-muted">{{ item.title }}</td>
+                            <td class="text-center">
+                                <span class="badge bg-primary fs-6">{{ item.count }}</span>
+                            </td>
+                            <td class="text-center">
+                                <span class="text-success small fw-bold">Active</span>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% else %}
+            <div class="text-center py-5">
+                <span style="font-size: 3rem;">📭</span>
+                <p class="mt-3 text-muted">You haven't marked attendance for any courses yet.</p>
+                <button onclick="startScanner()" class="btn btn-outline-success btn-sm">Start Scanning</button>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+</div>
+
+<!-- Advanced Scanner Styles -->
+<style>
+    #scanner-container {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100vw;
+        height: 100vh;
+        z-index: 9999;
+        background: #000;
+    }
+
+    #camera-container {
+        position: relative;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+    }
+
+    #camera-feed {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        min-width: 100%;
+        min-height: 100%;
+    }
+
+    #scan-overlay {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        pointer-events: none;
+    }
+
+    .scan-frame {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        width: 280px;
+        height: 280px;
+        border: 3px solid #00ff00;
+        border-radius: 24px;
+        box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.5);
+        animation: pulse 2s infinite;
+    }
+
+    .corner-tl,
+    .corner-tr,
+    .corner-bl,
+    .corner-br {
+        position: absolute;
+        width: 40px;
+        height: 40px;
+        border: 4px solid #00ff00;
+    }
+
+    .corner-tl {
+        top: -4px;
+        left: -4px;
+        border-right: none;
+        border-bottom: none;
+        border-radius: 24px 0 0 0;
+    }
+
+    .corner-tr {
+        top: -4px;
+        right: -4px;
+        border-left: none;
+        border-bottom: none;
+        border-radius: 0 24px 0 0;
+    }
+
+    .corner-bl {
+        bottom: -4px;
+        left: -4px;
+        border-right: none;
+        border-top: none;
+        border-radius: 0 0 0 24px;
+    }
+
+    .corner-br {
+        bottom: -4px;
+        right: -4px;
+        border-left: none;
+        border-top: none;
+        border-radius: 0 0 24px 0;
+    }
+
+    @keyframes pulse {
+
+        0%,
+        100% {
+            border-color: #00ff00;
+            box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.5), 0 0 20px #00ff00;
+        }
+
+        50% {
+            border-color: #00ff88;
+            box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.6), 0 0 40px #00ff88;
+        }
+    }
+
+    .scan-line {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 3px;
+        background: linear-gradient(90deg, transparent, #00ff00, transparent);
+        animation: scan 2s linear infinite;
+    }
+
+    @keyframes scan {
+        0% {
+            top: 0;
+        }
+
+        50% {
+            top: 100%;
+        }
+
+        100% {
+            top: 0;
+        }
+    }
+
+    .scanner-header {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        padding: 20px;
+        background: linear-gradient(180deg, rgba(0, 0, 0, 0.8) 0%, transparent 100%);
+        z-index: 10;
+        color: white;
+    }
+
+    .scanner-header h1 {
+        font-size: 24px;
+        font-weight: 700;
+        text-align: center;
+        margin: 0 0 8px 0;
+    }
+
+    .scanner-header p {
+        text-align: center;
+        color: #aaa;
+        font-size: 14px;
+        margin: 0;
+    }
+
+    .status-badge {
+        position: absolute;
+        top: 100px;
+        left: 50%;
+        transform: translateX(-50%);
+        padding: 12px 24px;
+        background: rgba(0, 0, 0, 0.8);
+        border-radius: 30px;
+        font-size: 14px;
+        font-weight: 600;
+        backdrop-filter: blur(10px);
+        border: 2px solid #00ff00;
+        z-index: 10;
+        color: white;
+    }
+
+    .status-badge.scanning {
+        border-color: #00ff00;
+        color: #00ff00;
+    }
+
+    .status-badge.success {
+        border-color: #00ff00;
+        background: rgba(0, 255, 0, 0.2);
+        color: #00ff00;
+    }
+
+    .status-badge.error {
+        border-color: #ff3b30;
+        background: rgba(255, 59, 48, 0.2);
+        color: #ff3b30;
+    }
+
+    .controls {
+        position: absolute;
+        bottom: 40px;
+        left: 50%;
+        transform: translateX(-50%);
+        display: flex;
+        gap: 16px;
+        z-index: 10;
+    }
+
+    .control-btn {
+        width: 60px;
+        height: 60px;
+        border-radius: 50%;
+        border: none;
+        background: rgba(255, 255, 255, 0.2);
+        backdrop-filter: blur(10px);
+        color: white;
+        font-size: 24px;
+        cursor: pointer;
+        transition: all 0.3s;
+    }
+
+    .control-btn:active {
+        transform: scale(0.95);
+    }
+
+    .control-btn.active {
+        background: rgba(0, 255, 0, 0.3);
+        border: 2px solid #00ff00;
+    }
+
+    .zoom-control {
+        position: absolute;
+        right: 20px;
+        top: 50%;
+        transform: translateY(-50%);
+        z-index: 10;
+    }
+
+    .zoom-slider {
+        writing-mode: bt-lr;
+        -webkit-appearance: slider-vertical;
+        width: 8px;
+        height: 200px;
+        background: rgba(255, 255, 255, 0.2);
+        border-radius: 10px;
+        outline: none;
+    }
+
+    .zoom-slider::-webkit-slider-thumb {
+        -webkit-appearance: none;
+        width: 20px;
+        height: 20px;
+        background: #00ff00;
+        border-radius: 50%;
+        cursor: pointer;
+    }
+
+    .zoom-label {
+        text-align: center;
+        margin-top: 10px;
+        font-size: 12px;
+        color: #00ff00;
+        font-weight: 600;
+    }
+
+    .loader {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        width: 60px;
+        height: 60px;
+        border: 4px solid rgba(255, 255, 255, 0.2);
+        border-top-color: #00ff00;
+        border-radius: 50%;
+        animation: spin 1s linear infinite;
+        z-index: 5;
+    }
+
+    @keyframes spin {
+        to {
+            transform: translate(-50%, -50%) rotate(360deg);
+        }
+    }
+
+    .instructions {
+        position: absolute;
+        bottom: 140px;
+        left: 50%;
+        transform: translateX(-50%);
+        text-align: center;
+        color: #fff;
+        font-size: 14px;
+        padding: 12px 20px;
+        background: rgba(0, 0, 0, 0.6);
+        border-radius: 20px;
+        max-width: 80%;
+        backdrop-filter: blur(10px);
+    }
+
+    .scan-frame.success {
+        animation: successPulse 0.5s ease;
+    }
+
+    @keyframes successPulse {
+        0% {
+            transform: translate(-50%, -50%) scale(1);
+        }
+
+        50% {
+            transform: translate(-50%, -50%) scale(1.1);
+        }
+
+        100% {
+            transform: translate(-50%, -50%) scale(1);
+        }
+    }
+
+    #processing-canvas {
+        display: none;
+    }
+
+    .camera-info {
+        position: absolute;
+        top: 160px;
+        left: 50%;
+        transform: translateX(-50%);
+        font-size: 12px;
+        color: rgba(255, 255, 255, 0.6);
+        text-align: center;
+    }
+</style>
+
+<!-- jsQR Library for Advanced QR Scanning -->
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
+
+<script>
+    const CSRF_TOKEN = "{{ csrf_token() }}";
+
+    // Scanner state
+    let stream = null;
+    let track = null;
+    let capabilities = null;
+    let scanningActive = false;
+    let lastScanTime = 0;
+    let currentZoom = 1;
+    let torchEnabled = false;
+
+    // Elements
+    const scannerContainer = document.getElementById('scanner-container');
+    const video = document.getElementById('camera-feed');
+    const canvas = document.getElementById('processing-canvas');
+    const ctx = canvas.getContext('2d');
+    const loader = document.getElementById('loader');
+    const statusBadge = document.getElementById('status-badge');
+    const scanFrame = document.getElementById('scan-frame');
+    const zoomSlider = document.getElementById('zoom-slider');
+    const zoomLabel = document.getElementById('zoom-label');
+    const torchBtn = document.getElementById('torch-btn');
+    const focusBtn = document.getElementById('focus-btn');
+    const cameraInfo = document.getElementById('camera-info');
+
+    // Show result banner
+    function showResult(message, isSuccess) {
+        const banner = document.getElementById('result-banner');
+        banner.textContent = message;
+        banner.className = `alert mt-3 text-center fw-bold fs-5 ${isSuccess ? 'alert-success' : 'alert-danger'}`;
+        banner.classList.remove('d-none');
+        setTimeout(() => banner.classList.add('d-none'), 5000);
+    }
+
+    // Show scanner status
+    function showScannerStatus(message, type) {
+        statusBadge.textContent = message;
+        statusBadge.className = `status-badge ${type}`;
+    }
+
+    // Start scanner
+    async function startScanner() {
+        scannerContainer.style.display = 'block';
+        document.body.style.overflow = 'hidden';
+        await initCamera();
+    }
+
+    // Stop scanner
+    function stopScanner() {
+        scanningActive = false;
+        if (stream) {
+            stream.getTracks().forEach(t => t.stop());
+        }
+        scannerContainer.style.display = 'none';
+        document.body.style.overflow = 'auto';
+    }
+
+    // Initialize camera with advanced settings
+    async function initCamera() {
+        try {
+            loader.style.display = 'block';
+
+            const constraints = {
+                video: {
+                    facingMode: 'environment',
+                    width: { ideal: 1920 },
+                    height: { ideal: 1080 },
+                    focusMode: 'continuous',  // ✅ AUTO-FOCUS
+                    focusDistance: { ideal: 0 }  // ✅ FOCUS AT DISTANCE
+                },
+                audio: false
+            };
+
+            stream = await navigator.mediaDevices.getUserMedia(constraints);
+            video.srcObject = stream;
+
+            track = stream.getVideoTracks()[0];
+            capabilities = track.getCapabilities();
+
+            console.log('📷 Camera capabilities:', capabilities);
+
+            // Setup zoom
+            if (capabilities.zoom) {
+                zoomSlider.min = capabilities.zoom.min;
+                zoomSlider.max = capabilities.zoom.max;
+                zoomSlider.step = capabilities.zoom.step || 0.1;
+            }
+
+            // Apply advanced settings
+            await applyAdvancedSettings();
+            updateCameraInfo();
+
+            video.addEventListener('loadedmetadata', () => {
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+                loader.style.display = 'none';
+                startScanning();
+            });
+
+        } catch (error) {
+            console.error('❌ Camera error:', error);
+            showScannerStatus('Camera access denied', 'error');
+            loader.style.display = 'none';
+        }
+    }
+
+    // Apply advanced camera settings for distance scanning
+    async function applyAdvancedSettings() {
+        if (!track) return;
+
+        const settings = {};
+
+        // Enable continuous auto-focus
+        if (capabilities.focusMode && capabilities.focusMode.includes('continuous')) {
+            settings.focusMode = 'continuous';
+        }
+
+        // Focus at distance (infinity)
+        if (capabilities.focusDistance) {
+            settings.focusDistance = capabilities.focusDistance.min;
+        }
+
+        // Apply zoom
+        if (capabilities.zoom) {
+            settings.zoom = currentZoom;
+        }
+
+        // Apply torch
+        if (capabilities.torch) {
+            settings.torch = torchEnabled;
+        }
+
+        try {
+            await track.applyConstraints({ advanced: [settings] });
+            console.log('✅ Applied advanced settings:', settings);
+        } catch (error) {
+            console.warn('⚠️ Could not apply all settings:', error);
+        }
+    }
+
+    // Update camera info display
+    function updateCameraInfo() {
+        if (!track) return;
+        const settings = track.getSettings();
+        cameraInfo.textContent = `${settings.width}x${settings.height} | Focus: ${settings.focusMode || 'auto'} | Zoom: ${currentZoom.toFixed(1)}x`;
+    }
+
+    // Start QR code scanning
+    function startScanning() {
+        scanningActive = true;
+        showScannerStatus('🔍 Scanning...', 'scanning');
+        scanQRCode();
+
+        // Auto-refocus every 2 seconds
+        setInterval(triggerFocus, 2000);
+    }
+
+    // Scan for QR codes (runs 10x per second)
+    function scanQRCode() {
+        if (!scanningActive) return;
+
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+        const code = jsQR(imageData.data, imageData.width, imageData.height, {
+            inversionAttempts: "dontInvert"
+        });
+
+        if (code) {
+            handleQRCodeDetected(code.data);
+        } else {
+            setTimeout(scanQRCode, 100); // Scan every 100ms
+        }
+    }
+
+    // Handle detected QR code
+    function handleQRCodeDetected(qrData) {
+        console.log('✅ QR Code detected:', qrData);
+
+        const now = Date.now();
+        if (now - lastScanTime < 1000) return; // Prevent duplicate scans
+        lastScanTime = now;
+
+        scanningActive = false;
+        scanFrame.classList.add('success');
+        showScannerStatus('✅ QR Code Found!', 'success');
+
+        if (navigator.vibrate) {
+            navigator.vibrate(200);
+        }
+
+        setTimeout(() => {
+            processAttendance(qrData);
+        }, 500);
+    }
+
+    // Process attendance (your existing logic)
+    function processAttendance(qrData) {
+        if (!navigator.geolocation) {
+            showScannerStatus("❌ Geolocation not supported", 'error');
+            return;
+        }
+
+        showScannerStatus("📍 Getting location...", 'scanning');
+
+        navigator.geolocation.getCurrentPosition(position => {
+            const lat = position.coords.latitude;
+            const lon = position.coords.longitude;
+
+            showScannerStatus("📤 Marking attendance...", 'scanning');
+
+            fetch('/mark_attendance', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRFToken': CSRF_TOKEN
+                },
+                body: JSON.stringify({
+                    qr_data: qrData,
+                    lat: lat,
+                    lon: lon
+                })
+            })
+                .then(response => {
+                    const contentType = response.headers.get('content-type');
+                    if (!contentType || !contentType.includes('application/json')) {
+                        stopScanner();
+                        showResult("❌ Session expired. Please log in again.", false);
+                        setTimeout(() => window.location.href = "/login", 2000);
+                        return null;
+                    }
+                    return response.json();
+                })
+                .then(data => {
+                    if (!data) return;
+
+                    if (data.status === 'success') {
+                        stopScanner();
+                        showResult("✅ " + data.message, true);
+                        setTimeout(() => location.reload(), 1500);
+                    } else {
+                        showScannerStatus("❌ " + data.message, 'error');
+                        setTimeout(() => {
+                            scanFrame.classList.remove('success');
+                            scanningActive = true;
+                            scanQRCode();
+                        }, 2000);
+                    }
+                })
+                .catch(error => {
+                    console.error("Fetch error:", error);
+                    showScannerStatus("❌ Network error", 'error');
+                    setTimeout(() => {
+                        scanFrame.classList.remove('success');
+                        scanningActive = true;
+                        scanQRCode();
+                    }, 2000);
+                });
+
+        }, () => {
+            showScannerStatus("❌ Location access denied!", 'error');
+        }, {
+            enableHighAccuracy: true,
+            timeout: 10000,
+            maximumAge: 0
+        });
+    }
+
+    // Zoom control
+    zoomSlider.addEventListener('input', async (e) => {
+        currentZoom = parseFloat(e.target.value);
+        zoomLabel.textContent = `${currentZoom.toFixed(1)}x`;
+
+        if (track && capabilities.zoom) {
+            try {
+                await track.applyConstraints({ advanced: [{ zoom: currentZoom }] });
+                updateCameraInfo();
+            } catch (error) {
+                console.warn('⚠️ Zoom error:', error);
+            }
+        }
+    });
+
+    // Flashlight toggle
+    torchBtn.addEventListener('click', async () => {
+        if (!capabilities.torch) {
+            alert('📱 Flashlight not available on this device');
+            return;
+        }
+
+        torchEnabled = !torchEnabled;
+        torchBtn.classList.toggle('active');
+
+        try {
+            await track.applyConstraints({ advanced: [{ torch: torchEnabled }] });
+        } catch (error) {
+            console.warn('⚠️ Torch error:', error);
+            torchEnabled = !torchEnabled;
+            torchBtn.classList.toggle('active');
+        }
+    });
+
+    // Manual focus
+    focusBtn.addEventListener('click', () => {
+        triggerFocus();
+        focusBtn.classList.add('active');
+        setTimeout(() => focusBtn.classList.remove('active'), 300);
+    });
+
+    // Trigger camera focus
+    async function triggerFocus() {
+        if (!track || !capabilities.focusMode) return;
+
+        try {
+            if (capabilities.focusMode.includes('manual')) {
+                await track.applyConstraints({ advanced: [{ focusMode: 'manual' }] });
+                setTimeout(async () => {
+                    await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] });
+                }, 100);
+            }
+        } catch (error) {
+            console.warn('⚠️ Focus error:', error);
+        }
+    }
+
+    // Cleanup
+    window.addEventListener('beforeunload', () => {
+        if (stream) {
+            stream.getTracks().forEach(t => t.stop());
+        }
+    });
+</script>
+{% endblock %}
