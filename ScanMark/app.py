@@ -77,7 +77,7 @@ limiter = Limiter(
     get_remote_address,
     app=app,
     storage_uri=limiter_storage,
-    default_limits=["200 per day", "50 per hour"]
+    default_limits=["20000 per day", "1000 per hour"]
 )
 print(f"🛡️ Rate Limiter Active (Storage: {limiter_storage.split(':')[0]})")
 
