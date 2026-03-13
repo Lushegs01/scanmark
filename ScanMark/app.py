@@ -913,7 +913,6 @@ def authorize_google():
 
 
 @app.route('/login', methods=['GET', 'POST'])
-@limiter.limit("5 per minute", error_message="Too many login attempts. Please try again later.")
 def login():
     if current_user.is_authenticated:
         return redirect_by_role(current_user.role)
@@ -1574,3 +1573,4 @@ if __name__ == '__main__':
     
 
     app.run(host='0.0.0.0', port=5000, debug=True)
+
