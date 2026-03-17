@@ -36,14 +36,29 @@
 
     </div>
 </div>
-<div class="card-header bg-success text-white d-flex align-items-center">
-    <h5 class="mb-0">
-        👨‍🎓 Live Class Roster
-        <span class="pulse-dot" title="Live connection active"></span>
-    </h5>
-    <span class="ms-auto badge bg-light text-success fs-6">
-        Total: <span id="student-count">0</span>
-    </span>
+<div class="container mt-4">
+    <div class="row">
+        <div class="col-md-7">
+            <div class="card shadow-sm ...">
+               ...
+            </div>
+        </div>
+
+        <div class="col-md-5">
+            <div class="card shadow-sm h-100">
+                <div class="card-header bg-success text-white d-flex align-items-center">
+                    <h5 class="mb-0">👨‍🎓 Enrolled Students<span class="pulse-dot" title="Live connection active"></span></h5>
+                    <span class="ms-auto badge bg-light text-success fs-6">Total: <span id="student-count">0</span></span>
+                </div>
+                
+                <div class="card-body p-0" style="max-height: 600px; overflow-y: auto;">
+                    <ul id="live-student-list" class="list-group list-group-flush">
+                        <li class="list-group-item text-muted text-center py-4">Waiting for students to scan...</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </div>
 </div>
 <style>
     .pulse-dot {
@@ -77,46 +92,49 @@
 </style>
 
 <script>
-    // Grab the course ID you want to track (assuming you pass course.id to the template)
-    const courseId = "{{ course.id }}";
-
-    function fetchLiveStudents() {
+    const courseId = "{{ course.id }}"; 
+    
+    function fetchEnrolledStudents() {
+        // Pointing to the enrolled_students route
         fetch(`/api/course/${courseId}/enrolled_students`)
             .then(response => response.json())
             .then(data => {
                 if (data.status === "success") {
-                    // Update the total count
                     document.getElementById("student-count").innerText = data.total;
-
                     const listContainer = document.getElementById("live-student-list");
-                    listContainer.innerHTML = ""; // Clear the old list
-
+                    
                     if (data.total === 0) {
-                        listContainer.innerHTML = '<li class="list-group-item text-muted">Waiting for students to join...</li>';
+                        listContainer.innerHTML = '<li class="list-group-item text-muted text-center py-4">Waiting for students to enroll...</li>';
                         return;
                     }
-
-                    // Loop through the fresh data and build the list instantly
+                    
+                    listContainer.innerHTML = ""; 
+                    
+                    // Build the detailed list items
                     data.students.forEach(student => {
                         const li = document.createElement("li");
-                        li.className = "list-group-item d-flex justify-content-between align-items-center";
+                        li.className = "list-group-item";
                         li.innerHTML = `
-                            <strong>${student.name}</strong> 
-                            <span class="badge bg-secondary rounded-pill">${student.matric_no}</span>
+                            <div class="d-flex justify-content-between align-items-center">
+                                <div>
+                                    <h6 class="mb-1 fw-bold text-dark">${student.name}</h6>
+                                    <small class="text-muted">
+                                        <strong>Matric:</strong> ${student.matric_no} | <strong>Level:</strong> ${student.level}
+                                    </small>
+                                </div>
+                                <span class="badge bg-success rounded-pill">Enrolled</span>
+                            </div>
                         `;
                         listContainer.appendChild(li);
                     });
                 }
             })
-            .catch(error => console.error("Error fetching live students:", error));
+            .catch(error => console.error("Error fetching enrolled students:", error));
     }
 
-    // Run this function immediately, then every 3 seconds (3000 milliseconds)
-    fetchLiveStudents();
-    setInterval(fetchLiveStudents, 3000);
+    fetchEnrolledStudents();
+    setInterval(fetchEnrolledStudents, 3000);
 </script>
-
-
 <script>
     // --- 1. QR CODE AUTO-REFRESH ---
     let timeLeft = 5;
