@@ -58,15 +58,17 @@
 
                     {% if current_user.role == 'Course Coordinator' %}
                     <hr>
-                    <form action="{{ url_for('add_instructor') }}" method="POST">
-                        <label class="form-label small fw-bold text-muted">Manage Team:</label>
-                        <div class="input-group input-group-sm">
-                            <input type="hidden" name="course_id" value="{{ course.id }}">
-                            <input type="email" name="lecturer_email" class="form-control"
-                                placeholder="colleague@funaab.edu.ng" required>
-                            <button class="btn btn-primary" type="submit">Invite</button>
-                        </div>
-                    </form>
+                   <form action="{{ url_for('add_instructor') }}" method="POST">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
+    
+    <label class="form-label small fw-bold text-muted">Manage Team:</label>
+    <div class="input-group input-group-sm">
+        <input type="hidden" name="course_id" value="{{ course.id }}">
+        <input type="email" name="lecturer_email" class="form-control"
+            placeholder="colleague@staff.funaab.edu.ng" required>
+        <button class="btn btn-primary" type="submit">Invite</button>
+    </div>
+</form>
                     {% endif %}
 
                 </div>
