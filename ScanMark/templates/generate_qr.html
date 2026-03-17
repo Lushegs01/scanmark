@@ -1,0 +1,206 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container mt-5">
+    <div class="card shadow-lg p-5 text-center mx-auto" style="max-width: 600px;">
+
+        <h2 class="mb-1">Scan to Mark Attendance</h2>
+        <h4 class="text-success mb-4">{{ course.code }} — {{ course.title }}</h4>
+
+        <!-- QR Code Image -->
+        <div class="my-3">
+            <img id="qrImage" src="{{ url_for('get_qr_image', course_id=course.id) }}" alt="QR Code"
+                style="width: 300px; height: 300px; border: 5px solid #198754; border-radius: 10px;">
+        </div>
+
+        <!-- FIX #1: Removed stray </button> tag. Clean timer display -->
+        <p class="text-muted mb-4">
+            Code refreshes in <span id="timer" class="fw-bold text-danger">5</span>s
+        </p>
+
+        <!-- FIX #2: Only ONE location status block -->
+        <div class="alert d-flex align-items-center justify-content-center gap-2" id="locationAlert">
+            <span class="spinner-grow spinner-grow-sm text-warning" role="status"></span>
+            <span>
+                <strong>Lecturer Location:</strong>
+                <span id="locationStatus">Acquiring GPS...</span>
+            </span>
+        </div>
+
+        <!-- FIX #3 & #4: Single clean stop button that goes to the correct URL -->
+        <form action="{{ url_for('lecturer_dashboard') }}" method="GET">
+            <button type="submit" class="btn btn-danger btn-lg mt-3 w-100">
+                🛑 End Class & Stop Tracking
+            </button>
+        </form>
+
+    </div>
+</div>
+<div class="card-header bg-success text-white d-flex align-items-center">
+    <h5 class="mb-0">
+        👨‍🎓 Live Class Roster
+        <span class="pulse-dot" title="Live connection active"></span>
+    </h5>
+    <span class="ms-auto badge bg-light text-success fs-6">
+        Total: <span id="student-count">0</span>
+    </span>
+</div>
+<style>
+    .pulse-dot {
+        height: 12px;
+        width: 12px;
+        background-color: #28a745;
+        /* ScanMark/Bootstrap Green */
+        border-radius: 50%;
+        display: inline-block;
+        margin-left: 10px;
+        /* This runs the breathing animation infinitely */
+        animation: pulse-animation 1.5s infinite;
+    }
+
+    @keyframes pulse-animation {
+        0% {
+            transform: scale(0.95);
+            box-shadow: 0 0 0 0 rgba(40, 167, 69, 0.7);
+        }
+
+        70% {
+            transform: scale(1);
+            box-shadow: 0 0 0 8px rgba(40, 167, 69, 0);
+        }
+
+        100% {
+            transform: scale(0.95);
+            box-shadow: 0 0 0 0 rgba(40, 167, 69, 0);
+        }
+    }
+</style>
+
+<script>
+    // Grab the course ID you want to track (assuming you pass course.id to the template)
+    const courseId = "{{ course.id }}";
+
+    function fetchLiveStudents() {
+        fetch(`/api/course/${courseId}/enrolled_students`)
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === "success") {
+                    // Update the total count
+                    document.getElementById("student-count").innerText = data.total;
+
+                    const listContainer = document.getElementById("live-student-list");
+                    listContainer.innerHTML = ""; // Clear the old list
+
+                    if (data.total === 0) {
+                        listContainer.innerHTML = '<li class="list-group-item text-muted">Waiting for students to join...</li>';
+                        return;
+                    }
+
+                    // Loop through the fresh data and build the list instantly
+                    data.students.forEach(student => {
+                        const li = document.createElement("li");
+                        li.className = "list-group-item d-flex justify-content-between align-items-center";
+                        li.innerHTML = `
+                            <strong>${student.name}</strong> 
+                            <span class="badge bg-secondary rounded-pill">${student.matric_no}</span>
+                        `;
+                        listContainer.appendChild(li);
+                    });
+                }
+            })
+            .catch(error => console.error("Error fetching live students:", error));
+    }
+
+    // Run this function immediately, then every 3 seconds (3000 milliseconds)
+    fetchLiveStudents();
+    setInterval(fetchLiveStudents, 3000);
+</script>
+
+
+<script>
+    // --- 1. QR CODE AUTO-REFRESH ---
+    let timeLeft = 5;
+    const timerEl = document.getElementById('timer');
+    const qrImage = document.getElementById('qrImage');
+
+    setInterval(() => {
+        timeLeft--;
+        timerEl.innerText = timeLeft;
+
+        if (timeLeft <= 0) {
+            // Bust browser cache by appending a timestamp so it fetches a fresh token
+            qrImage.src = "{{ url_for('get_qr_image', course_id=course.id) }}" + "?t=" + Date.now();
+            timeLeft = 5;
+        }
+    }, 1000);
+
+
+    // --- 2. GPS LOCATION SETTER ---
+    // FIX #5: Include CSRF token in the fetch header
+    // FIX #6: Re-send location every 30 seconds so it stays fresh
+    const CSRF_TOKEN = "{{ csrf_token() }}";
+
+    function setClassLocation() {
+        if (!navigator.geolocation) {
+            showLocationError("Geolocation is not supported by this browser.");
+            return;
+        }
+
+        navigator.geolocation.getCurrentPosition(
+            function (position) {
+                const lat = position.coords.latitude;
+                const lon = position.coords.longitude;
+
+                // Update UI to show active status
+                const statusEl = document.getElementById('locationStatus');
+                const alertEl = document.getElementById('locationAlert');
+
+                statusEl.innerText = `Active ✅ (${lat.toFixed(5)}, ${lon.toFixed(5)})`;
+                alertEl.classList.remove('alert-warning', 'alert-danger');
+                alertEl.classList.add('alert-success');
+                alertEl.querySelector('.spinner-grow').classList.add('d-none'); // Hide spinner
+
+                // FIX #5: Send CSRF token with the fetch request
+                fetch("/set_location/{{ course.id }}", {
+                    method: "POST",
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-CSRFToken': CSRF_TOKEN
+                    },
+                    body: JSON.stringify({ lat: lat, lon: lon })
+                })
+                    .then(res => res.json())
+                    .then(data => console.log("✅ Location updated:", data))
+                    .catch(err => console.error("❌ Location send error:", err));
+            },
+
+            function (error) {
+                const messages = {
+                    1: "GPS Permission Denied — please allow location access.",
+                    2: "Position Unavailable — check your device GPS.",
+                    3: "GPS Timeout — retrying..."
+                };
+                showLocationError(messages[error.code] || "Unknown GPS error.");
+            },
+
+            {
+                enableHighAccuracy: true,
+                timeout: 10000,
+                maximumAge: 0
+            }
+        );
+    }
+
+    function showLocationError(msg) {
+        const statusEl = document.getElementById('locationStatus');
+        const alertEl = document.getElementById('locationAlert');
+        statusEl.innerText = "⚠️ " + msg;
+        alertEl.classList.remove('alert-success', 'alert-warning');
+        alertEl.classList.add('alert-danger');
+    }
+
+    // Run immediately on page load, then every 30 seconds (FIX #6)
+    setClassLocation();
+    setInterval(setClassLocation, 30000);
+</script>
+{% endblock %}
