@@ -488,13 +488,7 @@ FUNAAB_DOMAINS = [
 
 def is_valid_funaab_email(email):
     """
-    Check if email is a valid FUNAAB email address
-    
-    Args:
-        email: Email address to validate
-    
-    Returns:
-        tuple: (is_valid, message, role)
+    Check if email is a valid FUNAAB email address OR a standard Gmail
     """
     if not email:
         return False, "Email is required", None
@@ -506,25 +500,28 @@ def is_valid_funaab_email(email):
     
     email = email.lower().strip()
     
-    # Check if email ends with any valid FUNAAB domain
     is_valid = False
     role = None
     
+    # Check domains and assign roles
     if email.endswith('@student.funaab.edu.ng'):
         is_valid = True
         role = 'student'
     elif email.endswith('@staff.funaab.edu.ng'):
         is_valid = True
-        role = 'lecturer'  # Default for staff, can be overridden to Course Coordinator
+        role = 'lecturer'  # Default for staff
     elif email.endswith('@funaab.edu.ng'):
         is_valid = True
-        role = 'student'  # Default role
+        role = 'student'
+    # 🚨 THE NEW GMAIL RULE: Allowed, but strictly as a student
+    elif email.endswith('@gmail.com'):
+        is_valid = True
+        role = 'student'
     
     if is_valid:
-        return True, "Valid FUNAAB email", role
+        return True, "Valid email", role
     else:
-        return False, "Only FUNAAB email addresses (@funaab.edu.ng, @student.funaab.edu.ng, @staff.funaab.edu.ng) are allowed", None
-
+        return False, "Only FUNAAB (@funaab.edu.ng) or Gmail (@gmail.com) addresses are allowed.", None
 
 def extract_name_from_funaab_email(email):
     """
