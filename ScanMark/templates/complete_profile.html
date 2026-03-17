@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Complete Profile - ScanMark</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+
+<body class="bg-light d-flex align-items-center justify-content-center" style="min-height: 100vh;">
+
+    <div class="card shadow-sm" style="max-width: 400px; width: 100%;">
+        <div class="card-body p-4">
+            <div class="text-center mb-4">
+                <h4 class="fw-bold text-success">Almost There! 🎓</h4>
+                <p class="text-muted small">We just need a couple more details to link your Google account to FUNAAB's
+                    records.</p>
+            </div>
+
+            {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+            {% for category, message in messages %}
+            <div class="alert alert-{{ category }} py-2">{{ message }}</div>
+            {% endfor %}
+            {% endif %}
+            {% endwith %}
+
+            <form action="{{ url_for('complete_profile') }}" method="POST">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+
+                <div class="mb-3">
+                    <label class="form-label fw-bold small text-muted">Matriculation Number</label>
+                    <input type="text" name="matric_no" class="form-control" placeholder="e.g. 2021/0001" required>
+                </div>
+
+                <div class="mb-4">
+                    <label class="form-label fw-bold small text-muted">Current Level</label>
+                    <select name="level" class="form-select" required>
+                        <option value="" disabled selected>Select your level</option>
+                        <option value="100">100 Level</option>
+                        <option value="200">200 Level</option>
+                        <option value="300">300 Level</option>
+                        <option value="400">400 Level</option>
+                        <option value="500">500 Level</option>
+                        <option value="600">600 Level</option>
+                    </select>
+                </div>
+
+                <button type="submit" class="btn btn-success w-100 fw-bold">Save & Enter Dashboard</button>
+            </form>
+        </div>
+    </div>
+
+</body>
+
+</html>
