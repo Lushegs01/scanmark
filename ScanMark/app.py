@@ -1284,15 +1284,14 @@ def add_course():
 
 @app.route('/api/course/<int:course_id>/enrolled_students')
 @login_required
-@limiter.exempt
+@limiter.exempt 
 def get_enrolled_students(course_id):
     course = Course.query.get_or_404(course_id)
     
-    # Security check: only the coordinator or instructor can see this
     if course.coordinator_id != current_user.id and current_user not in getattr(course, 'instructors', []):
         return jsonify({"error": "Unauthorised"}), 403
 
-    # Query all users who have this course in their enrolled_courses
+    # Grab all students who have registered for this specific course
     students = User.query.filter(User.enrolled_courses.any(id=course_id)).all()
     
     student_list = []
