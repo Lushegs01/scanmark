@@ -293,7 +293,7 @@
                         </div>
 
                         <div class="mb-3">
-                            <label class="form-label">FUNAAB Email Address</label>
+                            <label class="form-label">Email Address</label>
                             <input type="email" name="email" id="emailInput" class="form-control"
                                 placeholder="yourname@student.funaab.edu.ng or @gmail.com" required>
                             <small class="text-muted mt-1 d-block" id="emailHelp">
@@ -380,14 +380,14 @@
     emailInput.addEventListener('input', function () {
         const email = this.value.toLowerCase().trim();
 
-        if (email.includes('@student.funaab.edu.ng')) {
+        if (email.includes('@gmail.com')) {
             detectedRoleDiv.innerHTML = '<span class="badge bg-primary">Student</span>';
             roleField.value = 'student';
             studentFields.style.display = 'block';
             staffRoleSelector.style.display = 'none';
             staffRoleInput.required = false;
             emailHelp.className = 'text-success mt-1 d-block';
-            emailHelp.textContent = '✓ Valid FUNAAB student email';
+            emailHelp.textContent = '✓ Valid student email';
         } else if (email.includes('@staff.funaab.edu.ng')) {
             detectedRoleDiv.innerHTML = '<span class="badge bg-warning text-dark">Staff Member</span>';
             roleField.value = 'lecturer';
