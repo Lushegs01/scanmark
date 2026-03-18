@@ -1608,7 +1608,7 @@ def view_attendance(course_id):
 def download_csv(course_id):
     course = Course.query.get_or_404(course_id)
 
-    if not _attendance_authorized(course):  
+    if not getattr(course, 'coordinator_id') == current_user.id and current_user not in getattr(course, 'instructors', []):
         return "Unauthorised", 403
 
     records = (Attendance.query
@@ -1616,47 +1616,41 @@ def download_csv(course_id):
                .order_by(Attendance.timestamp.desc())
                .all())
 
-    # 🚨 DEBUG CHECK: Print to Render logs if empty
+    # Build the entire CSV in memory to prevent dropped database connections!
+    csv_data = "Matric Number,Full Name,Level,Time Scanned,Device ID\n"
+    
     if not records:
-        print(f"⚠️ CSV WARNING: Database returned 0 records for Course {course_id}")
-
-    def generate():
-        yield "Matric Number,Full Name,Level,Time Scanned,Device ID\n"
-        
-        # If the database is truly empty, tell us inside the Excel file!
-        if not records:
-            yield "NO DATA FOUND,NO DATA FOUND,NO DATA FOUND,NO DATA FOUND,NO DATA FOUND\n"
-            return
-            
+        csv_data += "NO DATA FOUND,NO DATA FOUND,NO DATA FOUND,NO DATA FOUND,NO DATA FOUND\n"
+    else:
         for rec in records:
+            # 1. Safely handle the timestamp (whether it's an object or a string)
             try:
-                time_str = rec.timestamp.strftime('%Y-%m-%d %I:%M %p') if rec.timestamp else "N/A"
+                time_str = rec.timestamp.strftime('%Y-%m-%d %I:%M %p')
+            except AttributeError:
+                time_str = str(rec.timestamp) # Fallback if Postgres returned a string
+            
+            # 2. Safely grab the student data
+            student = rec.student
+            if student:
+                matric = student.matric_no or "N/A"
+                level = student.level or "N/A"
+                full_name = student.full_name or "N/A"
+            else:
+                matric = "UNKNOWN"
+                level = "UNKNOWN"
+                full_name = "Deleted User"
                 
-                # Safely check if the student relationship still exists
-                student = rec.student
-                if student:
-                    matric = student.matric_no or "N/A"
-                    level = student.level or "N/A"
-                    full_name = student.full_name or "N/A"
-                else:
-                    matric = "UNKNOWN"
-                    level = "UNKNOWN"
-                    full_name = "Deleted User"
-                    
-                device = getattr(rec, 'device_id', "N/A") or "N/A"
-                
-                # Wrap every field in quotes to prevent comma-breaking!
-                yield f'"{matric}","{full_name}","{level}","{time_str}","{device}"\n'
-                
-            except Exception as e:
-                # If a row crashes, write the error into the CSV instead of aborting
-                yield f'"ERROR","PROCESSING","RECORD","{str(e)}","ERROR"\n'
+            device = getattr(rec, 'device_id', "N/A") or "N/A"
+            
+            # 3. Add the row to our massive text string
+            csv_data += f'"{matric}","{full_name}","{level}","{time_str}","{device}"\n'
 
     return Response(
-        generate(),
+        csv_data,
         mimetype='text/csv',
         headers={"Content-Disposition": f"attachment;filename={course.code}_attendance.csv"}
     )
+
 # ============================================================
 # ERROR HANDLERS
 # ============================================================
