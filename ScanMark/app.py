@@ -482,7 +482,8 @@ login_manager.login_view = 'login'
 FUNAAB_DOMAINS = [
     'funaab.edu.ng',
     'student.funaab.edu.ng',
-    'staff.funaab.edu.ng'
+    'staff.funaab.edu.ng',
+    'gmail.com'
 ]
 
 
@@ -504,7 +505,7 @@ def is_valid_funaab_email(email):
     role = None
     
     # Check domains and assign roles
-    if email.endswith('@student.funaab.edu.ng'):
+    if email.endswith('@gmail.com'):
         is_valid = True
         role = 'student'
     elif email.endswith('@staff.funaab.edu.ng'):
