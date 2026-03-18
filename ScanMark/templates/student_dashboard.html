@@ -190,54 +190,61 @@
         }
 
         showResult("📍 Code scanned! Verifying your location...", true);
-
-        navigator.geolocation.getCurrentPosition(position => {
-            const lat = position.coords.latitude;
-            const lon = position.coords.longitude;
-
-            fetch('/mark_attendance', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'X-CSRFToken': CSRF_TOKEN    // FIX 1: CSRF token
-                },
-                body: JSON.stringify({
-                    qr_data: qrData,             // FIX 2: correct field name (was qr_code)
-                    lat: lat,                    // FIX 2: correct field name (was latitude)
-                    lon: lon                     // FIX 2: correct field name (was longitude)
-                })
+navigator.geolocation.getCurrentPosition(
+    // Success callback
+    position => {
+        const lat = position.coords.latitude;
+        const lon = position.coords.longitude;
+        
+        // Continue with attendance marking...
+        fetch('/mark_attendance', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-CSRFToken': CSRF_TOKEN
+            },
+            body: JSON.stringify({
+                qr_data: qrData,
+                lat: lat,
+                lon: lon
             })
-                .then(response => {
-                    // FIX 3: Check content type before parsing JSON
-                    const contentType = response.headers.get('content-type');
-                    if (!contentType || !contentType.includes('application/json')) {
-                        showResult("❌ Session expired. Redirecting to login...", false);
-                        setTimeout(() => window.location.href = "/login", 2000);
-                        return null;
-                    }
-                    return response.json();
-                })
-                .then(data => {
-                    if (!data) return;
-                    if (data.status === 'success') {
-                        showResult("✅ " + data.message, true);
-                        setTimeout(() => location.reload(), 2000);
-                    } else {
-                        showResult("❌ " + data.message, false);
-                    }
-                })
-                .catch(error => {
-                    console.error("Fetch error:", error);
-                    showResult("❌ Could not reach the server. Check your connection.", false);
-                });
-
-        }, () => {
-            showResult("❌ Location access denied! Please allow GPS to mark attendance.", false);
-        }, {
-            enableHighAccuracy: true,
-            timeout: 10000,
-            maximumAge: 0
+        })
+        .then(response => response.json())
+        .then(data => {
+            if (data.status === 'success') {
+                showResult("✅ " + data.message, true);
+                setTimeout(() => location.reload(), 2000);
+            } else {
+                showResult("❌ " + data.message, false);
+            }
         });
+    },
+    
+    // Error callback - more specific errors
+    error => {
+        switch(error.code) {
+            case error.PERMISSION_DENIED:
+                showResult("❌ Please allow location access in your browser settings", false);
+                break;
+            case error.POSITION_UNAVAILABLE:
+                showResult("❌ Location information unavailable. Check your GPS.", false);
+                break;
+            case error.TIMEOUT:
+                showResult("❌ Location request timed out. Try again.", false);
+                break;
+            default:
+                showResult("❌ An unknown error occurred getting your location.", false);
+                break;
+        }
+    },
+    
+    // Options - increased timeout
+    {
+        enableHighAccuracy: true,
+        timeout: 30000,  // 30 seconds (increased from 10)
+        maximumAge: 0
+    }
+);
     }
 </script>
 {% endblock %}
