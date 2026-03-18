@@ -1608,7 +1608,7 @@ def view_attendance(course_id):
 def download_csv(course_id):
     course = Course.query.get_or_404(course_id)
 
-    if not _attendance_authorized(course):  # FIX #8
+    if not _attendance_authorized(course):  
         return "Unauthorised", 403
 
     records = (Attendance.query
@@ -1616,23 +1616,47 @@ def download_csv(course_id):
                .order_by(Attendance.timestamp.desc())
                .all())
 
+    # 🚨 DEBUG CHECK: Print to Render logs if empty
+    if not records:
+        print(f"⚠️ CSV WARNING: Database returned 0 records for Course {course_id}")
+
     def generate():
         yield "Matric Number,Full Name,Level,Time Scanned,Device ID\n"
+        
+        # If the database is truly empty, tell us inside the Excel file!
+        if not records:
+            yield "NO DATA FOUND,NO DATA FOUND,NO DATA FOUND,NO DATA FOUND,NO DATA FOUND\n"
+            return
+            
         for rec in records:
-            time_str = rec.timestamp.strftime('%Y-%m-%d %H:%M:%S')
-            matric = rec.student.matric_no or "N/A"
-            level = rec.student.level or "N/A"
-            full_name = rec.student.full_name or "N/A"
-            device = rec.device_id or "N/A"
-            yield f"{matric},{full_name},{level},{time_str},{device}\n"
+            try:
+                time_str = rec.timestamp.strftime('%Y-%m-%d %I:%M %p') if rec.timestamp else "N/A"
+                
+                # Safely check if the student relationship still exists
+                student = rec.student
+                if student:
+                    matric = student.matric_no or "N/A"
+                    level = student.level or "N/A"
+                    full_name = student.full_name or "N/A"
+                else:
+                    matric = "UNKNOWN"
+                    level = "UNKNOWN"
+                    full_name = "Deleted User"
+                    
+                device = getattr(rec, 'device_id', "N/A") or "N/A"
+                
+                # Wrap every field in quotes to prevent comma-breaking!
+                yield f'"{matric}","{full_name}","{level}","{time_str}","{device}"\n'
+                
+            except Exception as e:
+                # If a row crashes, write the error into the CSV instead of aborting
+                yield f'"ERROR","PROCESSING","RECORD","{str(e)}","ERROR"\n'
 
     return Response(
         generate(),
         mimetype='text/csv',
         headers={"Content-Disposition": f"attachment;filename={course.code}_attendance.csv"}
     )
-
-
 # ============================================================
 # ERROR HANDLERS
 # ============================================================
