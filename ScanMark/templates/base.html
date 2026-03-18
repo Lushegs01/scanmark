@@ -70,12 +70,64 @@
 
     {% block content %}{% endblock %}
 
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js">
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+
+    <script>
+        // Register the Service Worker so the phone knows it exists
         if ('serviceWorker' in navigator) {
-            window.addEventListener('load', function () {
-                navigator.serviceWorker.register('/service-worker.js');
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('/service-worker.js')
+                    .then(reg => console.log('🛡️ ScanMark Offline Shield Activated!'))
+                    .catch(err => console.error('❌ Shield failed:', err));
             });
         }
+
+        // The function that blasts saved scans to Render
+        function syncOfflineScans() {
+            console.log("🌍 Internet connection detected! Checking phone memory for saved scans...");
+
+            const request = indexedDB.open('ScanMarkOfflineDB', 1);
+
+            request.onsuccess = event => {
+                const db = event.target.result;
+                if (!db.objectStoreNames.contains('scans')) return; // No offline DB exists yet
+
+                const transaction = db.transaction('scans', 'readwrite');
+                const store = transaction.objectStore('scans');
+
+                // Open a cursor to read through every saved scan one by one
+                store.openCursor().onsuccess = async (event) => {
+                    const cursor = event.target.result;
+                    if (cursor) {
+                        const scanData = cursor.value;
+                        const scanKey = cursor.key; // The unique ID of this scan in the phone
+
+                        try {
+                            // Send it to your Render database
+                            const response = await fetch('/mark_attendance', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify(scanData)
+                            });
+
+                            if (response.ok) {
+                                // If Render says "Got it!", delete it from the phone's memory
+                                const deleteTx = db.transaction('scans', 'readwrite');
+                                deleteTx.objectStore('scans').delete(scanKey);
+                                console.log("✅ Offline scan successfully synced to the cloud!");
+                            }
+                        } catch (err) {
+                            console.log("Still offline, keeping scan in storage for later.");
+                        }
+                        cursor.continue(); // Move to the next saved scan
+                    }
+                };
+            };
+        }
+
+        // Listeners: Tell the phone EXACTLY when to run the sync
+        window.addEventListener('online', syncOfflineScans); // Run it the millisecond Wi-Fi connects
+        document.addEventListener('DOMContentLoaded', syncOfflineScans); // Run it every time they open a page
     </script>
 </body>
 
