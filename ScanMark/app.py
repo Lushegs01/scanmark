@@ -1537,7 +1537,7 @@ def mark_attendance():
                 class_loc['lat'], class_loc['lon'],
                 float(student_lat), float(student_lon)
             )
-            if dist > 50:  # 50 meters
+            if dist > 500:  # 50 meters
                 return jsonify({
                     "status": "error",
                     "message": f"Too far from classroom. You are {int(dist)}m away (max 50m)."
