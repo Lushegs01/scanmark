@@ -1651,6 +1651,35 @@ def download_csv(course_id):
         headers={"Content-Disposition": f"attachment;filename={course.code}_attendance.csv"}
     )
 
+    # ============================================================
+# ANALYTICS
+# ============================================================
+
+@app.route('/course/<int:course_id>/analytics')
+@login_required
+def course_analytics(course_id):
+    course = Course.query.get_or_404(course_id)
+
+    # Security check: Ensure they own the course
+    if not getattr(course, 'coordinator_id') == current_user.id and current_user not in getattr(course, 'instructors', []):
+        return "Unauthorised", 403
+
+    # Query the database: Group attendance by Date and count the scans
+    daily_attendance = db.session.query(
+        func.date(Attendance.timestamp).label('scan_date'),
+        func.count(Attendance.id).label('total_scans')
+    ).filter_by(course_id=course_id).group_by('scan_date').order_by('scan_date').all()
+
+    # Format the data for Chart.js
+    dates = [day.scan_date.strftime('%b %d') for day in daily_attendance if day.scan_date]
+    counts = [day.total_scans for day in daily_attendance]
+
+    return render_template('analytics.html', 
+                           course=course, 
+                           dates=dates, 
+                           counts=counts)
+
+
 # ============================================================
 # ERROR HANDLERS
 # ============================================================
