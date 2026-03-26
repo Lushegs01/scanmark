@@ -44,7 +44,11 @@
                             class="btn btn-outline-success btn-sm flex-fill mx-1">
                             📥 CSV
                         </a>
-
+                         <a href="{{ url_for('course_analytics', course_id=course.id) }}"
+                            class="btn btn-primary fw-bold">
+                            📊 View Analytics
+                        </a>
+                        
                         {% if current_user.role == 'Course Coordinator' %}
                         <form method="POST" action="/delete_course/{{ course.id }}"
                             onsubmit="return confirm('Are you sure you want to delete {{ course.code }}?')">
