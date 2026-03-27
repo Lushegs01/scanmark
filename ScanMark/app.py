@@ -70,6 +70,14 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False  # 🚨 FIX: Silence SQLAlc
 # FIX #2: Enable CSRF protection globally
 csrf = CSRFProtect(app)
 
+def user_based_rate_limit_key():
+    """
+    If the user is logged in, use their unique database ID.
+    If they are not logged in (e.g., on the signup page), fallback to their IP address.
+    """
+    if current_user.is_authenticated:
+        return f"user_{current_user.id}"
+    return request.remote_addr
 
 # ============================================================
 # REDIS SESSION CONFIGURATION
@@ -101,15 +109,6 @@ limiter = Limiter(
     default_limits=["5000 per day", "1000 per minute"] # Give them some breathing room!
 )
 print(f"🛡️ Rate Limiter Active (Storage: {limiter_storage.split(':')[0]})")
-
-def user_based_rate_limit_key():
-    """
-    If the user is logged in, use their unique database ID.
-    If they are not logged in (e.g., on the signup page), fallback to their IP address.
-    """
-    if current_user.is_authenticated:
-        return f"user_{current_user.id}"
-    return request.remote_addr
 
 # ============================================================
 # FLASK-MAIL CONFIGURATION
