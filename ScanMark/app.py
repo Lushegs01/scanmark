@@ -96,12 +96,20 @@ else:
 
 limiter_storage = os.environ.get('REDIS_URL', 'memory://')
 limiter = Limiter(
-    get_remote_address,
     app=app,
-    storage_uri=limiter_storage
+    key_func=user_based_rate_limit_key,
+    default_limits=["5000 per day", "1000 per minute"] # Give them some breathing room!
 )
 print(f"🛡️ Rate Limiter Active (Storage: {limiter_storage.split(':')[0]})")
 
+def user_based_rate_limit_key():
+    """
+    If the user is logged in, use their unique database ID.
+    If they are not logged in (e.g., on the signup page), fallback to their IP address.
+    """
+    if current_user.is_authenticated:
+        return f"user_{current_user.id}"
+    return request.remote_addr
 
 # ============================================================
 # FLASK-MAIL CONFIGURATION
