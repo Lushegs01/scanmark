@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ScanMark – Smart Attendance for FUNAAB</title>
+    <meta name="description" content="ScanMark: Geolocation-locked QR attendance system for FUNAAB students and lecturers.">
+
+    <link rel="manifest" href="/static/manifest.json">
+    <meta name="theme-color" content="#005A2B" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="ScanMark" />
+
+    <link rel="icon" type="image/png" href="{{ url_for('static', filename='logo.png') }}">
+
+    <!-- Bootstrap 5 -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <!-- Google Fonts: Poppins -->
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <!-- Font Awesome -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <!-- ScanMark Styles -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+
+    <!-- Apply saved theme immediately (no flash) -->
+    <script>
+        (function () {
+            var saved = localStorage.getItem('scanmark-theme') || 'light';
+            document.documentElement.setAttribute('data-theme', saved);
+        })();
+    </script>
+</head>
+
+<body>
+
+    <!-- ===== NAVBAR ===== -->
+    <nav class="navbar navbar-expand-lg navbar-custom navbar-dark">
+        <div class="container">
+            <!-- Brand -->
+            <a class="navbar-brand" href="/dashboard">
+                <i class="fas fa-qrcode me-1" style="color: var(--gold); font-size:1.1rem;"></i>
+                Scan<span class="brand-gold">Mark</span>
+            </a>
+
+            <!-- Mobile: right side controls -->
+            <div class="d-flex align-items-center gap-2 d-lg-none">
+                <!-- Dark Mode Toggle (mobile) -->
+                <button class="dark-toggle" onclick="toggleTheme()" aria-label="Toggle dark mode">
+                    <i class="fas fa-moon" id="darkToggleIconMobile"></i>
+                </button>
+                <!-- Hamburger -->
+                <button class="navbar-toggler border-0 p-0" type="button"
+                    data-bs-toggle="collapse" data-bs-target="#navbarNav"
+                    style="color: rgba(255,255,255,0.8); font-size: 1.2rem;">
+                    <i class="fas fa-bars"></i>
+                </button>
+            </div>
+
+            <div class="collapse navbar-collapse" id="navbarNav">
+                <ul class="navbar-nav ms-auto align-items-lg-center gap-lg-1">
+                    {% if current_user.is_authenticated %}
+                    <li class="nav-item">
+                        <span class="nav-link nav-greeting d-none d-lg-block">
+                            <i class="fas fa-user-circle me-1"></i>{{ current_user.full_name }}
+                        </span>
+                    </li>
+                    <li class="nav-item d-none d-lg-block">
+                        <!-- Dark Mode Toggle (desktop) -->
+                        <button class="dark-toggle ms-1" onclick="toggleTheme()" aria-label="Toggle dark mode">
+                            <i class="fas fa-moon" id="darkToggleIconDesktop"></i>
+                        </button>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link btn-logout ms-lg-2 d-inline-block" href="/logout">
+                            <i class="fas fa-sign-out-alt me-1"></i>Logout
+                        </a>
+                    </li>
+                    {% else %}
+                    <li class="nav-item">
+                        <a class="nav-link" href="/login">Login</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link btn-logout ms-lg-1 d-inline-block" href="/signup">Sign Up</a>
+                    </li>
+                    <li class="nav-item d-none d-lg-flex align-items-center ms-1">
+                        <button class="dark-toggle" onclick="toggleTheme()" aria-label="Toggle dark mode">
+                            <i class="fas fa-moon" id="darkToggleIconDesktop2"></i>
+                        </button>
+                    </li>
+                    {% endif %}
+                </ul>
+            </div>
+        </div>
+    </nav>
+
+    <!-- ===== FLASH MESSAGES ===== -->
+    <div class="container mt-3">
+        {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+        {% for category, message in messages %}
+        <div class="alert alert-{{ 'danger' if category == 'error' else 'warning' if category == 'warning' else 'success' }} alert-dismissible fade show" role="alert">
+            <i class="fas fa-{{ 'circle-xmark' if category == 'error' else 'triangle-exclamation' if category == 'warning' else 'circle-check' }} me-2"></i>
+            {{ message }}
+            <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+        </div>
+        {% endfor %}
+        {% endif %}
+        {% endwith %}
+
+        {% with messages = get_flashed_messages() %}
+        {% if messages %}
+        {% for message in messages %}
+        <div class="alert alert-warning alert-dismissible fade show" role="alert">
+            <i class="fas fa-triangle-exclamation me-2"></i>{{ message }}
+            <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+        </div>
+        {% endfor %}
+        {% endif %}
+        {% endwith %}
+    </div>
+
+    {% block content %}{% endblock %}
+
+    <!-- Bootstrap JS -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+
+    <script>
+        /* ===== DARK MODE LOGIC ===== */
+        function toggleTheme() {
+            var html = document.documentElement;
+            var current = html.getAttribute('data-theme');
+            var next = current === 'dark' ? 'light' : 'dark';
+            html.setAttribute('data-theme', next);
+            localStorage.setItem('scanmark-theme', next);
+            updateIcons(next);
+        }
+
+        function updateIcons(theme) {
+            var icons = ['darkToggleIconMobile', 'darkToggleIconDesktop', 'darkToggleIconDesktop2'];
+            icons.forEach(function (id) {
+                var el = document.getElementById(id);
+                if (el) {
+                    el.className = theme === 'dark' ? 'fas fa-sun' : 'fas fa-moon';
+                }
+            });
+        }
+
+        // Initialise icons on load
+        document.addEventListener('DOMContentLoaded', function () {
+            var stored = localStorage.getItem('scanmark-theme') || 'light';
+            updateIcons(stored);
+        });
+
+        /* ===== SERVICE WORKER ===== */
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', function () {
+                navigator.serviceWorker.register('/service-worker.js')
+                    .then(function () { console.log('🛡️ ScanMark Offline Shield Activated!'); })
+                    .catch(function (err) { console.error('❌ Shield failed:', err); });
+            });
+        }
+
+        /* ===== OFFLINE SYNC ===== */
+        function syncOfflineScans() {
+            const request = indexedDB.open('ScanMarkOfflineDB', 1);
+            request.onsuccess = event => {
+                const db = event.target.result;
+                if (!db.objectStoreNames.contains('scans')) return;
+                const transaction = db.transaction('scans', 'readwrite');
+                const store = transaction.objectStore('scans');
+                store.openCursor().onsuccess = async (event) => {
+                    const cursor = event.target.result;
+                    if (cursor) {
+                        const scanData = cursor.value;
+                        const scanKey = cursor.key;
+                        try {
+                            const response = await fetch('/mark_attendance', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify(scanData)
+                            });
+                            if (response.ok) {
+                                const deleteTx = db.transaction('scans', 'readwrite');
+                                deleteTx.objectStore('scans').delete(scanKey);
+                            }
+                        } catch (err) { /* still offline */ }
+                        cursor.continue();
+                    }
+                };
+            };
+        }
+
+        window.addEventListener('online', syncOfflineScans);
+        document.addEventListener('DOMContentLoaded', syncOfflineScans);
+    </script>
+</body>
+
+</html>
