@@ -1,0 +1,172 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container page-wrap">
+
+    <!-- ===== PAGE HEADER ===== -->
+    <div class="page-header d-flex flex-column flex-sm-row align-items-sm-center justify-content-sm-between gap-3">
+        <div>
+            <div class="accent-line"></div>
+            <h1 class="page-title">My Dashboard</h1>
+            <p class="page-subtitle mb-0">Manage your classes &amp; attendance records</p>
+        </div>
+        {% if can_create %}
+        <button class="btn btn-gold d-flex align-items-center gap-2 align-self-start"
+            data-bs-toggle="modal" data-bs-target="#createClassModal">
+            <i class="fas fa-plus"></i>
+            <span>New Class</span>
+        </button>
+        {% endif %}
+    </div>
+
+    <!-- ===== STATS ROW ===== -->
+    {% if courses %}
+    <div class="row g-3 mb-4">
+        <div class="col-6 col-lg-3">
+            <div class="glass-card stat-card h-100">
+                <div class="stat-icon" style="background: var(--gold-dim);">📚</div>
+                <div class="stat-number">{{ courses|length }}</div>
+                <div class="stat-label">Total Classes</div>
+            </div>
+        </div>
+        <div class="col-6 col-lg-3">
+            <div class="glass-card stat-card h-100">
+                <div class="stat-icon" style="background: rgba(0,90,43,0.12);">👥</div>
+                <div class="stat-number">{{ courses | sum(attribute='instructors') | list | length if false else '—' }}</div>
+                <div class="stat-label">Instructors</div>
+            </div>
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- ===== COURSE CARDS GRID ===== -->
+    <div class="section-label mb-3">
+        <i class="fas fa-layer-group me-1"></i> Your Courses
+    </div>
+
+    <div class="row g-3">
+        {% if courses %}
+        {% for course in courses %}
+        <div class="col-12 col-sm-6 col-xl-4">
+            <div class="card course-card h-100">
+                <div class="card-body d-flex flex-column">
+
+                    <!-- Course header -->
+                    <div class="d-flex justify-content-between align-items-start mb-1">
+                        <span class="course-code">{{ course.code }}</span>
+                        <span class="badge bg-secondary">
+                            <i class="fas fa-user-tie me-1"></i>{{ course.instructors.count() }}
+                        </span>
+                    </div>
+                    <p class="course-title">{{ course.title }}</p>
+
+                    <!-- Primary CTA -->
+                    <a href="{{ url_for('generate_qr', course_id=course.id) }}"
+                        class="btn btn-success w-100 mb-3 d-flex align-items-center justify-content-center gap-2">
+                        <i class="fas fa-qrcode"></i>
+                        <span>Start Attendance</span>
+                    </a>
+
+                    <!-- Secondary Actions -->
+                    <div class="d-flex gap-2 mb-2">
+                        <a href="{{ url_for('view_attendance', course_id=course.id) }}"
+                            class="btn btn-glass btn-sm flex-fill d-flex align-items-center justify-content-center gap-1">
+                            <i class="fas fa-list fa-xs"></i> List
+                        </a>
+                        <a href="{{ url_for('download_csv', course_id=course.id) }}"
+                            class="btn btn-outline-success btn-sm flex-fill d-flex align-items-center justify-content-center gap-1">
+                            <i class="fas fa-download fa-xs"></i> CSV
+                        </a>
+                        <a href="{{ url_for('course_analytics', course_id=course.id) }}"
+                            class="btn btn-primary btn-sm flex-fill d-flex align-items-center justify-content-center gap-1">
+                            <i class="fas fa-chart-bar fa-xs"></i> Analytics
+                        </a>
+                        {% if current_user.role == 'Course Coordinator' %}
+                        <form method="POST" action="/delete_course/{{ course.id }}"
+                            onsubmit="return confirm('Delete {{ course.code }}? This cannot be undone.')"
+                            class="m-0">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                            <button type="submit" class="btn btn-outline-danger btn-sm"
+                                title="Delete course">
+                                <i class="fas fa-trash fa-xs"></i>
+                            </button>
+                        </form>
+                        {% endif %}
+                    </div>
+
+                    <!-- Invite Instructor (Coordinator only) -->
+                    {% if current_user.role == 'Course Coordinator' %}
+                    <div class="mt-auto pt-2" style="border-top: 1px solid var(--divider);">
+                        <form action="{{ url_for('add_instructor') }}" method="POST">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                            <input type="hidden" name="course_id" value="{{ course.id }}">
+                            <div class="input-group input-group-sm">
+                                <input type="email" name="lecturer_email" class="form-control"
+                                    placeholder="colleague@funaab.edu.ng" required>
+                                <button class="btn btn-primary" type="submit">
+                                    <i class="fas fa-user-plus fa-xs"></i>
+                                </button>
+                            </div>
+                            <span class="section-label d-block mt-1" style="font-size:0.68rem;">Invite Instructor</span>
+                        </form>
+                    </div>
+                    {% endif %}
+
+                </div>
+            </div>
+        </div>
+        {% endfor %}
+
+        {% else %}
+        <!-- Empty State -->
+        <div class="col-12">
+            <div class="glass-card empty-state">
+                <span class="empty-icon">📂</span>
+                <p class="fw-semibold mb-1" style="color: var(--text-secondary);">No classes yet</p>
+                <p class="small mb-3" style="color: var(--text-muted);">Create your first class to get started</p>
+                {% if can_create %}
+                <button class="btn btn-gold" data-bs-toggle="modal" data-bs-target="#createClassModal">
+                    <i class="fas fa-plus me-1"></i> Create a Class
+                </button>
+                {% endif %}
+            </div>
+        </div>
+        {% endif %}
+    </div>
+</div>
+
+<!-- ===== CREATE CLASS MODAL ===== -->
+<div class="modal fade" id="createClassModal" tabindex="-1" aria-labelledby="createClassModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="createClassModalLabel">
+                    <i class="fas fa-plus-circle me-2 text-success"></i>Create New Class
+                </h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <form action="{{ url_for('add_course') }}" method="POST">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <div class="modal-body d-flex flex-column gap-3">
+                    <div>
+                        <label class="form-label">Course Code</label>
+                        <input type="text" name="code" class="form-control"
+                            placeholder="e.g. CSC 201" required>
+                    </div>
+                    <div>
+                        <label class="form-label">Course Title</label>
+                        <input type="text" name="title" class="form-control"
+                            placeholder="e.g. Introduction to Computer Science" required>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-glass" data-bs-dismiss="modal">Cancel</button>
+                    <button type="submit" class="btn btn-success d-flex align-items-center gap-2">
+                        <i class="fas fa-check"></i> Create Class
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+{% endblock %}
