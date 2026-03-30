@@ -1,0 +1,294 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container page-wrap">
+
+    <!-- ===== WELCOME HEADER ===== -->
+    <div class="page-header">
+        <div class="accent-line"></div>
+        <h1 class="page-title">My Portal</h1>
+        <p class="page-subtitle mb-0">Welcome back, <strong>{{ current_user.full_name }}</strong></p>
+    </div>
+
+    <!-- ===== QUICK STATS ===== -->
+    {% if attendance_data %}
+    <div class="row g-3 mb-4">
+        <div class="col-6">
+            <div class="glass-card stat-card h-100">
+                <div class="stat-icon" style="background: var(--gold-dim);">📚</div>
+                <div class="stat-number">{{ attendance_data|length }}</div>
+                <div class="stat-label">Courses</div>
+            </div>
+        </div>
+        <div class="col-6">
+            <div class="glass-card stat-card h-100">
+                <div class="stat-icon" style="background: rgba(0,90,43,0.12);">✅</div>
+                {% set total = namespace(count=0) %}
+                {% for item in attendance_data %}{% set total.count = total.count + item.count %}{% endfor %}
+                <div class="stat-number">{{ total.count }}</div>
+                <div class="stat-label">Classes Attended</div>
+            </div>
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- ===== QR SCAN CARD ===== -->
+    <div class="card mb-3">
+        <div class="card-body">
+            <div class="d-flex align-items-start gap-3 mb-3">
+                <div class="stat-icon flex-shrink-0 m-0"
+                    style="background: linear-gradient(135deg, var(--green), var(--green-mid)); color: white; font-size: 1.2rem;">
+                    <i class="fas fa-qrcode"></i>
+                </div>
+                <div>
+                    <h5 class="mb-0 fw-bold" style="color: var(--text);">Scan QR Code</h5>
+                    <p class="small mb-0" style="color: var(--text-muted);">Point your camera at the lecturer's QR code</p>
+                </div>
+            </div>
+
+            <button onclick="startScanner()" class="btn btn-scan" id="scanBtn">
+                <i class="fas fa-camera"></i>
+                <span>Start Camera &amp; Scan</span>
+            </button>
+
+            <!-- QR Reader -->
+            <div id="reader" style="width: 100%; display:none; margin-top: 1rem;"></div>
+
+            <!-- Zoom Slider -->
+            <div id="zoom-container" style="display:none; margin-top: 0.8rem; text-align: center;">
+                <label for="zoom-slider"
+                    style="font-weight: 600; font-size: 0.8rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.7px;">
+                    <i class="fas fa-search me-1"></i> Zoom:
+                    <span id="zoom-value" style="color: var(--green); font-weight: 800;">1.0×</span>
+                </label>
+                <br>
+                <input type="range" id="zoom-slider" min="1" max="5" step="0.1" value="1"
+                    style="width: 85%; height: 6px; accent-color: var(--green); cursor: pointer; margin-top: 6px;">
+            </div>
+
+            <!-- Result Banner -->
+            <div id="result-banner" class="alert mt-3 text-center fw-bold d-none" role="alert"></div>
+        </div>
+    </div>
+
+    <!-- ===== REGISTER FOR COURSE ===== -->
+    <div class="card mb-4">
+        <div class="card-body">
+            <div class="d-flex align-items-center gap-2 mb-3">
+                <span style="font-size: 1.2rem;">🎓</span>
+                <h6 class="mb-0 fw-bold" style="color: var(--text);">Register for a Course</h6>
+            </div>
+            <form action="{{ url_for('register_course') }}" method="POST">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <div class="input-group">
+                    <input type="text" name="course_code" class="form-control"
+                        placeholder="Enter Course Code (e.g. CSC 301)" required>
+                    <button type="submit" class="btn btn-primary d-flex align-items-center gap-1">
+                        <i class="fas fa-plus fa-xs"></i> Join
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- ===== ATTENDANCE RECORDS ===== -->
+    <div class="section-label">
+        <i class="fas fa-calendar-check me-1"></i> My Attendance Records
+    </div>
+
+    <div class="card">
+        <div class="card-body p-0">
+            {% if attendance_data %}
+            <div class="table-responsive">
+                <table class="table table-hover mb-0">
+                    <thead>
+                        <tr>
+                            <th class="ps-4">Course</th>
+                            <th class="d-none d-sm-table-cell">Title</th>
+                            <th class="text-center">Attended</th>
+                            <th class="text-center">Status</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for item in attendance_data %}
+                        <tr>
+                            <td class="ps-4">
+                                <span class="fw-bold" style="color: var(--green); font-size: 0.9rem;">{{ item.code }}</span>
+                                <span class="d-block d-sm-none small" style="color: var(--text-muted);">{{ item.title }}</span>
+                            </td>
+                            <td class="d-none d-sm-table-cell" style="color: var(--text-secondary); font-size: 0.85rem;">{{ item.title }}</td>
+                            <td class="text-center">
+                                <span class="badge bg-primary" style="font-size: 0.85rem; min-width: 32px;">
+                                    {{ item.count }}
+                                </span>
+                            </td>
+                            <td class="text-center">
+                                <span class="badge"
+                                    style="background: rgba(0,90,43,0.12); color: var(--green); font-size: 0.75rem;">
+                                    <i class="fas fa-circle fa-xs me-1" style="font-size: 0.5rem; vertical-align: middle;"></i>Active
+                                </span>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% else %}
+            <div class="empty-state">
+                <span class="empty-icon">📭</span>
+                <p class="fw-semibold mb-1" style="color: var(--text-secondary);">No records yet</p>
+                <p class="small" style="color: var(--text-muted);">Register for a course and scan a QR code to appear here.</p>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+
+</div>
+
+<!-- QR Scanner Script -->
+<script src="https://unpkg.com/html5-qrcode" type="text/javascript"></script>
+<script>
+    let html5QrCode;
+    let videoTrack = null;
+    const CSRF_TOKEN = "{{ csrf_token() }}";
+
+    function showResult(message, isSuccess) {
+        const banner = document.getElementById('result-banner');
+        banner.textContent = message;
+        banner.className = `alert mt-3 text-center fw-bold ${isSuccess ? 'alert-success' : 'alert-danger'}`;
+        banner.classList.remove('d-none');
+        banner.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        setTimeout(() => banner.classList.add('d-none'), 6000);
+    }
+
+    function startScanner() {
+        const reader = document.getElementById('reader');
+        const btn = document.getElementById('scanBtn');
+
+        reader.style.display = 'block';
+        btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i><span>Activating Camera…</span>';
+        btn.disabled = true;
+
+        const config = {
+            fps: 10,
+            qrbox: { width: 240, height: 240 },
+            useBarCodeDetectorIfSupported: true,
+            videoConstraints: {
+                facingMode: "environment",
+                width: { ideal: 1920 },
+                height: { ideal: 1080 },
+                focusMode: "continuous"
+            }
+        };
+
+        html5QrCode = new Html5Qrcode("reader");
+
+        html5QrCode.start(
+            { facingMode: "environment" },
+            config,
+            (decodedText) => {
+                html5QrCode.stop().then(() => {
+                    reader.style.display = 'none';
+                    document.getElementById('zoom-container').style.display = 'none';
+                    btn.innerHTML = '<i class="fas fa-camera"></i><span>Start Camera & Scan</span>';
+                    btn.disabled = false;
+                    processAttendance(decodedText);
+                });
+            },
+            () => { /* scanning — ignore errors */ }
+        ).then(() => {
+            btn.innerHTML = '<i class="fas fa-times"></i><span>Stop Scanner</span>';
+            btn.disabled = false;
+            btn.onclick = stopScanner;
+            enableZoom();
+        }).catch(err => {
+            showResult("❌ Camera Error: " + err, false);
+            reader.style.display = 'none';
+            btn.innerHTML = '<i class="fas fa-camera"></i><span>Start Camera & Scan</span>';
+            btn.disabled = false;
+        });
+    }
+
+    function stopScanner() {
+        if (html5QrCode) {
+            html5QrCode.stop().then(() => {
+                document.getElementById('reader').style.display = 'none';
+                document.getElementById('zoom-container').style.display = 'none';
+                const btn = document.getElementById('scanBtn');
+                btn.innerHTML = '<i class="fas fa-camera"></i><span>Start Camera & Scan</span>';
+                btn.onclick = startScanner;
+            });
+        }
+    }
+
+    function enableZoom() {
+        setTimeout(() => {
+            const videoElement = document.querySelector("#reader video");
+            if (!videoElement) return;
+            const track = html5QrCode.scanner?.html5QrCode?.localMediaStream?.getVideoTracks()[0]
+                || videoElement.srcObject?.getVideoTracks()[0];
+
+            if (track) {
+                videoTrack = track;
+                const capabilities = track.getCapabilities();
+                const settings = track.getSettings();
+                if (capabilities.zoom) {
+                    const zoomControl = document.getElementById("zoom-slider");
+                    const zoomContainer = document.getElementById("zoom-container");
+                    const zoomValueDisplay = document.getElementById("zoom-value");
+                    zoomContainer.style.display = "block";
+                    zoomControl.min = capabilities.zoom.min;
+                    zoomControl.max = capabilities.zoom.max;
+                    zoomControl.step = 0.1;
+                    zoomControl.value = settings.zoom || 1;
+                    zoomControl.oninput = function () {
+                        zoomValueDisplay.innerText = parseFloat(this.value).toFixed(1) + "×";
+                        track.applyConstraints({ advanced: [{ zoom: parseFloat(this.value) }] });
+                    };
+                }
+            }
+        }, 1000);
+    }
+
+    function processAttendance(qrData) {
+        if (!navigator.geolocation) {
+            showResult("❌ Geolocation is not supported by your browser.", false);
+            return;
+        }
+        showResult("📍 Code scanned! Verifying your location…", true);
+
+        navigator.geolocation.getCurrentPosition(position => {
+            const lat = position.coords.latitude;
+            const lon = position.coords.longitude;
+
+            fetch('/mark_attendance', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-CSRFToken': CSRF_TOKEN },
+                body: JSON.stringify({ qr_data: qrData, lat: lat, lon: lon })
+            })
+                .then(response => {
+                    const ct = response.headers.get('content-type');
+                    if (!ct || !ct.includes('application/json')) {
+                        showResult("❌ Session expired. Redirecting to login…", false);
+                        setTimeout(() => window.location.href = "/login", 2000);
+                        return null;
+                    }
+                    return response.json();
+                })
+                .then(data => {
+                    if (!data) return;
+                    if (data.status === 'success') {
+                        showResult("✅ " + data.message, true);
+                        setTimeout(() => location.reload(), 2500);
+                    } else {
+                        showResult("❌ " + data.message, false);
+                    }
+                })
+                .catch(() => showResult("❌ Could not reach the server. Check your connection.", false));
+
+        }, () => {
+            showResult("❌ Location access denied! Please allow GPS to mark attendance.", false);
+        }, { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 });
+    }
+</script>
+{% endblock %}
