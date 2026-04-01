@@ -1,0 +1,190 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container page-wrap">
+
+    <!-- ===== HERO HEADER ===== -->
+    <div class="row align-items-center justify-content-center" style="min-height: 260px;">
+
+        <!-- LEFT HERO PANEL (desktop only) -->
+        <div class="col-md-5 mb-4 d-none d-md-block pe-5">
+            <div class="accent-line"></div>
+            <h1 class="page-title" style="font-size: 2.2rem; line-height: 1.2;">
+                {{ course.code }} <span style="color: var(--gold);">Analytics</span>
+            </h1>
+            <p class="page-subtitle mt-3" style="font-size: 0.95rem; line-height: 1.7;">
+                Live attendance trends and course health<br>
+                insights at a glance.
+            </p>
+
+            <div class="mt-4 d-flex flex-column gap-3">
+                <div class="d-flex align-items-center gap-3">
+                    <div class="stat-icon flex-shrink-0" style="background: var(--gold-dim); font-size: 1rem;">📊</div>
+                    <div>
+                        <p class="mb-0 fw-bold" style="color: var(--text); font-size: 0.88rem;">Daily Tracking</p>
+                        <p class="mb-0 small" style="color: var(--text-muted);">Attendance volume charted per session</p>
+                    </div>
+                </div>
+                <div class="d-flex align-items-center gap-3">
+                    <div class="stat-icon flex-shrink-0" style="background: rgba(0,90,43,0.12); font-size: 1rem;">📈</div>
+                    <div>
+                        <p class="mb-0 fw-bold" style="color: var(--text); font-size: 0.88rem;">Peak & Average Stats</p>
+                        <p class="mb-0 small" style="color: var(--text-muted);">Identify your best-attended classes</p>
+                    </div>
+                </div>
+                <div class="d-flex align-items-center gap-3">
+                    <div class="stat-icon flex-shrink-0" style="background: rgba(100,100,250,0.10); font-size: 1rem;">🔍</div>
+                    <div>
+                        <p class="mb-0 fw-bold" style="color: var(--text); font-size: 0.88rem;">Trend Analysis</p>
+                        <p class="mb-0 small" style="color: var(--text-muted);">Spot attendance patterns over time</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- RIGHT STATS CARD -->
+        <div class="col-md-5 mb-4">
+            <div class="glass-card p-4 p-md-5">
+                <div class="text-center mb-4">
+                    <div class="mb-3">
+                        <i class="fas fa-chart-line" style="font-size: 2rem; color: var(--gold);"></i>
+                    </div>
+                    <h2 class="page-title" style="font-size: 1.4rem;">Course Overview</h2>
+                    <p class="page-subtitle">{{ course.code }} — {{ course.title }}</p>
+                </div>
+
+                <!-- Quick Stats -->
+                <div class="row g-3 mb-4" id="quickStatsRow" style="display: none !important;">
+                    <div class="col-6">
+                        <div class="glass-card stat-card h-100 text-center" style="padding: 1.2rem 0.8rem;">
+                            <div class="stat-icon" style="background: rgba(0,90,43,0.12);">📈</div>
+                            <div class="stat-number" id="stat-peak" style="font-size: 1.5rem;">0</div>
+                            <div class="section-label">Peak</div>
+                        </div>
+                    </div>
+                    <div class="col-6">
+                        <div class="glass-card stat-card h-100 text-center" style="padding: 1.2rem 0.8rem;">
+                            <div class="stat-icon" style="background: var(--gold-dim);">👥</div>
+                            <div class="stat-number" id="stat-avg" style="font-size: 1.5rem;">0</div>
+                            <div class="section-label">Average</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Back Button -->
+                <div class="d-grid">
+                    <a href="{{ url_for('lecturer_dashboard') }}"
+                        class="btn btn-primary btn-lg d-flex align-items-center justify-content-center gap-2">
+                        <i class="fas fa-arrow-left"></i>
+                        <span>Back to Dashboard</span>
+                    </a>
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- ===== MOBILE HEADER (visible on small screens) ===== -->
+    <div class="d-md-none mb-4">
+        <div class="accent-line"></div>
+        <h1 class="page-title">{{ course.code }} <span style="color: var(--gold);">Analytics</span></h1>
+        <p class="page-subtitle mb-0">Live attendance trends and course health</p>
+    </div>
+
+    <!-- ===== CHART CARD ===== -->
+    <div class="glass-card p-4 p-md-5 mb-4">
+        <div class="d-flex align-items-center gap-2 mb-4">
+            <div class="stat-icon flex-shrink-0 m-0" style="background: var(--gold-dim); width: 40px; height: 40px; border-radius: 12px; font-size: 1rem;">📊</div>
+            <div>
+                <p class="mb-0 fw-bold" style="color: var(--text); font-size: 0.95rem;">Daily Attendance Volume</p>
+                <p class="mb-0 small" style="color: var(--text-muted);">Students present per session over time</p>
+            </div>
+        </div>
+
+        <canvas id="attendanceChart" height="100"></canvas>
+
+        {% if not dates %}
+        <div class="empty-state">
+            <span class="empty-icon">📭</span>
+            <p class="fw-semibold mb-1" style="color: var(--text-secondary);">No Data Yet</p>
+            <p class="small" style="color: var(--text-muted);">Run a live class to generate your first attendance insights!</p>
+        </div>
+        {% endif %}
+    </div>
+
+</div>
+
+<script id="chart-dates" type="application/json">{{ dates | tojson | safe }}</script>
+<script id="chart-counts" type="application/json">{{ counts | tojson | safe }}</script>
+
+<script>
+    const chartLabels = JSON.parse(document.getElementById('chart-dates').textContent || '[]');
+    const chartData   = JSON.parse(document.getElementById('chart-counts').textContent || '[]');
+
+    if (chartLabels.length > 0) {
+        // Quick Stats
+        const peak = Math.max(...chartData);
+        const avg  = Math.round(chartData.reduce((a, b) => a + b, 0) / chartData.length);
+        document.getElementById('stat-peak').innerText = peak + ' Students';
+        document.getElementById('stat-avg').innerText  = '~' + avg + ' / class';
+        document.getElementById('quickStatsRow').style.setProperty('display', 'flex', 'important');
+
+        // Chart colour — adapts to dark/light mode
+        function getGreen() {
+            return getComputedStyle(document.documentElement).getPropertyValue('--green').trim() || '#005A2B';
+        }
+
+        const ctx      = document.getElementById('attendanceChart').getContext('2d');
+        const gradient = ctx.createLinearGradient(0, 0, 0, 400);
+        gradient.addColorStop(0, 'rgba(0, 90, 43, 0.35)');
+        gradient.addColorStop(1, 'rgba(0, 90, 43, 0.0)');
+
+        new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: chartLabels,
+                datasets: [{
+                    label: 'Total Students Present',
+                    data: chartData,
+                    borderColor: '#005A2B',
+                    backgroundColor: gradient,
+                    borderWidth: 3,
+                    pointBackgroundColor: '#FFD700',
+                    pointBorderColor: '#ffffff',
+                    pointBorderWidth: 2,
+                    pointRadius: 6,
+                    pointHoverRadius: 8,
+                    fill: true,
+                    tension: 0.4
+                }]
+            },
+            options: {
+                responsive: true,
+                animation: { duration: 1500, easing: 'easeOutQuart' },
+                plugins: {
+                    legend: { display: false },
+                    tooltip: {
+                        backgroundColor: '#0A192F',
+                        titleFont: { size: 13, family: 'Poppins' },
+                        bodyFont:  { size: 13, family: 'Poppins', weight: 'bold' },
+                        padding: 12,
+                        cornerRadius: 10,
+                        displayColors: false
+                    }
+                },
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        grid: { borderDash: [5, 5], color: 'rgba(0,0,0,0.06)' },
+                        ticks: { precision: 0, font: { weight: '600', family: 'Poppins' } }
+                    },
+                    x: {
+                        grid: { display: false },
+                        ticks: { font: { weight: '600', family: 'Poppins' } }
+                    }
+                }
+            }
+        });
+    }
+</script>
+{% endblock %}
