@@ -11,8 +11,8 @@
             <p class="page-subtitle mb-0">Manage your classes &amp; attendance records</p>
         </div>
         {% if can_create %}
-        <button class="btn btn-gold d-flex align-items-center gap-2 align-self-start"
-            data-bs-toggle="modal" data-bs-target="#createClassModal">
+        <button class="btn btn-gold d-flex align-items-center gap-2 align-self-start" data-bs-toggle="modal"
+            data-bs-target="#createClassModal">
             <i class="fas fa-plus"></i>
             <span>New Class</span>
         </button>
@@ -32,7 +32,8 @@
         <div class="col-6 col-lg-3">
             <div class="glass-card stat-card h-100">
                 <div class="stat-icon" style="background: rgba(0,90,43,0.12);">👥</div>
-                <div class="stat-number">{{ courses | sum(attribute='instructors') | list | length if false else '—' }}</div>
+                <div class="stat-number">{{ courses | sum(attribute='instructors') | list | length if false else '—' }}
+                </div>
                 <div class="stat-label">Instructors</div>
             </div>
         </div>
@@ -47,7 +48,7 @@
     <div class="row g-3">
         {% if courses %}
         {% for course in courses %}
-        <div class="col-12 col-sm-6 col-xl-4">
+        <div class="col-12 col-md-6 col-xl-4">
             <div class="card course-card h-100">
                 <div class="card-body d-flex flex-column">
 
@@ -83,11 +84,9 @@
                         </a>
                         {% if current_user.role == 'Course Coordinator' %}
                         <form method="POST" action="/delete_course/{{ course.id }}"
-                            onsubmit="return confirm('Delete {{ course.code }}? This cannot be undone.')"
-                            class="m-0">
+                            onsubmit="return confirm('Delete {{ course.code }}? This cannot be undone.')" class="m-0">
                             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                            <button type="submit" class="btn btn-outline-danger btn-sm"
-                                title="Delete course">
+                            <button type="submit" class="btn btn-outline-danger btn-sm" title="Delete course">
                                 <i class="fas fa-trash fa-xs"></i>
                             </button>
                         </form>
@@ -150,8 +149,7 @@
                 <div class="modal-body d-flex flex-column gap-3">
                     <div>
                         <label class="form-label">Course Code</label>
-                        <input type="text" name="code" class="form-control"
-                            placeholder="e.g. CSC 201" required>
+                        <input type="text" name="code" class="form-control" placeholder="e.g. CSC 201" required>
                     </div>
                     <div>
                         <label class="form-label">Course Title</label>
