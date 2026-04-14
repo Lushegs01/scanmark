@@ -122,7 +122,7 @@
                             <div class="col-6 mb-3">
                                 <label class="form-label">Matric No</label>
                                 <input type="text" name="matric_no" id="matricInput" class="form-control"
-                                    placeholder="2021/...">
+                                    placeholder="2021...">
                             </div>
                             <div class="col-6 mb-3">
                                 <label class="form-label">Level</label>
@@ -133,6 +133,7 @@
                                     <option value="300">300</option>
                                     <option value="400">400</option>
                                     <option value="500">500</option>
+                                    <option value="600">600</option>
                                 </select>
                             </div>
                         </div>
@@ -179,7 +180,7 @@
     emailInput.addEventListener('input', function () {
         const email = this.value.toLowerCase().trim();
 
-        if (email.includes('@student.funaab.edu.ng')) {
+        if (email.includes('@student.funaab.edu.ng','@gmail.com')) {
             detectedRoleDiv.innerHTML = '<span class="badge bg-primary">Student</span>';
             roleField.value = 'student';
             studentFields.style.display = 'block';
