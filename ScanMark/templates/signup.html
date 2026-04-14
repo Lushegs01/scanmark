@@ -180,48 +180,52 @@
     emailInput.addEventListener('input', function () {
         const email = this.value.toLowerCase().trim();
 
-        if (email.includes('@student.funaab.edu.ng','@gmail.com')) {
-            detectedRoleDiv.innerHTML = '<span class="badge bg-primary">Student</span>';
-            roleField.value = 'student';
-            studentFields.style.display = 'block';
-            staffRoleSelector.style.display = 'none';
-            staffRoleInput.required = false;
-            emailHelp.className = 'text-success mt-1 d-block';
-            emailHelp.textContent = '✓ Valid FUNAAB student email';
-        } else if (email.includes('@staff.funaab.edu.ng')) {
-            detectedRoleDiv.innerHTML = '<span class="badge bg-warning text-dark">Staff Member</span>';
-            roleField.value = 'lecturer';
-            studentFields.style.display = 'none';
-            staffRoleSelector.style.display = 'block';
-            staffRoleInput.required = true;
-            emailHelp.className = 'text-success mt-1 d-block';
-            emailHelp.textContent = '✓ Valid FUNAAB staff email — please select your role below';
-        } else if (email.endsWith('@funaab.edu.ng')) {
-            detectedRoleDiv.innerHTML = '<span class="badge bg-info text-dark">Student (General)</span>';
-            roleField.value = 'student';
-            studentFields.style.display = 'block';
-            staffRoleSelector.style.display = 'none';
-            staffRoleInput.required = false;
-            emailHelp.className = 'text-success mt-1 d-block';
-            emailHelp.textContent = '✓ Valid FUNAAB email';
-        } else if (email.includes('@')) {
-            detectedRoleDiv.innerHTML = '<span class="badge bg-danger">Invalid — must use FUNAAB email</span>';
-            roleField.value = '';
-            studentFields.style.display = 'none';
-            staffRoleSelector.style.display = 'none';
-            staffRoleInput.required = false;
-            emailHelp.className = 'text-danger mt-1 d-block';
-            emailHelp.textContent = '✗ Only FUNAAB emails are allowed';
-        } else {
-            detectedRoleDiv.textContent = '';
-            studentFields.style.display = 'none';
-            staffRoleSelector.style.display = 'none';
-            staffRoleInput.required = false;
-            emailHelp.className = 'text-muted mt-1 d-block';
-            emailHelp.textContent = 'Your role will be automatically detected from your email domain.';
-        }
-    });
+emailInput.addEventListener('input', function () {
+    const email = this.value.toLowerCase().trim();
 
+    // ✅ FIXED: Accept FUNAAB student emails OR Gmail
+    if (email.includes('@student.funaab.edu.ng') || email.includes('@gmail.com')) {
+        detectedRoleDiv.innerHTML = '<span class="badge bg-primary">Student</span>';
+        roleField.value = 'student';
+        studentFields.style.display = 'block';
+        staffRoleSelector.style.display = 'none';
+        staffRoleInput.required = false;
+        emailHelp.className = 'text-success mt-1 d-block';
+        emailHelp.textContent = '✓ Valid email address';
+    } else if (email.includes('@staff.funaab.edu.ng')) {
+        detectedRoleDiv.innerHTML = '<span class="badge bg-warning text-dark">Staff Member</span>';
+        roleField.value = 'lecturer';
+        studentFields.style.display = 'none';
+        staffRoleSelector.style.display = 'block';
+        staffRoleInput.required = true;
+        emailHelp.className = 'text-success mt-1 d-block';
+        emailHelp.textContent = '✓ Valid FUNAAB staff email — please select your role below';
+    } else if (email.endsWith('@funaab.edu.ng')) {
+        detectedRoleDiv.innerHTML = '<span class="badge bg-info text-dark">Student (General)</span>';
+        roleField.value = 'student';
+        studentFields.style.display = 'block';
+        staffRoleSelector.style.display = 'none';
+        staffRoleInput.required = false;
+        emailHelp.className = 'text-success mt-1 d-block';
+        emailHelp.textContent = '✓ Valid FUNAAB email';
+    } else if (email.includes('@')) {
+        // ✅ Changed: Less scary message
+        detectedRoleDiv.innerHTML = '<span class="badge bg-secondary">Other Email</span>';
+        roleField.value = '';
+        studentFields.style.display = 'none';
+        staffRoleSelector.style.display = 'none';
+        staffRoleInput.required = false;
+        emailHelp.className = 'text-warning mt-1 d-block';
+        emailHelp.textContent = '⚠ Recommended: Use FUNAAB email for automatic verification';
+    } else {
+        detectedRoleDiv.textContent = '';
+        studentFields.style.display = 'none';
+        staffRoleSelector.style.display = 'none';
+        staffRoleInput.required = false;
+        emailHelp.className = 'text-muted mt-1 d-block';
+        emailHelp.textContent = 'Your role will be automatically detected from your email domain.';
+    }
+});
     if (staffRoleInput) {
         staffRoleInput.addEventListener('change', function () {
             if (this.value) {
