@@ -19,8 +19,8 @@
                 <div class="d-flex align-items-center gap-3">
                     <div class="stat-icon flex-shrink-0" style="background: var(--gold-dim); font-size: 1rem;">📧</div>
                     <div>
-                        <p class="mb-0 fw-bold" style="color: var(--text); font-size: 0.88rem;">FUNAAB Email Required</p>
-                        <p class="mb-0 small" style="color: var(--text-muted);">Use @student, @staff, or @funaab.edu.ng</p>
+                        <p class="mb-0 fw-bold" style="color: var(--text); font-size: 0.88rem;">FUNAAB or Gmail Required</p>
+                        <p class="mb-0 small" style="color: var(--text-muted);">Use @student, @staff, @funaab.edu.ng, or @gmail.com</p>
                     </div>
                 </div>
                 <div class="d-flex align-items-center gap-3">
@@ -49,7 +49,7 @@
                         <i class="fas fa-user-plus" style="font-size: 2rem; color: var(--gold);"></i>
                     </div>
                     <h2 class="page-title" style="font-size: 1.4rem;">Create Account</h2>
-                    <p class="page-subtitle">Fill in your FUNAAB details to get started</p>
+                    <p class="page-subtitle">Fill in your FUNAAB or Gmail details to get started</p>
                 </div>
 
                 <!-- Google Sign-Up -->
@@ -83,9 +83,9 @@
                     </div>
 
                     <div class="mb-3">
-                        <label class="form-label">FUNAAB Email Address</label>
+                        <label class="form-label">Email Address</label>
                         <input type="email" name="email" id="emailInput" class="form-control"
-                            placeholder="yourname@student.funaab.edu.ng" required>
+                            placeholder="student@funaab.edu.ng or @gmail.com" required>
                         <small class="text-muted mt-1 d-block" id="emailHelp">
                             Your role will be automatically detected from your email domain.
                         </small>
@@ -122,7 +122,7 @@
                             <div class="col-6 mb-3">
                                 <label class="form-label">Matric No</label>
                                 <input type="text" name="matric_no" id="matricInput" class="form-control"
-                                    placeholder="2021...">
+                                    placeholder="2021/...">
                             </div>
                             <div class="col-6 mb-3">
                                 <label class="form-label">Level</label>
@@ -133,7 +133,6 @@
                                     <option value="300">300</option>
                                     <option value="400">400</option>
                                     <option value="500">500</option>
-                                    <option value="600">600</option>
                                 </select>
                             </div>
                         </div>
@@ -180,52 +179,56 @@
     emailInput.addEventListener('input', function () {
         const email = this.value.toLowerCase().trim();
 
-emailInput.addEventListener('input', function () {
-    const email = this.value.toLowerCase().trim();
+        if (email.includes('@student.funaab.edu.ng')) {
+            detectedRoleDiv.innerHTML = '<span class="badge bg-primary">Student</span>';
+            roleField.value = 'student';
+            studentFields.style.display = 'block';
+            staffRoleSelector.style.display = 'none';
+            staffRoleInput.required = false;
+            emailHelp.className = 'text-success mt-1 d-block';
+            emailHelp.textContent = '✓ Valid FUNAAB student email';
+        } else if (email.includes('@staff.funaab.edu.ng')) {
+            detectedRoleDiv.innerHTML = '<span class="badge bg-warning text-dark">Staff Member</span>';
+            roleField.value = 'lecturer';
+            studentFields.style.display = 'none';
+            staffRoleSelector.style.display = 'block';
+            staffRoleInput.required = true;
+            emailHelp.className = 'text-success mt-1 d-block';
+            emailHelp.textContent = '✓ Valid FUNAAB staff email — please select your role below';
+        } else if (email.endsWith('@funaab.edu.ng')) {
+            detectedRoleDiv.innerHTML = '<span class="badge bg-info text-dark">Student (General)</span>';
+            roleField.value = 'student';
+            studentFields.style.display = 'block';
+            staffRoleSelector.style.display = 'none';
+            staffRoleInput.required = false;
+            emailHelp.className = 'text-success mt-1 d-block';
+            emailHelp.textContent = '✓ Valid FUNAAB email';
+        } else if (email.endsWith('@gmail.com')) {
+            detectedRoleDiv.innerHTML = '<span class="badge bg-info text-dark">Student (Gmail)</span>';
+            roleField.value = 'student';
+            studentFields.style.display = 'block';
+            staffRoleSelector.style.display = 'none';
+            staffRoleInput.required = false;
+            emailHelp.className = 'text-success mt-1 d-block';
+            emailHelp.textContent = '✓ Valid Gmail account';
+        } else if (email.includes('@')) {
+            detectedRoleDiv.innerHTML = '<span class="badge bg-danger">Invalid — must use FUNAAB or Gmail</span>';
+            roleField.value = '';
+            studentFields.style.display = 'none';
+            staffRoleSelector.style.display = 'none';
+            staffRoleInput.required = false;
+            emailHelp.className = 'text-danger mt-1 d-block';
+            emailHelp.textContent = '✗ Only FUNAAB or Gmail emails are allowed';
+        } else {
+            detectedRoleDiv.textContent = '';
+            studentFields.style.display = 'none';
+            staffRoleSelector.style.display = 'none';
+            staffRoleInput.required = false;
+            emailHelp.className = 'text-muted mt-1 d-block';
+            emailHelp.textContent = 'Your role will be automatically detected from your email domain.';
+        }
+    });
 
-    // ✅ FIXED: Accept FUNAAB student emails OR Gmail
-    if (email.includes('@student.funaab.edu.ng') || email.includes('@gmail.com')) {
-        detectedRoleDiv.innerHTML = '<span class="badge bg-primary">Student</span>';
-        roleField.value = 'student';
-        studentFields.style.display = 'block';
-        staffRoleSelector.style.display = 'none';
-        staffRoleInput.required = false;
-        emailHelp.className = 'text-success mt-1 d-block';
-        emailHelp.textContent = '✓ Valid email address';
-    } else if (email.includes('@staff.funaab.edu.ng')) {
-        detectedRoleDiv.innerHTML = '<span class="badge bg-warning text-dark">Staff Member</span>';
-        roleField.value = 'lecturer';
-        studentFields.style.display = 'none';
-        staffRoleSelector.style.display = 'block';
-        staffRoleInput.required = true;
-        emailHelp.className = 'text-success mt-1 d-block';
-        emailHelp.textContent = '✓ Valid FUNAAB staff email — please select your role below';
-    } else if (email.endsWith('@funaab.edu.ng')) {
-        detectedRoleDiv.innerHTML = '<span class="badge bg-info text-dark">Student (General)</span>';
-        roleField.value = 'student';
-        studentFields.style.display = 'block';
-        staffRoleSelector.style.display = 'none';
-        staffRoleInput.required = false;
-        emailHelp.className = 'text-success mt-1 d-block';
-        emailHelp.textContent = '✓ Valid FUNAAB email';
-    } else if (email.includes('@')) {
-        // ✅ Changed: Less scary message
-        detectedRoleDiv.innerHTML = '<span class="badge bg-secondary">Other Email</span>';
-        roleField.value = '';
-        studentFields.style.display = 'none';
-        staffRoleSelector.style.display = 'none';
-        staffRoleInput.required = false;
-        emailHelp.className = 'text-warning mt-1 d-block';
-        emailHelp.textContent = '⚠ Recommended: Use FUNAAB email for automatic verification';
-    } else {
-        detectedRoleDiv.textContent = '';
-        studentFields.style.display = 'none';
-        staffRoleSelector.style.display = 'none';
-        staffRoleInput.required = false;
-        emailHelp.className = 'text-muted mt-1 d-block';
-        emailHelp.textContent = 'Your role will be automatically detected from your email domain.';
-    }
-});
     if (staffRoleInput) {
         staffRoleInput.addEventListener('change', function () {
             if (this.value) {
