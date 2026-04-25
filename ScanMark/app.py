@@ -36,6 +36,8 @@ from notifications import (
     generate_student_weekly_pdf,
     generate_lecturer_weekly_pdf,
     send_weekly_report_email,
+    send_parent_attendance_whatsapp,
+    send_parent_attendance_email,
     DEFAULT_ATTENDANCE_THRESHOLD,
 )
 
@@ -1578,7 +1580,7 @@ def mark_attendance():
             timestamp=timestamp_str
         )
 
-        # ── NEW: Real-time WhatsApp alert ──
+        # ── Real-time WhatsApp alert ──
         pref = NotificationPreference.query.filter_by(user_id=current_user.id).first()
         if pref and pref.whatsapp_alerts and pref.phone_number:
             send_attendance_whatsapp(
@@ -1589,7 +1591,32 @@ def mark_attendance():
                 timestamp_str=timestamp_str
             )
 
-        # ── NEW: Early-warning check ──
+        # ── Parent/Guardian real-time alerts ──
+        if pref and pref.notify_parent:
+            parent_name = pref.parent_name or 'Parent/Guardian'
+            # WhatsApp to parent
+            if pref.parent_phone:
+                send_parent_attendance_whatsapp(
+                    phone=pref.parent_phone,
+                    parent_name=parent_name,
+                    student_name=current_user.full_name,
+                    course_code=course.code,
+                    course_title=course.title,
+                    timestamp_str=timestamp_str
+                )
+            # Email to parent
+            if pref.parent_email:
+                send_parent_attendance_email(
+                    app_instance=app,
+                    mail_func=send_email,
+                    pref=pref,
+                    student_name=current_user.full_name,
+                    course_code=course.code,
+                    course_title=course.title,
+                    timestamp_str=timestamp_str
+                )
+
+        # ── Early-warning check (alerts student + parent if below threshold) ──
         process_early_warning(
             student=current_user,
             course=course,
@@ -1755,10 +1782,10 @@ def notification_settings():
             pref = NotificationPreference(user_id=current_user.id)
             db.session.add(pref)
 
-        # Update preferences
+        # Update student preferences
         phone = request.form.get('phone_number', '').strip()
         if phone and not phone.startswith('+'):
-            phone = '+234' + phone.lstrip('0')  # Default Nigeria country code
+            phone = '+234' + phone.lstrip('0')
         pref.phone_number = phone or None
 
         pref.whatsapp_alerts = bool(request.form.get('whatsapp_alerts'))
@@ -1770,6 +1797,17 @@ def notification_settings():
             pref.warning_threshold = max(10, min(100, int(threshold)))
         except ValueError:
             pref.warning_threshold = 75
+
+        # Update parent/guardian preferences
+        pref.parent_name = request.form.get('parent_name', '').strip() or None
+        pref.parent_email = request.form.get('parent_email', '').strip() or None
+
+        parent_phone = request.form.get('parent_phone', '').strip()
+        if parent_phone and not parent_phone.startswith('+'):
+            parent_phone = '+234' + parent_phone.lstrip('0')
+        pref.parent_phone = parent_phone or None
+
+        pref.notify_parent = bool(request.form.get('notify_parent'))
 
         db.session.commit()
         flash('Notification settings updated! ✅', 'success')
@@ -1840,6 +1878,16 @@ def run_weekly_reports():
                 app, send_email, student.email, student.full_name,
                 pdf_buf, 'student', week_range
             )
+
+            # Also send a copy to parent/guardian if enabled
+            if pref.notify_parent and pref.parent_email:
+                parent_name = pref.parent_name or 'Parent/Guardian'
+                pdf_buf.seek(0)  # reset buffer for re-read
+                send_weekly_report_email(
+                    app, send_email, pref.parent_email,
+                    f"{parent_name} (re: {student.full_name})",
+                    pdf_buf, 'parent', week_range
+                )
 
             # Record
             db.session.add(WeeklyReport(
@@ -1942,8 +1990,32 @@ def ratelimit_handler(e):
 
 with app.app_context():
     db.create_all()
-    db.engine.dispose()  # 🚨 THE FIX: Forces Gunicorn workers to create fresh connections
-    print("✅ Database initialized successfully!")
+
+    # ── Idempotent migration: add columns that create_all won't add ──
+    # db.create_all() only creates NEW tables; it never alters existing ones.
+    # This block safely adds any missing columns to production.
+    _migrations = [
+        # Parent/guardian notification columns
+        ("notification_preference", "parent_name",   "VARCHAR(100)"),
+        ("notification_preference", "parent_email",  "VARCHAR(120)"),
+        ("notification_preference", "parent_phone",  "VARCHAR(20)"),
+        ("notification_preference", "notify_parent", "BOOLEAN DEFAULT FALSE"),
+        # Attendance.course_id (was previously commented out)
+        ("attendance", "course_id", "INTEGER REFERENCES course(id)"),
+    ]
+    with db.engine.connect() as conn:
+        for table, column, col_type in _migrations:
+            try:
+                conn.execute(db.text(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {col_type}"
+                ))
+                conn.commit()
+                print(f"[MIGRATION] Added {table}.{column}")
+            except Exception:
+                conn.rollback()  # Column already exists — skip
+
+    db.engine.dispose()  # Forces Gunicorn workers to create fresh connections
+    print("[OK] Database initialized successfully!")
 
 # APScheduler: Weekly reports every Monday at 7 AM
 try:
