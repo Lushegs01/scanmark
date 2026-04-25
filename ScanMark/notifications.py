@@ -104,6 +104,105 @@ def send_warning_whatsapp(phone, student_name, course_code, attendance_pct, thre
 
 
 # ============================================================
+# PARENT / GUARDIAN NOTIFICATIONS
+# ============================================================
+
+def send_parent_attendance_whatsapp(phone, parent_name, student_name, course_code, course_title, timestamp_str):
+    """Notify a parent/guardian via WhatsApp that their ward marked attendance."""
+    message = (
+        f"✅ *Attendance Update*\n\n"
+        f"Dear {parent_name},\n"
+        f"Your ward *{student_name}* has just attended:\n\n"
+        f"📚 {course_code} — {course_title}\n"
+        f"🕐 {timestamp_str}\n\n"
+        f"_ScanMark • FUNAAB_"
+    )
+    notification_executor.submit(send_whatsapp_message, phone, message)
+
+
+def send_parent_warning_whatsapp(phone, parent_name, student_name, course_code, attendance_pct, threshold):
+    """Alert a parent/guardian via WhatsApp that their ward's attendance is low."""
+    message = (
+        f"⚠️ *Parent Alert — Low Attendance*\n\n"
+        f"Dear {parent_name},\n"
+        f"Your ward *{student_name}*'s attendance for *{course_code}* "
+        f"is at *{attendance_pct:.0f}%* (minimum: {threshold}%).\n\n"
+        f"Please encourage them to attend upcoming classes.\n\n"
+        f"_ScanMark • FUNAAB_"
+    )
+    notification_executor.submit(send_whatsapp_message, phone, message)
+
+
+def send_parent_attendance_email(app_instance, mail_func, pref, student_name, course_code, course_title, timestamp_str):
+    """Email a parent/guardian when their ward marks attendance."""
+    parent_name = pref.parent_name or 'Parent/Guardian'
+    subject = f"Attendance Update — {student_name} attended {course_code}"
+
+    text_body = (
+        f"Dear {parent_name},\n\n"
+        f"This is to inform you that your ward, {student_name}, "
+        f"attended {course_code} ({course_title}) on {timestamp_str}.\n\n"
+        f"— ScanMark, FUNAAB"
+    )
+
+    html_body = f"""
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"/></head>
+<body style="margin:0;padding:0;background:#f0f4f0;font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="padding:40px 20px;">
+    <tr><td align="center">
+      <table width="560" cellpadding="0" cellspacing="0"
+        style="background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.08);">
+        <tr>
+          <td style="background:linear-gradient(135deg,#006838 0%,#198754 100%);padding:36px 40px;text-align:center;">
+            <p style="margin:0 0 8px;font-size:36px;">👨‍👩‍👧</p>
+            <h1 style="margin:0;color:#ffffff;font-size:22px;font-weight:800;">Attendance Update</h1>
+            <p style="margin:6px 0 0;color:rgba(255,255,255,0.8);font-size:13px;">Your ward attended class</p>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:32px 40px;">
+            <p style="font-size:16px;color:#1a1a1a;margin:0 0 8px;font-weight:700;">Dear {parent_name},</p>
+            <p style="font-size:14px;color:#555;margin:0 0 20px;line-height:1.6;">
+              Your ward <strong>{student_name}</strong> has successfully marked attendance for:
+            </p>
+            <table width="100%" cellpadding="0" cellspacing="0"
+              style="border:1px solid #e2e8e2;border-radius:8px;overflow:hidden;margin-bottom:20px;">
+              <tr style="background:#f7faf7;">
+                <td style="padding:16px;text-align:center;border-right:1px solid #e2e8e2;">
+                  <div style="font-size:18px;font-weight:800;color:#006838;">{course_code}</div>
+                  <div style="font-size:11px;color:#999;text-transform:uppercase;letter-spacing:1px;">Course</div>
+                </td>
+                <td style="padding:16px;text-align:center;">
+                  <div style="font-size:14px;font-weight:600;color:#333;">{timestamp_str}</div>
+                  <div style="font-size:11px;color:#999;text-transform:uppercase;letter-spacing:1px;">Date & Time</div>
+                </td>
+              </tr>
+            </table>
+            <p style="font-size:13px;color:#777;line-height:1.5;">
+              <strong>{course_title}</strong>
+            </p>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:20px 40px;border-top:1px solid #e2e8e2;text-align:center;">
+            <p style="margin:0;font-size:12px;color:#999;">
+              <strong>Federal University of Agriculture, Abeokuta (FUNAAB)</strong><br/>
+              &copy; {datetime.now().year} ScanMark Attendance System
+            </p>
+          </td>
+        </tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>
+    """.strip()
+
+    mail_func(subject, pref.parent_email, text_body, html_body)
+
+
+# ============================================================
 # EARLY WARNING SYSTEM
 # ============================================================
 
@@ -144,7 +243,7 @@ def check_attendance_threshold(student, course, db_session, Attendance_model, Cl
 def process_early_warning(student, course, app_instance, mail_func, Attendance_model, ClassSession_model, db_session):
     """
     Full early-warning pipeline: check threshold → send alerts if needed.
-    Called after each attendance mark.
+    Called after each attendance mark.  Notifies student AND parent/guardian.
     """
     from models import NotificationPreference
 
@@ -157,7 +256,7 @@ def process_early_warning(student, course, app_instance, mail_func, Attendance_m
 
     pref = NotificationPreference.query.filter_by(user_id=student.id).first()
 
-    # Send email warning
+    # ── Student alerts ──
     if not pref or pref.email_alerts:
         notification_executor.submit(
             _send_warning_email_task,
@@ -171,7 +270,6 @@ def process_early_warning(student, course, app_instance, mail_func, Attendance_m
             threshold
         )
 
-    # Send WhatsApp warning
     if pref and pref.whatsapp_alerts and pref.phone_number:
         send_warning_whatsapp(
             pref.phone_number,
@@ -180,6 +278,36 @@ def process_early_warning(student, course, app_instance, mail_func, Attendance_m
             pct,
             threshold
         )
+
+    # ── Parent / Guardian alerts ──
+    if pref and pref.notify_parent:
+        parent_name = pref.parent_name or 'Parent/Guardian'
+
+        # Email the parent
+        if pref.parent_email:
+            notification_executor.submit(
+                _send_parent_warning_email_task,
+                app_instance,
+                mail_func,
+                pref.parent_email,
+                parent_name,
+                student.full_name,
+                course.code,
+                course.title,
+                pct,
+                threshold
+            )
+
+        # WhatsApp the parent
+        if pref.parent_phone:
+            send_parent_warning_whatsapp(
+                pref.parent_phone,
+                parent_name,
+                student.full_name,
+                course.code,
+                pct,
+                threshold
+            )
 
 
 def _send_warning_email_task(app_instance, mail_func, email, name, code, title, pct, threshold):
@@ -274,6 +402,80 @@ def _send_warning_email_task(app_instance, mail_func, email, name, code, title, 
     """.strip()
 
     mail_func(subject, email, text_body, html_body)
+
+
+def _send_parent_warning_email_task(app_instance, mail_func, parent_email, parent_name, student_name, code, title, pct, threshold):
+    """Email warning to parent/guardian — runs in thread pool."""
+    subject = f"Parent Alert — {student_name}'s attendance is low ({code})"
+
+    text_body = (
+        f"Dear {parent_name},\n\n"
+        f"Your ward {student_name}'s attendance for {code} ({title}) "
+        f"is currently at {pct:.0f}%, which is below the required {threshold}%.\n\n"
+        f"Please encourage them to attend upcoming classes.\n\n"
+        f"— ScanMark, FUNAAB"
+    )
+
+    html_body = f"""
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"/></head>
+<body style="margin:0;padding:0;background:#f0f4f0;font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="padding:40px 20px;">
+    <tr><td align="center">
+      <table width="560" cellpadding="0" cellspacing="0"
+        style="background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.08);">
+        <tr>
+          <td style="background:linear-gradient(135deg,#dc3545 0%,#c82333 100%);padding:36px 40px;text-align:center;">
+            <p style="margin:0 0 8px;font-size:36px;">👨‍👩‍👧</p>
+            <h1 style="margin:0;color:#ffffff;font-size:22px;font-weight:800;">Parent/Guardian Alert</h1>
+            <p style="margin:6px 0 0;color:rgba(255,255,255,0.8);font-size:13px;">{student_name}'s attendance needs attention</p>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:32px 40px;">
+            <p style="font-size:16px;color:#1a1a1a;margin:0 0 8px;font-weight:700;">Dear {parent_name},</p>
+            <p style="font-size:14px;color:#555;margin:0 0 20px;line-height:1.6;">
+              Your ward <strong>{student_name}</strong>'s attendance for
+              <strong>{code} — {title}</strong> has dropped below the required minimum.
+            </p>
+            <table width="100%" cellpadding="0" cellspacing="0"
+              style="border:1px solid #f5c6cb;border-radius:8px;overflow:hidden;margin-bottom:20px;">
+              <tr style="background:#fff5f5;">
+                <td style="padding:16px;text-align:center;border-right:1px solid #f5c6cb;">
+                  <div style="font-size:28px;font-weight:800;color:#dc3545;">{pct:.0f}%</div>
+                  <div style="font-size:11px;color:#999;text-transform:uppercase;letter-spacing:1px;">Current Attendance</div>
+                </td>
+                <td style="padding:16px;text-align:center;">
+                  <div style="font-size:28px;font-weight:800;color:#198754;">{threshold}%</div>
+                  <div style="font-size:11px;color:#999;text-transform:uppercase;letter-spacing:1px;">Required Minimum</div>
+                </td>
+              </tr>
+            </table>
+            <div style="background:#fff3cd;border-left:4px solid #ffc107;padding:14px 16px;border-radius:4px;">
+              <p style="margin:0;font-size:13px;color:#555;line-height:1.5;">
+                Please encourage your ward to attend upcoming classes consistently
+                to improve their attendance record.
+              </p>
+            </div>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:20px 40px;border-top:1px solid #e2e8e2;text-align:center;">
+            <p style="margin:0;font-size:12px;color:#999;">
+              <strong>Federal University of Agriculture, Abeokuta (FUNAAB)</strong><br/>
+              &copy; {datetime.now().year} ScanMark Attendance System
+            </p>
+          </td>
+        </tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>
+    """.strip()
+
+    mail_func(subject, parent_email, text_body, html_body)
 
 
 # ============================================================
