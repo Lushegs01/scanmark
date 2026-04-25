@@ -27,7 +27,17 @@ from flask_wtf.csrf import CSRFProtect
 import sentry_sdk
 from sentry_sdk.integrations.flask import FlaskIntegration
 
-from models import db, User, Course, Attendance
+from models import db, User, Course, Attendance, ClassSession, NotificationPreference, WeeklyReport
+from notifications import (
+    send_attendance_whatsapp,
+    send_warning_whatsapp,
+    check_attendance_threshold,
+    process_early_warning,
+    generate_student_weekly_pdf,
+    generate_lecturer_weekly_pdf,
+    send_weekly_report_email,
+    DEFAULT_ATTENDANCE_THRESHOLD,
+)
 
 # ============================================================
 # SENTRY ERROR MONITORING
@@ -1568,6 +1578,28 @@ def mark_attendance():
             timestamp=timestamp_str
         )
 
+        # ── NEW: Real-time WhatsApp alert ──
+        pref = NotificationPreference.query.filter_by(user_id=current_user.id).first()
+        if pref and pref.whatsapp_alerts and pref.phone_number:
+            send_attendance_whatsapp(
+                phone=pref.phone_number,
+                student_name=current_user.full_name,
+                course_code=course.code,
+                course_title=course.title,
+                timestamp_str=timestamp_str
+            )
+
+        # ── NEW: Early-warning check ──
+        process_early_warning(
+            student=current_user,
+            course=course,
+            app_instance=app,
+            mail_func=send_email,
+            Attendance_model=Attendance,
+            ClassSession_model=ClassSession,
+            db_session=db.session
+        )
+
         return jsonify({"status": "success", "message": "Attendance marked successfully! ✅"})
 
     except Exception as e:
@@ -1686,6 +1718,208 @@ def course_analytics(course_id):
                            dates=dates, 
                            counts=counts)
 
+from datetime import datetime
+
+@app.route('/course/<int:course_id>/start_session', methods=['POST'])
+@login_required
+def start_session(course_id):
+    course = Course.query.get_or_404(course_id)
+    
+    # Security check: Ensure they are the lecturer
+    if not getattr(course, 'coordinator_id') == current_user.id and current_user not in getattr(course, 'instructors', []):
+        return "Unauthorised", 403
+
+    # Automatically generate a smart title (e.g., "Lecture on Apr 15")
+    today_date = datetime.now().strftime("%b %d")
+    session_title = f"Lecture on {today_date}"
+
+    # Create the new session in the database
+    new_session = ClassSession(course_id=course.id, title=session_title)
+    db.session.add(new_session)
+    db.session.commit()
+
+    # Immediately redirect them to the live projector page, passing the NEW session_id!
+    return redirect(url_for('live_qr_projector', session_id=new_session.id))
+
+# ============================================================
+# NOTIFICATION SETTINGS ROUTES
+# ============================================================
+
+@app.route('/notification_settings', methods=['GET', 'POST'])
+@login_required
+def notification_settings():
+    pref = NotificationPreference.query.filter_by(user_id=current_user.id).first()
+
+    if request.method == 'POST':
+        if not pref:
+            pref = NotificationPreference(user_id=current_user.id)
+            db.session.add(pref)
+
+        # Update preferences
+        phone = request.form.get('phone_number', '').strip()
+        if phone and not phone.startswith('+'):
+            phone = '+234' + phone.lstrip('0')  # Default Nigeria country code
+        pref.phone_number = phone or None
+
+        pref.whatsapp_alerts = bool(request.form.get('whatsapp_alerts'))
+        pref.email_alerts = bool(request.form.get('email_alerts'))
+        pref.weekly_report = bool(request.form.get('weekly_report'))
+
+        threshold = request.form.get('warning_threshold', '75')
+        try:
+            pref.warning_threshold = max(10, min(100, int(threshold)))
+        except ValueError:
+            pref.warning_threshold = 75
+
+        db.session.commit()
+        flash('Notification settings updated! ✅', 'success')
+        return redirect(url_for('notification_settings'))
+
+    return render_template('notification_settings.html', pref=pref)
+
+
+# ============================================================
+# WEEKLY REPORT SCHEDULER
+# ============================================================
+
+def run_weekly_reports():
+    """Generate and email weekly PDF reports for all opted-in users."""
+    with app.app_context():
+        today = datetime.utcnow().date()
+        week_end = today
+        week_start = today - timedelta(days=7)
+        week_range = f"{week_start.strftime('%d %b')} — {week_end.strftime('%d %b %Y')}"
+
+        print(f"\n📊 Running weekly reports for {week_range}...")
+
+        # ── Student Reports ──
+        students_with_pref = (
+            db.session.query(User, NotificationPreference)
+            .join(NotificationPreference, NotificationPreference.user_id == User.id)
+            .filter(User.role == 'student')
+            .filter(NotificationPreference.weekly_report == True)
+            .all()
+        )
+
+        for student, pref in students_with_pref:
+            # Check if already sent this week
+            existing = WeeklyReport.query.filter_by(
+                user_id=student.id,
+                week_start=week_start,
+                report_type='student'
+            ).first()
+            if existing:
+                continue
+
+            # Build course data
+            courses_data = []
+            for course in getattr(student, 'enrolled_courses', []):
+                total_sessions = ClassSession.query.filter_by(course_id=course.id).count()
+                attended = Attendance.query.filter_by(
+                    student_id=student.id,
+                    course_id=course.id
+                ).count()
+                pct = (attended / total_sessions * 100) if total_sessions > 0 else 0
+                courses_data.append({
+                    'code': course.code,
+                    'title': course.title,
+                    'total_sessions': total_sessions,
+                    'attended': attended,
+                    'percentage': pct,
+                })
+
+            if not courses_data:
+                continue
+
+            pdf_buf = generate_student_weekly_pdf(
+                student, courses_data,
+                datetime.combine(week_start, datetime.min.time()),
+                datetime.combine(week_end, datetime.min.time())
+            )
+            send_weekly_report_email(
+                app, send_email, student.email, student.full_name,
+                pdf_buf, 'student', week_range
+            )
+
+            # Record
+            db.session.add(WeeklyReport(
+                user_id=student.id,
+                week_start=week_start,
+                week_end=week_end,
+                report_type='student'
+            ))
+
+        # ── Lecturer Reports ──
+        lecturers = User.query.filter(
+            User.role.in_(['lecturer', 'Lecturer', 'Course Coordinator', 'course coordinator'])
+        ).all()
+
+        for lecturer in lecturers:
+            lec_pref = NotificationPreference.query.filter_by(user_id=lecturer.id).first()
+            if lec_pref and not lec_pref.weekly_report:
+                continue
+
+            existing = WeeklyReport.query.filter_by(
+                user_id=lecturer.id,
+                week_start=week_start,
+                report_type='lecturer'
+            ).first()
+            if existing:
+                continue
+
+            # Get courses this lecturer manages
+            coordinated = Course.query.filter_by(coordinator_id=lecturer.id).all()
+            teaching = getattr(lecturer, 'teaching_courses', [])
+            all_courses = list(set(list(coordinated) + list(teaching)))
+
+            if not all_courses:
+                continue
+
+            courses_data = []
+            for course in all_courses:
+                total_enrolled = len(course.students) if hasattr(course, 'students') else 0
+                sessions_week = ClassSession.query.filter(
+                    ClassSession.course_id == course.id,
+                    ClassSession.date_created >= datetime.combine(week_start, datetime.min.time()),
+                    ClassSession.date_created <= datetime.combine(week_end, datetime.max.time())
+                ).count()
+                total_sessions = ClassSession.query.filter_by(course_id=course.id).count()
+
+                # Average attendance
+                if total_sessions > 0 and total_enrolled > 0:
+                    total_att = Attendance.query.filter_by(course_id=course.id).count()
+                    avg_pct = (total_att / (total_sessions * total_enrolled)) * 100
+                else:
+                    avg_pct = 0
+
+                courses_data.append({
+                    'code': course.code,
+                    'title': course.title,
+                    'total_enrolled': total_enrolled,
+                    'sessions_this_week': sessions_week,
+                    'avg_attendance_pct': avg_pct,
+                })
+
+            pdf_buf = generate_lecturer_weekly_pdf(
+                lecturer, courses_data,
+                datetime.combine(week_start, datetime.min.time()),
+                datetime.combine(week_end, datetime.min.time())
+            )
+            send_weekly_report_email(
+                app, send_email, lecturer.email, lecturer.full_name,
+                pdf_buf, 'lecturer', week_range
+            )
+
+            db.session.add(WeeklyReport(
+                user_id=lecturer.id,
+                week_start=week_start,
+                week_end=week_end,
+                report_type='lecturer'
+            ))
+
+        db.session.commit()
+        print("✅ Weekly reports sent!")
+
 
 # ============================================================
 # ERROR HANDLERS
@@ -1703,13 +1937,33 @@ def ratelimit_handler(e):
     return f"<h2>Too Many Requests!</h2><p>Please wait a minute and <a href='{url_for('dashboard')}'>try again</a>.</p>", 429
 
 # ============================================================
-# DATABASE INITIALIZATION
+# DATABASE INITIALIZATION & SCHEDULER
 # ============================================================
 
 with app.app_context():
     db.create_all()
     db.engine.dispose()  # 🚨 THE FIX: Forces Gunicorn workers to create fresh connections
     print("✅ Database initialized successfully!")
+
+# APScheduler: Weekly reports every Monday at 7 AM
+try:
+    from apscheduler.schedulers.background import BackgroundScheduler
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(
+        func=run_weekly_reports,
+        trigger='cron',
+        day_of_week='mon',
+        hour=7,
+        minute=0,
+        id='weekly_reports',
+        replace_existing=True
+    )
+    scheduler.start()
+    print("📅 Weekly Report Scheduler Active (Every Monday @ 7:00 AM)")
+except ImportError:
+    print("⚠️  APScheduler not installed. Weekly reports won't run automatically.")
+    print("   Install with: pip install APScheduler")
+
 if __name__ == '__main__':
     print("\n" + "="*60)
     print("🎓 FUNAAB ATTENDANCE SYSTEM STARTING")
@@ -1718,6 +1972,9 @@ if __name__ == '__main__':
     print(f"📧 Mail Username: {app.config['MAIL_USERNAME']}")
     print(f"🔐 CSRF Protection: Enabled")
     print(f"🛡️  Rate Limiting: Enabled")
+    print(f"📱 WhatsApp Alerts: {'Enabled' if os.environ.get('TWILIO_ACCOUNT_SID') else 'Disabled'}")
+    print(f"📊 Weekly PDF Reports: Scheduled (Monday 7 AM)")
+    print(f"⚠️  Early-Warning Threshold: {DEFAULT_ATTENDANCE_THRESHOLD}%")
     print("="*60 + "\n")
     
     app.run(host='0.0.0.0', port=5000, debug=True)

@@ -64,9 +64,51 @@ class Course(db.Model):
     # NEW: Links a course to a faculty so the Dean can see it
     faculty = db.Column(db.String(50), nullable=True)
 
+class ClassSession(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    course_id = db.Column(db.Integer, db.ForeignKey('course.id'), nullable=False)
+    title = db.Column(db.String(100), nullable=False)  # e.g., "Week 1", "Makeup Class"
+    date_created = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    # This relationship links the session to all the students who scanned it
+    attendances = db.relationship('Attendance', backref='session', lazy=True, cascade="all, delete-orphan")
+
 class Attendance(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     student_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
-    course_id = db.Column(db.Integer, db.ForeignKey('course.id'), nullable=False)
+    #course_id = db.Column(db.Integer, db.ForeignKey('course.id'), nullable=False)
+    session_id = db.Column(db.Integer, db.ForeignKey('class_session.id'), nullable=False)
     timestamp = db.Column(db.DateTime, default=datetime.utcnow)
-    device_id = db.Column(db.String(100))
+    device_id = db.Column(db.String(200), nullable=True)
+
+
+class NotificationPreference(db.Model):
+    """Per-user notification settings for alerts and reports."""
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), unique=True, nullable=False)
+
+    # WhatsApp
+    phone_number = db.Column(db.String(20), nullable=True)  # e.g. +2348012345678
+    whatsapp_alerts = db.Column(db.Boolean, default=False)
+
+    # Email
+    email_alerts = db.Column(db.Boolean, default=True)
+
+    # Weekly PDF reports
+    weekly_report = db.Column(db.Boolean, default=True)
+
+    # Early-warning threshold (percentage)
+    warning_threshold = db.Column(db.Integer, default=75)
+
+    # Relationship back to user
+    user = db.relationship('User', backref=db.backref('notification_pref', uselist=False))
+
+
+class WeeklyReport(db.Model):
+    """Tracks sent weekly reports to avoid duplicates."""
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    week_start = db.Column(db.Date, nullable=False)
+    week_end = db.Column(db.Date, nullable=False)
+    sent_at = db.Column(db.DateTime, default=datetime.utcnow)
+    report_type = db.Column(db.String(20), nullable=False)  # 'student' or 'lecturer'
