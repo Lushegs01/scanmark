@@ -76,7 +76,7 @@ class ClassSession(db.Model):
 class Attendance(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     student_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
-    #course_id = db.Column(db.Integer, db.ForeignKey('course.id'), nullable=False)
+    course_id = db.Column(db.Integer, db.ForeignKey('course.id'), nullable=False)
     session_id = db.Column(db.Integer, db.ForeignKey('class_session.id'), nullable=False)
     timestamp = db.Column(db.DateTime, default=datetime.utcnow)
     device_id = db.Column(db.String(200), nullable=True)
@@ -99,6 +99,12 @@ class NotificationPreference(db.Model):
 
     # Early-warning threshold (percentage)
     warning_threshold = db.Column(db.Integer, default=75)
+
+    # ── Parent / Guardian ──
+    parent_name = db.Column(db.String(100), nullable=True)
+    parent_email = db.Column(db.String(120), nullable=True)
+    parent_phone = db.Column(db.String(20), nullable=True)   # e.g. +2348098765432
+    notify_parent = db.Column(db.Boolean, default=False)      # master toggle
 
     # Relationship back to user
     user = db.relationship('User', backref=db.backref('notification_pref', uselist=False))
