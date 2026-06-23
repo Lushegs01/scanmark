@@ -6,6 +6,8 @@ import secrets
 import time
 import math
 import re
+import json
+import base64
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -947,6 +949,153 @@ def authorize_google():
 
     login_user(user)
     return redirect_by_role(user.role)
+
+
+# ============================================================
+# CAMPOS SSO HAND-OFF  (Single Sign-On from CampOS Core)
+# ============================================================
+# CampOS Core is the identity provider. When a student clicks "ScanMark"
+# inside CampOS, Core mints a short-lived signed token carrying their CampOS
+# identity and redirects here. We verify the token with the SHARED secret,
+# trust the claims, find/create the local user, and log them in — so the
+# student signs in once at CampOS and lands here already authenticated.
+#
+# The signing secret MUST match CampOS Core. Set SSO_JWT_SECRET to the same
+# value in both apps (defaults mirror Core so local dev works out of the box).
+
+SSO_ISSUER = 'campos-core'
+SSO_AUDIENCE = 'scanmark'
+
+
+def _sso_secret() -> str:
+    return (
+        os.environ.get('SSO_JWT_SECRET')
+        or os.environ.get('JWT_SECRET')
+        or 'campos-jwt-secret-change-in-production'
+    )
+
+
+def _sso_b64url_decode(segment: str) -> bytes:
+    """Decode a base64url segment, restoring missing padding."""
+    padding = '=' * (-len(segment) % 4)
+    return base64.urlsafe_b64decode(segment + padding)
+
+
+def _map_campos_role(roles) -> str:
+    """Map CampOS roles onto ScanMark roles. Students are the default."""
+    roles = [str(r).lower().strip() for r in (roles or [])]
+    if any(r in ('lecturer', 'course coordinator', 'instructor') for r in roles):
+        return 'lecturer'
+    if 'hod' in roles:
+        return 'hod'
+    if 'dean' in roles:
+        return 'dean'
+    return 'student'
+
+
+def verify_campos_sso_token(token: str) -> dict:
+    """
+    Verify an HS256 JWT minted by CampOS Core using the Python standard
+    library (no extra dependencies). Checks the signature, expiry, issuer
+    and audience, and returns the claims dict. Raises ValueError on failure.
+    """
+    try:
+        header_b64, payload_b64, sig_b64 = token.split('.')
+    except ValueError:
+        raise ValueError('malformed token')
+
+    header = json.loads(_sso_b64url_decode(header_b64))
+    if header.get('alg') != 'HS256':
+        raise ValueError('unexpected signing algorithm')
+
+    signing_input = f'{header_b64}.{payload_b64}'.encode('ascii')
+    expected_sig = hmac.new(
+        _sso_secret().encode('utf-8'), signing_input, hashlib.sha256
+    ).digest()
+    if not hmac.compare_digest(expected_sig, _sso_b64url_decode(sig_b64)):
+        raise ValueError('bad signature')
+
+    claims = json.loads(_sso_b64url_decode(payload_b64))
+
+    now = int(time.time())
+    if 'exp' in claims and now > int(claims['exp']) + 5:  # 5s clock leeway
+        raise ValueError('token expired')
+    if claims.get('iss') != SSO_ISSUER:
+        raise ValueError('bad issuer')
+    if claims.get('aud') != SSO_AUDIENCE:
+        raise ValueError('bad audience')
+
+    return claims
+
+
+@app.route('/sso/callback')
+@csrf.exempt
+def campos_sso_callback():
+    token = request.args.get('token')
+    next_path = request.args.get('next')
+
+    if not token:
+        flash('Sign-in failed: missing SSO token.', 'error')
+        return redirect(url_for('login'))
+
+    try:
+        claims = verify_campos_sso_token(token)
+    except Exception as e:
+        print(f'⚠️  CampOS SSO rejected: {e}')
+        flash('Sign-in failed: the link is invalid or has expired.', 'error')
+        return redirect(url_for('login'))
+
+    email = (claims.get('email') or '').strip().lower()
+    if not email:
+        flash('Sign-in failed: no email in identity token.', 'error')
+        return redirect(url_for('login'))
+
+    full_name = ' '.join(
+        filter(None, [claims.get('firstName'), claims.get('lastName')])
+    ).strip() or email.split('@')[0]
+    matric_no = claims.get('matricNumber')
+    level = claims.get('level')
+    role = _map_campos_role(claims.get('roles'))
+
+    user = User.query.filter_by(email=email).first()
+    if not user:
+        # First arrival from CampOS — provision the local account.
+        user = User(
+            full_name=full_name,
+            email=email,
+            password=generate_password_hash(secrets.token_hex(32), method='scrypt'),
+            role=role,
+        )
+        # CampOS is the source of truth for matric number (guard uniqueness).
+        if matric_no and not User.query.filter_by(matric_no=matric_no).first():
+            user.matric_no = matric_no
+        if level:
+            user.level = level
+        db.session.add(user)
+        db.session.commit()
+        print(f'🟢 Created ScanMark user via CampOS SSO: {email}')
+    else:
+        # Keep identity fresh from the source of truth.
+        changed = False
+        if full_name and user.full_name != full_name:
+            user.full_name = full_name
+            changed = True
+        if matric_no and not user.matric_no and not User.query.filter_by(matric_no=matric_no).first():
+            user.matric_no = matric_no
+            changed = True
+        if level and not user.level:
+            user.level = level
+            changed = True
+        if changed:
+            db.session.commit()
+
+    login_user(user)
+
+    # Only allow safe relative redirects (block open-redirect via ?next=).
+    if next_path and next_path.startswith('/') and not next_path.startswith('//'):
+        return redirect(next_path)
+    return redirect_by_role(user.role)
+
 
 @app.route('/complete_profile', methods=['GET', 'POST'])
 @login_required
