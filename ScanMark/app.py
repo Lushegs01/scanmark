@@ -2201,6 +2201,10 @@ with app.app_context():
         ("notification_preference", "notify_parent", "BOOLEAN DEFAULT FALSE"),
         # Attendance.course_id (was previously commented out)
         ("attendance", "course_id", "INTEGER REFERENCES course(id)"),
+        # Attendance.session_id — model declares it but older tables lack the
+        # column, so reads/inserts on `attendance` fail until it is added.
+        ("attendance", "session_id", "INTEGER"),
+        ("attendance", "device_id", "VARCHAR(200)"),
     ]
     with db.engine.connect() as conn:
         for table, column, col_type in _migrations:
