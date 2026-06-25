@@ -1650,6 +1650,41 @@ def set_location(course_id):
 # ATTENDANCE ROUTES
 # ============================================================
 
+# ============================================================
+# CAMPOS ATTENDANCE REPORTING
+# ============================================================
+# After attendance is recorded locally, report it to CampOS Core so it appears
+# on the student's CampOS dashboard. Keyed by the shared identity (matric/email).
+# Best-effort and fully isolated — never affects attendance marking. Configure
+# CAMPOS_API_URL and CAMPOS_API_KEY in the environment to enable it.
+
+def report_attendance_to_campos(matric_no, email, course_code, course_title, external_id, scanned_at_iso):
+    import requests
+    base = os.environ.get('CAMPOS_API_URL')
+    api_key = os.environ.get('CAMPOS_API_KEY')
+    if not base or not api_key:
+        return  # CampOS reporting not configured
+    try:
+        resp = requests.post(
+            f"{base.rstrip('/')}/api/modules/attendance",
+            json={
+                'matricNumber': matric_no,
+                'email': email,
+                'courseCode': course_code,
+                'courseTitle': course_title,
+                'status': 'present',
+                'externalId': str(external_id),
+                'scannedAt': scanned_at_iso,
+            },
+            headers={'X-API-Key': api_key},
+            timeout=8,
+        )
+        if resp.status_code >= 300:
+            print(f"⚠️ CampOS attendance report failed ({resp.status_code}): {resp.text[:200]}")
+    except Exception as e:
+        print(f"⚠️ CampOS attendance report error: {e}")
+
+
 @app.route('/mark_attendance', methods=['POST'])
 @limiter.limit("10 per minute", error_message="Too many scan attempts. Please wait.")
 @login_required
@@ -1718,7 +1753,22 @@ def mark_attendance():
         )
         db.session.add(new_record)
         db.session.commit()
-        
+
+        # Report to CampOS Core (best-effort, async — never blocks the scan).
+        try:
+            scanned_iso = (new_record.timestamp.isoformat() + "Z") if new_record.timestamp else None
+            email_executor.submit(
+                report_attendance_to_campos,
+                current_user.matric_no,
+                current_user.email,
+                course.code,
+                course.title,
+                new_record.id,
+                scanned_iso,
+            )
+        except Exception as e:
+            print(f"⚠️ Could not queue CampOS attendance report: {e}")
+
         # Send attendance confirmation email
         timestamp_str = datetime.now().strftime('%B %d, %Y at %I:%M %p')
         send_attendance_confirmation(
