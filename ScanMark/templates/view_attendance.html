@@ -2,49 +2,119 @@
 
 {% block content %}
 <div class="container mt-4">
-    <div class="d-flex justify-content-between align-items-center mb-3">
+    <div class="d-flex flex-column flex-md-row justify-content-between align-items-md-center gap-2 mb-3">
         <div>
-            <h2>📋 {{ course.code }} Attendance Sheet</h2>
-            <p class="text-muted">Total Present: <strong>{{ attendees|length }}</strong></p>
+            <h2>📋 {{ course.code }} Attendance Records</h2>
+            <p class="text-muted mb-0">
+                <strong>{{ sessions_data|length }}</strong> class{{ 'es' if sessions_data|length != 1 }} held
+                &nbsp;·&nbsp; <strong>{{ enrolled_total }}</strong> enrolled
+                {% if sessions_data %}
+                &nbsp;·&nbsp; avg <strong>{{ avg_present }}</strong> present per class
+                {% endif %}
+            </p>
         </div>
-       <div>
-    <a href="/dashboard" class="btn btn-secondary">Back</a>
-    <a href="/course/{{ course.id }}/download_csv" class="btn btn-primary">📥 Download CSV</a>
-    <button class="btn btn-outline-success" onclick="window.print()">🖨️ Print View</button>
-</div>
+        <div class="d-flex flex-wrap gap-2">
+            <a href="/dashboard" class="btn btn-secondary">Back</a>
+            {% if can_manage %}
+            <a href="{{ url_for('download_csv', course_id=course.id) }}" class="btn btn-primary"
+                title="One row per student, one column per class, with totals and %">
+                📥 Semester Register (CSV)
+            </a>
+            {% endif %}
+            <button class="btn btn-outline-success" onclick="window.print()">🖨️ Print View</button>
+        </div>
     </div>
 
+    {% if unassigned %}
+    <div class="alert alert-warning py-2 small">
+        ⚠️ {{ unassigned }} older record(s) are not linked to a class session yet. They will be
+        linked automatically the next time the server restarts.
+    </div>
+    {% endif %}
+
+    {% if sessions_data %}
+    <div class="accordion" id="sessionsAccordion">
+        {% for item in sessions_data %}
+        {% set sess = item.session %}
+        <div class="accordion-item mb-2 shadow-sm">
+            <h2 class="accordion-header" id="heading{{ sess.id }}">
+                <button class="accordion-button {{ '' if loop.first else 'collapsed' }}" type="button"
+                    data-bs-toggle="collapse" data-bs-target="#collapse{{ sess.id }}"
+                    aria-expanded="{{ 'true' if loop.first else 'false' }}" aria-controls="collapse{{ sess.id }}">
+                    <div class="d-flex flex-wrap align-items-center gap-2 w-100 me-3">
+                        <strong>{{ sess.title }}</strong>
+                        <span class="text-muted small">
+                            {{ sess.date_created.strftime('%A, %d %B %Y') if sess.date_created }}
+                        </span>
+                        <span class="badge bg-success ms-auto">
+                            {{ item.present }} / {{ enrolled_total }} present
+                            {% if item.pct is not none %}({{ item.pct }}%){% endif %}
+                        </span>
+                    </div>
+                </button>
+            </h2>
+            <div id="collapse{{ sess.id }}" class="accordion-collapse collapse {{ 'show' if loop.first }}"
+                aria-labelledby="heading{{ sess.id }}" data-bs-parent="#sessionsAccordion">
+                <div class="accordion-body p-0">
+                    <table class="table table-striped table-hover mb-0">
+                        <thead class="bg-dark text-white">
+                            <tr>
+                                <th>#</th>
+                                <th>Full Name</th>
+                                <th>Matric No</th>
+                                <th>Level</th>
+                                <th>Time Scanned</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for record in item.records %}
+                            <tr>
+                                <td>{{ loop.index }}</td>
+                                <td>{{ record.student.full_name if record.student else 'Deleted User' }}</td>
+                                <td>{{ record.student.matric_no if record.student else 'N/A' }}</td>
+                                <td>{{ record.student.level ~ 'L' if record.student and record.student.level else 'N/A' }}</td>
+                                <td>{{ record.timestamp.strftime('%I:%M %p') if record.timestamp }}</td>
+                            </tr>
+                            {% else %}
+                            <tr>
+                                <td colspan="5" class="text-center py-4">
+                                    <span class="text-muted">Nobody scanned for this class.</span>
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                    {% if can_manage %}
+                    <div class="d-flex justify-content-between align-items-center p-2 border-top">
+                        <a href="{{ url_for('download_csv', course_id=course.id, session_id=sess.id) }}"
+                            class="btn btn-sm btn-outline-primary">
+                            📥 This class only (CSV)
+                        </a>
+                        <form method="POST" action="{{ url_for('delete_session', session_id=sess.id) }}" class="m-0"
+                            onsubmit="return confirm('Delete “{{ sess.title }}” and its {{ item.present }} record(s)? It will no longer count as a class held.')">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                            <button type="submit" class="btn btn-sm btn-outline-danger" title="Delete this session">
+                                🗑️ Delete session
+                            </button>
+                        </form>
+                    </div>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+    {% else %}
     <div class="card shadow">
-        <div class="card-body p-0">
-            <table class="table table-striped table-hover mb-0">
-                <thead class="bg-dark text-white">
-                    <tr>
-                        <th>#</th>
-                        <th>Full Name</th>
-                        <th>Matric No</th>
-                        <th>Level</th>
-                        <th>Time Scanned</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {% for record in attendees %}
-                    <tr>
-                        <td>{{ loop.index }}</td>
-                        <td>{{ record.student.full_name }}</td>
-                        <td>{{ record.student.matric_no }}</td>
-                        <td>{{ record.student.level }}L</td>
-                        <td>{{ record.timestamp.strftime('%I:%M %p') }}</td>
-                    </tr>
-                    {% else %}
-                    <tr>
-                        <td colspan="5" class="text-center py-4">
-                            <span class="text-muted">No attendance marked yet.</span>
-                        </td>
-                    </tr>
-                    {% endfor %}
-                </tbody>
-            </table>
+        <div class="card-body text-center py-5">
+            <span style="font-size: 2rem;">📭</span>
+            <p class="fw-semibold mb-1">No classes held yet</p>
+            <p class="text-muted small mb-0">
+                Press <strong>Start Attendance</strong> on your dashboard to open your first class session.
+                Each session keeps its own attendance sheet, week after week.
+            </p>
         </div>
     </div>
+    {% endif %}
 </div>
 {% endblock %}

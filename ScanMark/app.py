@@ -620,13 +620,16 @@ def _make_signature(message: str) -> str:
     ).hexdigest()[:16]
 
 
-def generate_signed_qr(course_id: int) -> str:
+def generate_signed_qr(session_id: int) -> str:
     """
-    Generate a signed QR payload and cache it in Redis so that
-    /api/qr_data and the live image endpoint always return the SAME token.
-    Format: "course_id|timestamp|hmac_sig"
+    Generate a signed QR payload for one CLASS SESSION and cache it in Redis
+    so that /api/qr_data and the live image endpoint always return the SAME
+    token. Format: "S<session_id>|timestamp|hmac_sig"
+
+    Tokens are scoped to a ClassSession (one class meeting), not the course,
+    so every scan lands in the record set of that specific lecture.
     """
-    cache_key = f"qr_token:{course_id}"
+    cache_key = f"qr_token:session:{session_id}"
 
     if redis_client:
         cached = redis_client.get(cache_key)
@@ -635,7 +638,7 @@ def generate_signed_qr(course_id: int) -> str:
 
     # Create a new token
     timestamp = int(time.time())
-    message = f"{course_id}|{timestamp}"
+    message = f"S{session_id}|{timestamp}"
     sig = _make_signature(message)
     token = f"{message}|{sig}"
 
@@ -648,24 +651,27 @@ def generate_signed_qr(course_id: int) -> str:
 def verify_signed_qr(qr_text: str):
     """
     Verify the QR payload signature and expiry.
-    Returns (course_id, timestamp) on success, or raises ValueError.
+    Returns (session_id, timestamp) on success, or raises ValueError.
     """
     parts = qr_text.split('|')
     if len(parts) != 3:
         raise ValueError("Invalid QR code format.")
 
-    course_id_str, timestamp_str, received_sig = parts
-    message = f"{course_id_str}|{timestamp_str}"
+    session_part, timestamp_str, received_sig = parts
+    message = f"{session_part}|{timestamp_str}"
     expected_sig = _make_signature(message)
 
     if not hmac.compare_digest(received_sig, expected_sig):
         raise ValueError("QR code signature is invalid.")
 
+    if not session_part.startswith('S') or not session_part[1:].isdigit():
+        raise ValueError("Invalid QR code format.")
+
     timestamp = int(timestamp_str)
     if int(time.time()) - timestamp > QR_CODE_WINDOW:
         raise ValueError("QR code has expired. Please scan again.")
 
-    return int(course_id_str), timestamp
+    return int(session_part[1:]), timestamp
 
 
 # ------------------------------------------------------------------
@@ -1323,6 +1329,9 @@ def student_dashboard():
         return redirect(url_for('complete_profile'))
 
     # FIX #10: Only iterate over the student's own enrolled courses
+    pref = NotificationPreference.query.filter_by(user_id=current_user.id).first()
+    threshold = pref.warning_threshold if pref and pref.warning_threshold else 75
+
     enrolled_courses = getattr(current_user, 'enrolled_courses', [])
     attendance_data = []
     for course in enrolled_courses:
@@ -1330,15 +1339,20 @@ def student_dashboard():
             student_id=current_user.id,
             course_id=course.id
         ).count()
+        total_sessions = ClassSession.query.filter_by(course_id=course.id).count()
+        pct = round(count / total_sessions * 100) if total_sessions else None
         attendance_data.append({
             'code': course.code,
             'title': course.title,
             'count': count,
+            'total_sessions': total_sessions,
+            'pct': pct,
         })
 
     return render_template('student_dashboard.html',
                            attendance_data=attendance_data,
-                           enrolled_courses=enrolled_courses)
+                           enrolled_courses=enrolled_courses,
+                           threshold=threshold)
 
 
 @app.route('/lecturer_dashboard')
@@ -1510,6 +1524,7 @@ def delete_course(course_id):
         return redirect(url_for('dashboard'))
 
     Attendance.query.filter_by(course_id=course_id).delete()
+    ClassSession.query.filter_by(course_id=course_id).delete()
     db.session.delete(course)
     db.session.commit()
     flash(f'Course "{course.code}" has been deleted.', 'success')
@@ -1579,45 +1594,84 @@ def _is_course_authorized(course):
     return is_coordinator or is_instructor
 
 
+def _get_or_create_todays_session(course):
+    """
+    Return today's ClassSession for a course, creating it if the lecturer
+    hasn't started one yet. Re-opening the QR page on the same day resumes
+    the SAME session, so a refresh never fragments one class meeting into
+    several record sets — while next week's class gets a brand-new session.
+    """
+    today = datetime.utcnow().date()
+    session_row = (ClassSession.query
+                   .filter(ClassSession.course_id == course.id,
+                           func.date(ClassSession.date_created) == today)
+                   .order_by(ClassSession.date_created.desc())
+                   .first())
+    if not session_row:
+        session_row = ClassSession(
+            course_id=course.id,
+            title=f"Lecture on {datetime.utcnow().strftime('%b %d, %Y')}"
+        )
+        db.session.add(session_row)
+        db.session.commit()
+    return session_row
+
+
 @app.route('/generate_qr/<int:course_id>')
 @login_required
 def generate_qr(course_id):
+    """Legacy entry point: opens (or resumes) today's session for the course."""
     course = Course.query.get_or_404(course_id)
     if not _is_course_authorized(course):
         flash('Unauthorised Access', 'error')
         return redirect(url_for('dashboard'))
-    return render_template('generate_qr.html', course=course)
+    session_row = _get_or_create_todays_session(course)
+    return redirect(url_for('session_qr', session_id=session_row.id))
 
 
-@app.route('/api/qr_data/<int:course_id>')
+@app.route('/session/<int:session_id>/qr')
+@login_required
+def session_qr(session_id):
+    """Live QR projector page for ONE class session."""
+    session_row = ClassSession.query.get_or_404(session_id)
+    course = Course.query.get_or_404(session_row.course_id)
+    if not _is_course_authorized(course):
+        flash('Unauthorised Access', 'error')
+        return redirect(url_for('dashboard'))
+    return render_template('generate_qr.html', course=course, session=session_row)
+
+
+@app.route('/api/qr_data/<int:session_id>')
 @login_required
 @limiter.exempt
-def get_qr_data(course_id):
+def get_qr_data(session_id):
     """
     FIX #6: Returns the same cached signed token as the image endpoint.
     FIX #3: Token is HMAC-signed so it cannot be forged.
     """
-    course = Course.query.get_or_404(course_id)
+    session_row = ClassSession.query.get_or_404(session_id)
+    course = Course.query.get_or_404(session_row.course_id)
     if not _is_course_authorized(course):
         return jsonify({"error": "Unauthorised"}), 403
 
-    qr_text = generate_signed_qr(course_id)
+    qr_text = generate_signed_qr(session_id)
     return jsonify({"qr_text": qr_text})
 
 
-@app.route('/course/<int:course_id>/live')
+@app.route('/session/<int:session_id>/live')
 @login_required
 @limiter.exempt
-def get_qr_image(course_id):
+def get_qr_image(session_id):
     """
     FIX #6: Uses the same shared cached token as /api/qr_data.
     FIX #3: Token is HMAC-signed.
     """
-    course = Course.query.get_or_404(course_id)
+    session_row = ClassSession.query.get_or_404(session_id)
+    course = Course.query.get_or_404(session_row.course_id)
     if not _is_course_authorized(course):
         return "Unauthorised", 403
 
-    qr_text = generate_signed_qr(course_id)
+    qr_text = generate_signed_qr(session_id)
 
     try:
         import qrcode
@@ -1628,6 +1682,39 @@ def get_qr_image(course_id):
         return send_file(buf, mimetype='image/png')
     except ImportError:
         return "QR code library not installed", 500
+
+
+@app.route('/api/session/<int:session_id>/attendees')
+@login_required
+@limiter.exempt
+def get_session_attendees(session_id):
+    """Live roll-call feed for the projector page: who has scanned THIS session."""
+    session_row = ClassSession.query.get_or_404(session_id)
+    course = Course.query.get_or_404(session_row.course_id)
+    if not _is_course_authorized(course):
+        return jsonify({"error": "Unauthorised"}), 403
+
+    records = (Attendance.query
+               .filter_by(session_id=session_id)
+               .order_by(Attendance.timestamp.desc())
+               .all())
+    attendees = []
+    for rec in records:
+        student = rec.student
+        attendees.append({
+            "name": student.full_name if student else "Unknown",
+            "matric_no": (student.matric_no if student else None) or "N/A",
+            "level": (student.level if student else None) or "N/A",
+            "time": rec.timestamp.strftime('%I:%M %p') if rec.timestamp else "",
+        })
+
+    enrolled_total = len(course.students) if hasattr(course, 'students') else 0
+    return jsonify({
+        "status": "success",
+        "present": len(attendees),
+        "enrolled": enrolled_total,
+        "attendees": attendees,
+    })
 
 
 @app.route('/scan_page')
@@ -1698,13 +1785,18 @@ def mark_attendance():
         if not qr_text:
             return jsonify({"status": "error", "message": "No QR data provided."})
 
-        # FIX #3 & #5: Verify the signed token (3-part format: id|ts|sig)
+        # FIX #3 & #5: Verify the signed token (3-part format: S<id>|ts|sig)
         try:
-            course_id, timestamp = verify_signed_qr(qr_text)
+            session_id, timestamp = verify_signed_qr(qr_text)
         except ValueError as ve:
             return jsonify({"status": "error", "message": str(ve)})
 
-        course = Course.query.get(course_id)
+        class_session = ClassSession.query.get(session_id)
+        if not class_session:
+            return jsonify({"status": "error", "message": "Invalid QR Code: Class session not found."})
+
+        course = Course.query.get(class_session.course_id)
+        course_id = class_session.course_id
         if not course:
             return jsonify({"status": "error", "message": "Invalid QR Code: Course not found."})
 
@@ -1716,18 +1808,17 @@ def mark_attendance():
                     "message": f"🚫 Access Denied: You are not registered for {course.code}."
                 })
 
-        # Duplicate entry check (2-hour window)
-        time_limit = datetime.utcnow() - timedelta(hours=2)
-        existing = Attendance.query.filter(
-            Attendance.student_id == current_user.id,
-            Attendance.course_id == course_id,
-            Attendance.timestamp > time_limit
+        # Duplicate check: one scan per student per CLASS SESSION.
+        # Next week's lecture is a new session, so scanning again then is fine.
+        existing = Attendance.query.filter_by(
+            student_id=current_user.id,
+            session_id=session_id
         ).first()
 
         if existing:
             return jsonify({
                 "status": "error",
-                "message": "You are already marked present! Double-scanning is not allowed."
+                "message": "You are already marked present for this class! Double-scanning is not allowed."
             })
 
         # FIX #4: Retrieve location from Redis
@@ -1749,6 +1840,7 @@ def mark_attendance():
         new_record = Attendance(
             student_id=current_user.id,
             course_id=course_id,
+            session_id=session_id,
             device_id=data.get('device_id', 'browser')
         )
         db.session.add(new_record)
@@ -1855,65 +1947,161 @@ def _attendance_authorized(course):
 @app.route('/course/<int:course_id>/attendance')
 @login_required
 def view_attendance(course_id):
+    """
+    Attendance records grouped BY CLASS SESSION: each weekly lecture is its
+    own sheet (who was present that day), instead of one flat pile of scans.
+    """
     course = Course.query.get_or_404(course_id)
 
     if not _attendance_authorized(course):  # FIX #8
         flash("Unauthorised access to attendance list.", "error")
         return redirect(url_for('dashboard'))
 
-    records = (Attendance.query
-               .filter_by(course_id=course_id)
-               .order_by(Attendance.timestamp.desc())
-               .all())
-    return render_template('view_attendance.html', course=course, attendees=records)
+    sessions = (ClassSession.query
+                .filter_by(course_id=course_id)
+                .order_by(ClassSession.date_created.desc())
+                .all())
+
+    enrolled_total = len(course.students) if hasattr(course, 'students') else 0
+
+    sessions_data = []
+    for sess in sessions:
+        records = sorted(sess.attendances,
+                         key=lambda r: r.timestamp or datetime.min)
+        present = len(records)
+        pct = round(present / enrolled_total * 100) if enrolled_total else None
+        sessions_data.append({
+            'session': sess,
+            'records': records,
+            'present': present,
+            'pct': pct,
+        })
+
+    total_scans = sum(s['present'] for s in sessions_data)
+    avg_present = round(total_scans / len(sessions_data)) if sessions_data else 0
+
+    # Rows that never got adopted by the startup backfill (shouldn't happen)
+    unassigned = Attendance.query.filter_by(course_id=course_id) \
+                                 .filter(Attendance.session_id.is_(None)).count()
+
+    return render_template('view_attendance.html',
+                           course=course,
+                           sessions_data=sessions_data,
+                           enrolled_total=enrolled_total,
+                           avg_present=avg_present,
+                           unassigned=unassigned,
+                           can_manage=_is_course_authorized(course))
+
+
+def _csv_cell(value):
+    """Quote a value for CSV, escaping embedded double quotes."""
+    return '"' + str(value if value is not None else "N/A").replace('"', '""') + '"'
 
 
 @app.route('/course/<int:course_id>/download_csv')
 @login_required
 def download_csv(course_id):
+    """
+    Without ?session_id: the SEMESTER REGISTER — one row per student, one
+    column per class session held, plus attended/total/% columns.
+    With ?session_id=<id>: the sheet for that single class meeting.
+    """
     course = Course.query.get_or_404(course_id)
 
     if not getattr(course, 'coordinator_id') == current_user.id and current_user not in getattr(course, 'instructors', []):
         return "Unauthorised", 403
 
-    records = (Attendance.query
-               .filter_by(course_id=course_id)
-               .order_by(Attendance.timestamp.desc())
-               .all())
+    safe_code = (course.code or "course").replace(' ', '_')
+    session_id = request.args.get('session_id', type=int)
 
-    # Build the entire CSV in memory to prevent dropped database connections!
-    csv_data = "Matric Number,Full Name,Level,Time Scanned,Device ID\n"
-    
-    if not records:
-        csv_data += "NO DATA FOUND,NO DATA FOUND,NO DATA FOUND,NO DATA FOUND,NO DATA FOUND\n"
-    else:
-        for rec in records:
-            # 1. Safely handle the timestamp (whether it's an object or a string)
-            try:
-                time_str = rec.timestamp.strftime('%Y-%m-%d %I:%M %p')
-            except AttributeError:
-                time_str = str(rec.timestamp) # Fallback if Postgres returned a string
-            
-            # 2. Safely grab the student data
-            student = rec.student
-            if student:
-                matric = student.matric_no or "N/A"
-                level = student.level or "N/A"
-                full_name = student.full_name or "N/A"
+    # ── Single-session sheet ──
+    if session_id:
+        sess = ClassSession.query.filter_by(id=session_id, course_id=course_id).first_or_404()
+        records = {rec.student_id: rec for rec in sess.attendances}
+        enrolled = list(course.students) if hasattr(course, 'students') else []
+
+        csv_data = "Matric Number,Full Name,Level,Status,Time Scanned,Device ID\n"
+        listed_ids = set()
+        for student in sorted(enrolled, key=lambda s: (s.matric_no or '', s.full_name or '')):
+            listed_ids.add(student.id)
+            rec = records.get(student.id)
+            if rec:
+                time_str = rec.timestamp.strftime('%Y-%m-%d %I:%M %p') if rec.timestamp else "N/A"
+                device = rec.device_id or "N/A"
+                row = [student.matric_no, student.full_name, student.level, "Present", time_str, device]
             else:
-                matric = "UNKNOWN"
-                level = "UNKNOWN"
-                full_name = "Deleted User"
-                
-            device = getattr(rec, 'device_id', "N/A") or "N/A"
-            
-            # 3. Add the row to our massive text string
-            csv_data += f'"{matric}","{full_name}","{level}","{time_str}","{device}"\n'
+                row = [student.matric_no, student.full_name, student.level, "Absent", "-", "-"]
+            csv_data += ",".join(_csv_cell(v) for v in row) + "\n"
+
+        # Scans from students no longer enrolled (kept for the record)
+        for rec in sess.attendances:
+            if rec.student_id in listed_ids:
+                continue
+            student = rec.student
+            time_str = rec.timestamp.strftime('%Y-%m-%d %I:%M %p') if rec.timestamp else "N/A"
+            row = [student.matric_no if student else "UNKNOWN",
+                   (student.full_name if student else "Deleted User") + " (not enrolled)",
+                   student.level if student else "N/A",
+                   "Present", time_str, rec.device_id or "N/A"]
+            csv_data += ",".join(_csv_cell(v) for v in row) + "\n"
+
+        date_tag = sess.date_created.strftime('%Y-%m-%d') if sess.date_created else "session"
+        return Response(
+            csv_data,
+            mimetype='text/csv',
+            headers={"Content-Disposition": f"attachment;filename={safe_code}_{date_tag}_attendance.csv"}
+        )
+
+    # ── Full semester register ──
+    sessions = (ClassSession.query
+                .filter_by(course_id=course_id)
+                .order_by(ClassSession.date_created.asc())
+                .all())
+
+    # student_id -> set of session_ids attended
+    attended_map = {}
+    students_by_id = {}
+    for sess in sessions:
+        for rec in sess.attendances:
+            attended_map.setdefault(rec.student_id, set()).add(sess.id)
+            if rec.student:
+                students_by_id[rec.student_id] = rec.student
+
+    enrolled = list(course.students) if hasattr(course, 'students') else []
+    enrolled_ids = {s.id for s in enrolled}
+    for s in enrolled:
+        students_by_id[s.id] = s
+
+    session_labels = []
+    for sess in sessions:
+        date_str = sess.date_created.strftime('%Y-%m-%d') if sess.date_created else "?"
+        session_labels.append(f"{sess.title} ({date_str})")
+
+    header = ["Matric Number", "Full Name", "Level"] + session_labels + \
+             ["Classes Attended", "Classes Held", "Attendance %"]
+    csv_data = ",".join(_csv_cell(h) for h in header) + "\n"
+
+    all_students = sorted(students_by_id.values(),
+                          key=lambda s: (s.matric_no or '', s.full_name or ''))
+    total_sessions = len(sessions)
+
+    if not all_students:
+        csv_data += _csv_cell("NO STUDENTS ENROLLED YET") + "\n"
+    for student in all_students:
+        attended = attended_map.get(student.id, set())
+        name = student.full_name or "N/A"
+        if student.id not in enrolled_ids:
+            name += " (not enrolled)"
+        row = [student.matric_no, name, student.level]
+        row += ["Present" if sess.id in attended else "Absent" for sess in sessions]
+        pct = round(len(attended) / total_sessions * 100) if total_sessions else 0
+        row += [len(attended), total_sessions, f"{pct}%"]
+        csv_data += ",".join(_csv_cell(v) for v in row) + "\n"
 
     return Response(
         csv_data,
         mimetype='text/csv',
-        headers={"Content-Disposition": f"attachment;filename={course.code}_attendance.csv"}
+        headers={"Content-Disposition": f"attachment;filename={safe_code}_attendance_register.csv"}
     )
 
     # ============================================================
@@ -1929,43 +2117,59 @@ def course_analytics(course_id):
     if not getattr(course, 'coordinator_id') == current_user.id and current_user not in getattr(course, 'instructors', []):
         return "Unauthorised", 403
 
-    # Query the database: Group attendance by Date and count the scans
-    daily_attendance = db.session.query(
-        func.date(Attendance.timestamp).label('scan_date'),
-        func.count(Attendance.id).label('total_scans')
-    ).filter_by(course_id=course_id).group_by('scan_date').order_by('scan_date').all()
+    # One data point PER CLASS SESSION (a session nobody scanned still shows
+    # as 0, which a plain group-by-date of scans could never reveal).
+    per_session = (
+        db.session.query(ClassSession, func.count(Attendance.id))
+        .outerjoin(Attendance, Attendance.session_id == ClassSession.id)
+        .filter(ClassSession.course_id == course_id)
+        .group_by(ClassSession.id)
+        .order_by(ClassSession.date_created.asc())
+        .all()
+    )
 
     # Format the data for Chart.js
-    dates = [day.scan_date.strftime('%b %d') for day in daily_attendance if day.scan_date]
-    counts = [day.total_scans for day in daily_attendance]
+    dates = [sess.date_created.strftime('%b %d') if sess.date_created else '?'
+             for sess, _count in per_session]
+    counts = [count for _sess, count in per_session]
 
-    return render_template('analytics.html', 
-                           course=course, 
-                           dates=dates, 
+    return render_template('analytics.html',
+                           course=course,
+                           dates=dates,
                            counts=counts)
 
-from datetime import datetime
 
 @app.route('/course/<int:course_id>/start_session', methods=['POST'])
 @login_required
 def start_session(course_id):
     course = Course.query.get_or_404(course_id)
-    
+
     # Security check: Ensure they are the lecturer
     if not getattr(course, 'coordinator_id') == current_user.id and current_user not in getattr(course, 'instructors', []):
         return "Unauthorised", 403
 
-    # Automatically generate a smart title (e.g., "Lecture on Apr 15")
-    today_date = datetime.now().strftime("%b %d")
-    session_title = f"Lecture on {today_date}"
+    # Open today's class meeting (or resume it if already started today),
+    # then head to the live QR projector page for that session.
+    session_row = _get_or_create_todays_session(course)
+    return redirect(url_for('session_qr', session_id=session_row.id))
 
-    # Create the new session in the database
-    new_session = ClassSession(course_id=course.id, title=session_title)
-    db.session.add(new_session)
+
+@app.route('/session/<int:session_id>/delete', methods=['POST'])
+@login_required
+def delete_session(session_id):
+    """Remove a class session started by mistake (and its scans), so it
+    doesn't count as a 'class held' in every student's percentage."""
+    session_row = ClassSession.query.get_or_404(session_id)
+    course = Course.query.get_or_404(session_row.course_id)
+
+    if not _is_course_authorized(course):
+        flash("Unauthorised: only the course lecturers can delete a session.", "error")
+        return redirect(url_for('dashboard'))
+
+    db.session.delete(session_row)  # cascade removes its attendance records
     db.session.commit()
-
-    # Immediately redirect them to the live projector page, passing the NEW session_id!
-    return redirect(url_for('live_qr_projector', session_id=new_session.id))
+    flash(f'Session "{session_row.title}" and its records were deleted.', 'success')
+    return redirect(url_for('view_attendance', course_id=course.id))
 
 # ============================================================
 # NOTIFICATION SETTINGS ROUTES
@@ -2216,6 +2420,44 @@ with app.app_context():
                 print(f"[MIGRATION] Added {table}.{column}")
             except Exception:
                 conn.rollback()  # Column already exists — skip
+
+    # ── Backfill: adopt legacy attendance rows into per-day class sessions ──
+    # Before sessions were wired up, scans were saved with session_id NULL.
+    # Group those rows by (course, calendar day) and attach each group to a
+    # ClassSession so old records show up in the per-session views. Idempotent:
+    # it only ever touches rows that still have no session.
+    try:
+        orphans = Attendance.query.filter(Attendance.session_id.is_(None)).all()
+        if orphans:
+            by_course_day = {}
+            for rec in orphans:
+                day = (rec.timestamp or datetime.utcnow()).date()
+                by_course_day.setdefault((rec.course_id, day), []).append(rec)
+
+            for (course_id, day), recs in sorted(by_course_day.items(),
+                                                 key=lambda item: (item[0][0], item[0][1])):
+                session_row = ClassSession.query.filter(
+                    ClassSession.course_id == course_id,
+                    func.date(ClassSession.date_created) == day
+                ).first()
+                if not session_row:
+                    first_ts = min((r.timestamp for r in recs if r.timestamp),
+                                   default=datetime.utcnow())
+                    session_row = ClassSession(
+                        course_id=course_id,
+                        title=f"Lecture on {day.strftime('%b %d, %Y')}",
+                        date_created=first_ts,
+                    )
+                    db.session.add(session_row)
+                    db.session.flush()
+                for rec in recs:
+                    rec.session_id = session_row.id
+
+            db.session.commit()
+            print(f"[MIGRATION] Linked {len(orphans)} legacy attendance rows to daily class sessions")
+    except Exception as e:
+        db.session.rollback()
+        print(f"[MIGRATION] Session backfill failed (will retry next boot): {e}")
 
     db.engine.dispose()  # Forces Gunicorn workers to create fresh connections
     print("[OK] Database initialized successfully!")
