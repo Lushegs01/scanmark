@@ -9,7 +9,8 @@ import re
 import json
 import base64
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 load_dotenv()
 from authlib.integrations.flask_client import OAuth
@@ -18,6 +19,7 @@ from flask import (Flask, render_template, redirect, url_for,
 from flask_login import LoginManager, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 import redis
 from flask_session import Session
 from itsdangerous import URLSafeTimedSerializer
@@ -564,6 +566,41 @@ def extract_name_from_funaab_email(email):
 # UTILITY FUNCTIONS
 # ============================================================
 
+# Timestamps are stored in UTC; FUNAAB runs on West Africa Time (UTC+1).
+# All display formatting and "what day is it" decisions use local time.
+LOCAL_TZ = ZoneInfo(os.environ.get('APP_TIMEZONE', 'Africa/Lagos'))
+
+# Label stamped on courses/sessions until the coordinator starts a new
+# semester with their own name (e.g. "2026/2027 First Semester").
+DEFAULT_SEMESTER = os.environ.get('DEFAULT_SEMESTER', '2025/2026')
+
+# Max distance (metres) between lecturer and student for a scan to count as
+# location-verified. Was hardcoded 500 while the message claimed 50.
+GEOFENCE_RADIUS_M = int(os.environ.get('GEOFENCE_RADIUS_M', 100))
+
+
+def to_local(dt):
+    """Convert a stored UTC datetime to local (Africa/Lagos) time."""
+    if dt is None:
+        return None
+    return dt.replace(tzinfo=timezone.utc).astimezone(LOCAL_TZ)
+
+
+@app.template_filter('localtime')
+def localtime_filter(dt, fmt='%I:%M %p'):
+    local = to_local(dt)
+    return local.strftime(fmt) if local else ''
+
+
+def _local_day_bounds_utc():
+    """Return (start, end) naive-UTC datetimes spanning the current LOCAL day,
+    for comparing against UTC-stored timestamps."""
+    now_local = datetime.now(LOCAL_TZ)
+    start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_utc = start_local.astimezone(timezone.utc).replace(tzinfo=None)
+    return start_utc, start_utc + timedelta(days=1)
+
+
 def calculate_distance(lat1, lon1, lat2, lon2):
     """Calculate distance between two coordinates using the Haversine formula."""
     R = 6371000  # Radius of Earth in metres
@@ -838,75 +875,6 @@ def reset_password(token):
 
 
 # ============================================================
-# DEBUG ENDPOINT (Remove in production)
-# ============================================================
-
-@app.route('/test_signup', methods=['GET', 'POST'])
-@csrf.exempt
-def test_signup():
-    """Simple signup test page"""
-    if request.method == 'POST':
-        print("\n" + "="*60)
-        print("TEST SIGNUP - Form Submitted")
-        print("="*60)
-        print(f"Form Data: {dict(request.form)}")
-        print(f"Method: {request.method}")
-        print(f"Content-Type: {request.content_type}")
-        
-        name = request.form.get('name', '')
-        email = request.form.get('email', '')
-        password = request.form.get('password', '')
-        
-        print(f"\nExtracted Values:")
-        print(f"  Name: '{name}'")
-        print(f"  Email: '{email}'")
-        print(f"  Password: {'*' * len(password) if password else 'EMPTY'}")
-        print("="*60 + "\n")
-        
-        return f"""
-        <h2>Form Received Successfully!</h2>
-        <ul>
-            <li>Name: {name}</li>
-            <li>Email: {email}</li>
-            <li>Password: {'*' * len(password)}</li>
-        </ul>
-        <a href="/test_signup">Back to form</a>
-        """
-    
-    return '''
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Test Signup</title>
-        <style>
-            body { font-family: Arial; max-width: 500px; margin: 50px auto; padding: 20px; }
-            input { width: 100%; padding: 10px; margin: 10px 0; }
-            button { width: 100%; padding: 12px; background: #28a745; color: white; border: none; cursor: pointer; }
-            button:hover { background: #218838; }
-        </style>
-    </head>
-    <body>
-        <h2>Test Signup Form</h2>
-        <form method="POST" onsubmit="console.log('Form submitting...'); return true;">
-            <label>Name:</label>
-            <input type="text" name="name" value="Test User" required>
-            
-            <label>Email:</label>
-            <input type="email" name="email" value="test@student.funaab.edu.ng" required>
-            
-            <label>Password:</label>
-            <input type="password" name="password" value="test123456" required>
-            
-            <button type="submit">Test Submit</button>
-        </form>
-        <hr>
-        <p><a href="/signup">Go to Real Signup Page</a></p>
-    </body>
-    </html>
-    '''
-
-
-# ============================================================
 # AUTHENTICATION ROUTES
 # ============================================================
 
@@ -943,15 +911,20 @@ def authorize_google():
             full_name=full_name,
             email=email,
             password=generate_password_hash(secrets.token_hex(32), method='scrypt'),
-            role=auto_role or 'student'
+            role=auto_role or 'student',
+            email_verified=True,  # Google already verified this address
         )
         db.session.add(user)
         db.session.commit()
-        
+
         # Send welcome email
         send_welcome_email(email, full_name, auto_role or 'student')
-        
+
         flash('Account created via Google! Check your email for confirmation.', 'success')
+    elif not user.email_verified:
+        # Signing in through Google proves ownership of the address
+        user.email_verified = True
+        db.session.commit()
 
     login_user(user)
     return redirect_by_role(user.role)
@@ -1071,6 +1044,7 @@ def campos_sso_callback():
             email=email,
             password=generate_password_hash(secrets.token_hex(32), method='scrypt'),
             role=role,
+            email_verified=True,  # CampOS is the identity provider
         )
         # CampOS is the source of truth for matric number (guard uniqueness).
         if matric_no and not User.query.filter_by(matric_no=matric_no).first():
@@ -1083,6 +1057,9 @@ def campos_sso_callback():
     else:
         # Keep identity fresh from the source of truth.
         changed = False
+        if not user.email_verified:
+            user.email_verified = True
+            changed = True
         if full_name and user.full_name != full_name:
             user.full_name = full_name
             changed = True
@@ -1136,6 +1113,12 @@ def login():
         user = User.query.filter_by(email=email).first()
 
         if user and check_password_hash(user.password, password):
+            if not user.email_verified:
+                # Auto-resend so a lost email never locks anyone out
+                send_verification_email(user.email, user.full_name)
+                flash("Please verify your email first. We've just re-sent the "
+                      "verification link — check your inbox.", 'warning')
+                return render_template('login.html')
             login_user(user)
             return redirect_by_role(user.role)
         else:
@@ -1144,158 +1127,131 @@ def login():
     return render_template('login.html')
 
 
+def send_verification_email(user_email, user_name):
+    """Email a signed link that activates the account (expires in 24h)."""
+    token = serializer.dumps(user_email, salt='email-verify-salt')
+    verify_url = url_for('verify_email', token=token, _external=True)
+    text_body = (
+        f"Hello {user_name},\n\n"
+        "Confirm your email address to activate your ScanMark account "
+        f"(link valid for 24 hours):\n\n{verify_url}\n\n"
+        "If you did not sign up, you can ignore this email.\n"
+    )
+    html_body = (
+        f"<p>Hello <strong>{user_name}</strong>,</p>"
+        "<p>Confirm your email address to activate your ScanMark account "
+        "(link valid for 24 hours):</p>"
+        f'<p><a href="{verify_url}" style="display:inline-block;padding:12px 28px;'
+        'background:#006838;color:#fff;text-decoration:none;border-radius:6px;'
+        'font-weight:700;">Verify my email</a></p>'
+        f"<p>Or paste this link into your browser:<br>{verify_url}</p>"
+        "<p>If you did not sign up, you can ignore this email.</p>"
+    )
+    send_email("Verify your ScanMark email", user_email, text_body, html_body)
+
+
+@app.route('/verify_email/<token>')
+def verify_email(token):
+    try:
+        email = serializer.loads(token, salt='email-verify-salt', max_age=86400)
+    except Exception:
+        flash("This verification link is invalid or has expired. "
+              "Log in to receive a fresh one.", 'error')
+        return redirect(url_for('login'))
+
+    user = User.query.filter_by(email=email).first()
+    if not user:
+        flash("Account not found.", 'error')
+        return redirect(url_for('signup'))
+
+    if not user.email_verified:
+        user.email_verified = True
+        db.session.commit()
+        send_welcome_email(user.email, user.full_name, user.role)
+    flash("Email verified! You can now log in. ✅", 'success')
+    return redirect(url_for('login'))
+
+
 @app.route('/signup', methods=['GET', 'POST'])
-@csrf.exempt  # Temporarily exempt for debugging
 def signup():
-    print(f"\n{'='*60}")
-    print(f"SIGNUP REQUEST - Method: {request.method}")
-    print(f"{'='*60}")
-    
     if request.method == 'POST':
-        # Get all form data
-        print("\n📋 FORM DATA RECEIVED:")
-        print(f"Raw form keys: {list(request.form.keys())}")
-        print(f"Raw form: {dict(request.form)}")
-        
-        # Get main fields
-        name = (request.form.get('full_name') or 
+        name = (request.form.get('full_name') or
                 request.form.get('name') or '').strip()
-        
         email = (request.form.get('email') or '').strip().lower()
         password = (request.form.get('password') or '').strip()
-        
-        # Get optional student fields
         matric_no = request.form.get('matric_no', '').strip()
         level = request.form.get('level', '').strip()
-        
-        # Get staff role selection (if provided)
         staff_role = request.form.get('staff_role', '').strip()
-        
-        print(f"\n📝 PARSED VALUES:")
-        print(f"  Name: '{name}' (length: {len(name)})")
-        print(f"  Email: '{email}' (length: {len(email)})")
-        print(f"  Password: {'*' * len(password)} (length: {len(password)})")
-        print(f"  Staff Role Selection: '{staff_role}'")
-        print(f"  Matric No: '{matric_no}'")
-        print(f"  Level: '{level}'")
-        
-        # Step 1: Check if all required fields are provided
+
         if not name:
-            print("❌ VALIDATION FAILED: Name is empty")
             flash('Please enter your full name!', 'danger')
             return render_template('signup.html')
-            
         if not email:
-            print("❌ VALIDATION FAILED: Email is empty")
             flash('Please enter your email address!', 'danger')
             return render_template('signup.html')
-            
         if not password:
-            print("❌ VALIDATION FAILED: Password is empty")
             flash('Please enter a password!', 'danger')
             return render_template('signup.html')
-        
-        print("✅ All required fields have values")
-        
-        # Step 2: Validate FUNAAB email
-        print(f"\n🔍 Validating email: {email}")
+
         is_valid, message, auto_role = is_valid_funaab_email(email)
-        print(f"  Valid: {is_valid}")
-        print(f"  Message: {message}")
-        print(f"  Auto Role: {auto_role}")
-        
         if not is_valid:
-            print(f"❌ EMAIL VALIDATION FAILED: {message}")
             flash(message, 'danger')
             return render_template('signup.html')
-        
-        # Step 2.5: Override role if staff selected a specific role
+
         final_role = auto_role
         if email.endswith('@staff.funaab.edu.ng') and staff_role:
-            # Staff member selected their specific role
             final_role = staff_role
-            print(f"  Staff role override: {staff_role}")
         elif email.endswith('@staff.funaab.edu.ng') and not staff_role:
-            # Staff email but no role selected
-            print("❌ VALIDATION FAILED: Staff must select a role")
             flash('Please select your role (Lecturer or Course Coordinator)', 'danger')
             return render_template('signup.html')
-        
-        print(f"✅ Email validated - Final Role: {final_role}")
-        
-        # Step 3: Password strength check
+
         if len(password) < 6:
-            print(f"❌ VALIDATION FAILED: Password too short ({len(password)} chars)")
             flash('Password must be at least 6 characters long!', 'danger')
             return render_template('signup.html')
-        
-        print("✅ Password validated")
-        
-        # Step 4: Check if user already exists
-        print(f"\n🔍 Checking if user exists...")
-        existing_user = User.query.filter_by(email=email).first()
-        if existing_user:
-            print(f"❌ USER EXISTS: {email}")
+
+        if User.query.filter_by(email=email).first():
             flash('This FUNAAB email is already registered!', 'warning')
             return redirect(url_for('login'))
-        
-        print("✅ Email is available")
-        
-        # Step 5: Create new user
-        print(f"\n👤 Creating new user...")
-        print(f"  Name: {name}")
-        print(f"  Email: {email}")
-        print(f"  Role: {final_role}")
-        print(f"  Matric No: {matric_no or 'N/A'}")
-        print(f"  Level: {level or 'N/A'}")
-        
-        hashed_password = generate_password_hash(password, method='scrypt')
-        print(f"  Password hashed: {hashed_password[:20]}...")
-        
+
+        # Matric numbers identify one student — reject a second account
+        # claiming the same one instead of failing with a server error.
+        if matric_no and User.query.filter_by(matric_no=matric_no).first():
+            flash('That matric number is already registered to another account. '
+                  'Contact IT support if this is yours.', 'danger')
+            return render_template('signup.html')
+
         new_user = User(
             full_name=name,
             email=email,
-            password=hashed_password,
+            password=generate_password_hash(password, method='scrypt'),
             role=final_role,
             matric_no=matric_no if matric_no else None,
-            level=level if level else None
+            level=level if level else None,
+            email_verified=False,
         )
-        
+
         try:
             db.session.add(new_user)
             db.session.commit()
-            print("✅ User saved to database")
-            
-            # Step 6: Send welcome email
-            print(f"\n📧 Sending welcome email to {email}...")
+            app.logger.info("New signup (id=%s, role=%s)", new_user.id, final_role)
+
             try:
-                # 🚨 FIX: Don't send password in email (security issue)
-                send_welcome_email(email, name, final_role)
-                print("✅ Welcome email sent successfully")
-            except Exception as email_error:
-                print(f"⚠️ Email sending failed: {email_error}")
-                # Don't fail the signup if email fails
-            
-            print(f"\n{'='*60}")
-            print(f"🎉 SIGNUP SUCCESSFUL!")
-            print(f"{'='*60}\n")
-            
-            flash('Account created successfully! Welcome to ScanMark', 'success')
+                send_verification_email(email, name)
+            except Exception:
+                app.logger.exception("Verification email failed for user id=%s", new_user.id)
+
+            flash('Account created! Check your email for the verification link '
+                  'to activate it.', 'success')
             return redirect(url_for('login'))
-            
-        except Exception as e:
+
+        except Exception:
             db.session.rollback()
-            print(f"\n❌ DATABASE ERROR: {e}")
-            import traceback
-            traceback.print_exc()
-            print(f"{'='*60}\n")
+            app.logger.exception("Signup failed")
             flash('Error creating account. Please try again.', 'danger')
             return render_template('signup.html')
-            
-    # GET request
-    print("📄 Rendering signup form\n")
+
     return render_template('signup.html')
-        
+
 @app.route('/logout')
 @login_required
 def logout():
@@ -1335,13 +1291,18 @@ def student_dashboard():
     enrolled_courses = getattr(current_user, 'enrolled_courses', [])
     attendance_data = []
     for course in enrolled_courses:
-        count = Attendance.query.filter_by(
-            student_id=current_user.id,
-            course_id=course.id
-        ).count()
-        total_sessions = ClassSession.query.filter_by(course_id=course.id).count()
+        # Stats are scoped to the course's CURRENT semester
+        session_ids = [s.id for s in
+                       _semester_sessions_query(course, _course_semester(course))
+                       .with_entities(ClassSession.id).all()]
+        total_sessions = len(session_ids)
+        count = Attendance.query.filter(
+            Attendance.student_id == current_user.id,
+            Attendance.session_id.in_(session_ids)
+        ).count() if session_ids else 0
         pct = round(count / total_sessions * 100) if total_sessions else None
         attendance_data.append({
+            'course_id': course.id,
             'code': course.code,
             'title': course.title,
             'count': count,
@@ -1353,6 +1314,43 @@ def student_dashboard():
                            attendance_data=attendance_data,
                            enrolled_courses=enrolled_courses,
                            threshold=threshold)
+
+
+@app.route('/my/course/<int:course_id>/history')
+@login_required
+def my_course_history(course_id):
+    """A student's own class-by-class record: exactly which lectures they
+    attended or missed, so disputes can be raised while memories are fresh."""
+    course = Course.query.get_or_404(course_id)
+    if course not in getattr(current_user, 'enrolled_courses', []):
+        flash("You are not enrolled in that course.", "error")
+        return redirect(url_for('student_dashboard'))
+
+    semester = request.args.get('semester') or _course_semester(course)
+    sessions = (_semester_sessions_query(course, semester)
+                .order_by(ClassSession.date_created.desc())
+                .all())
+
+    my_records = {rec.session_id: rec for rec in Attendance.query.filter(
+        Attendance.student_id == current_user.id,
+        Attendance.course_id == course.id
+    ).all()}
+
+    history = [{'session': sess, 'record': my_records.get(sess.id)} for sess in sessions]
+    attended = sum(1 for h in history if h['record'])
+    pct = round(attended / len(history) * 100) if history else None
+
+    pref = NotificationPreference.query.filter_by(user_id=current_user.id).first()
+    threshold = pref.warning_threshold if pref and pref.warning_threshold else DEFAULT_ATTENDANCE_THRESHOLD
+
+    return render_template('student_course_history.html',
+                           course=course,
+                           history=history,
+                           attended=attended,
+                           pct=pct,
+                           threshold=threshold,
+                           semester=semester,
+                           semester_choices=_course_semester_choices(course))
 
 
 @app.route('/lecturer_dashboard')
@@ -1481,6 +1479,7 @@ def add_course():
         coordinator_id=current_user.id,
         department=getattr(current_user, 'department', None),
         faculty=getattr(current_user, 'faculty', None),
+        current_semester=DEFAULT_SEMESTER,
     )
     db.session.add(new_course)
     db.session.commit()
@@ -1594,27 +1593,73 @@ def _is_course_authorized(course):
     return is_coordinator or is_instructor
 
 
-def _get_or_create_todays_session(course):
+def _course_semester(course):
+    """The semester a course is currently teaching."""
+    return course.current_semester or DEFAULT_SEMESTER
+
+
+def _get_or_create_todays_session(course, force_new=False):
     """
     Return today's ClassSession for a course, creating it if the lecturer
     hasn't started one yet. Re-opening the QR page on the same day resumes
     the SAME session, so a refresh never fragments one class meeting into
     several record sets — while next week's class gets a brand-new session.
+    Pass force_new=True for a deliberate second class on the same day.
     """
-    today = datetime.utcnow().date()
-    session_row = (ClassSession.query
-                   .filter(ClassSession.course_id == course.id,
-                           func.date(ClassSession.date_created) == today)
-                   .order_by(ClassSession.date_created.desc())
-                   .first())
+    day_start, day_end = _local_day_bounds_utc()
+    session_row = None
+    if not force_new:
+        # Only resume a session that belongs to the CURRENT semester — after
+        # a rollover, an earlier same-day session stays with the old one.
+        session_row = (ClassSession.query
+                       .filter(ClassSession.course_id == course.id,
+                               ClassSession.date_created >= day_start,
+                               ClassSession.date_created < day_end,
+                               db.or_(ClassSession.semester == _course_semester(course),
+                                      ClassSession.semester.is_(None)))
+                       .order_by(ClassSession.date_created.desc())
+                       .first())
     if not session_row:
+        local_day = datetime.now(LOCAL_TZ).strftime('%b %d, %Y')
+        title = f"Lecture on {local_day}"
+        if force_new:
+            nth = (ClassSession.query
+                   .filter(ClassSession.course_id == course.id,
+                           ClassSession.date_created >= day_start,
+                           ClassSession.date_created < day_end)
+                   .count()) + 1
+            title = f"Lecture on {local_day} (#{nth})"
         session_row = ClassSession(
             course_id=course.id,
-            title=f"Lecture on {datetime.utcnow().strftime('%b %d, %Y')}"
+            title=title,
+            semester=_course_semester(course),
         )
         db.session.add(session_row)
         db.session.commit()
     return session_row
+
+
+def _semester_sessions_query(course, semester):
+    """Sessions of one course within one semester (legacy NULLs count as the
+    course's current semester so pre-feature data stays visible)."""
+    q = ClassSession.query.filter(ClassSession.course_id == course.id)
+    if semester == _course_semester(course):
+        q = q.filter(db.or_(ClassSession.semester == semester,
+                            ClassSession.semester.is_(None)))
+    else:
+        q = q.filter(ClassSession.semester == semester)
+    return q
+
+
+def _course_semester_choices(course):
+    """Distinct semester labels that have sessions, current one first."""
+    rows = (db.session.query(ClassSession.semester)
+            .filter(ClassSession.course_id == course.id)
+            .distinct().all())
+    labels = {row[0] or _course_semester(course) for row in rows}
+    labels.add(_course_semester(course))
+    current = _course_semester(course)
+    return [current] + sorted(l for l in labels if l != current)
 
 
 @app.route('/generate_qr/<int:course_id>')
@@ -1705,7 +1750,7 @@ def get_session_attendees(session_id):
             "name": student.full_name if student else "Unknown",
             "matric_no": (student.matric_no if student else None) or "N/A",
             "level": (student.level if student else None) or "N/A",
-            "time": rec.timestamp.strftime('%I:%M %p') if rec.timestamp else "",
+            "time": to_local(rec.timestamp).strftime('%I:%M %p') if rec.timestamp else "",
         })
 
     enrolled_total = len(course.students) if hasattr(course, 'students') else 0
@@ -1821,7 +1866,22 @@ def mark_attendance():
                 "message": "You are already marked present for this class! Double-scanning is not allowed."
             })
 
+        # Anti buddy-punching: one physical device marks ONE student per class.
+        device_id = (data.get('device_id') or '').strip()
+        if device_id and device_id != 'browser':
+            same_device = Attendance.query.filter(
+                Attendance.session_id == session_id,
+                Attendance.device_id == device_id,
+                Attendance.student_id != current_user.id
+            ).first()
+            if same_device:
+                return jsonify({
+                    "status": "error",
+                    "message": "🚫 This device already marked attendance for another student in this class."
+                })
+
         # FIX #4: Retrieve location from Redis
+        location_verified = False
         class_loc = get_class_location(course_id)
         if class_loc:
             if not student_lat or not student_lon:
@@ -1831,20 +1891,34 @@ def mark_attendance():
                 class_loc['lat'], class_loc['lon'],
                 float(student_lat), float(student_lon)
             )
-            if dist > 500:  # 50 meters
+            if dist > GEOFENCE_RADIUS_M:
                 return jsonify({
                     "status": "error",
-                    "message": f"Too far from classroom. You are {int(dist)}m away (max 50m)."
+                    "message": f"Too far from classroom. You are {int(dist)}m away (max {GEOFENCE_RADIUS_M}m)."
                 })
+            location_verified = True
+        # If the lecturer has no live location (e.g. desktop projector without
+        # GPS) the scan is still accepted, but stored as location-UNVERIFIED so
+        # it is visibly flagged on the records page instead of silently equal.
 
         new_record = Attendance(
             student_id=current_user.id,
             course_id=course_id,
             session_id=session_id,
-            device_id=data.get('device_id', 'browser')
+            device_id=device_id or 'browser',
+            location_verified=location_verified,
         )
         db.session.add(new_record)
-        db.session.commit()
+        try:
+            db.session.commit()
+        except IntegrityError:
+            # Two simultaneous scans raced past the duplicate check; the DB
+            # unique constraint (student, session) is the final referee.
+            db.session.rollback()
+            return jsonify({
+                "status": "error",
+                "message": "You are already marked present for this class!"
+            })
 
         # Report to CampOS Core (best-effort, async — never blocks the scan).
         try:
@@ -1862,7 +1936,7 @@ def mark_attendance():
             print(f"⚠️ Could not queue CampOS attendance report: {e}")
 
         # Send attendance confirmation email
-        timestamp_str = datetime.now().strftime('%B %d, %Y at %I:%M %p')
+        timestamp_str = datetime.now(LOCAL_TZ).strftime('%B %d, %Y at %I:%M %p')
         send_attendance_confirmation(
             user_email=current_user.email,
             user_name=current_user.full_name,
@@ -1957,8 +2031,8 @@ def view_attendance(course_id):
         flash("Unauthorised access to attendance list.", "error")
         return redirect(url_for('dashboard'))
 
-    sessions = (ClassSession.query
-                .filter_by(course_id=course_id)
+    semester = request.args.get('semester') or _course_semester(course)
+    sessions = (_semester_sessions_query(course, semester)
                 .order_by(ClassSession.date_created.desc())
                 .all())
 
@@ -1968,6 +2042,14 @@ def view_attendance(course_id):
     for sess in sessions:
         records = sorted(sess.attendances,
                          key=lambda r: r.timestamp or datetime.min)
+        # Devices used by more than one student in this class = buddy-punching
+        # suspects (older scans predate blocking, and IDs can be spoofed).
+        device_counts = {}
+        for r in records:
+            if r.device_id and r.device_id not in ('browser', 'manual'):
+                device_counts[r.device_id] = device_counts.get(r.device_id, 0) + 1
+        shared_devices = {d for d, n in device_counts.items() if n > 1}
+
         present = len(records)
         pct = round(present / enrolled_total * 100) if enrolled_total else None
         sessions_data.append({
@@ -1975,6 +2057,7 @@ def view_attendance(course_id):
             'records': records,
             'present': present,
             'pct': pct,
+            'shared_devices': shared_devices,
         })
 
     total_scans = sum(s['present'] for s in sessions_data)
@@ -1990,6 +2073,12 @@ def view_attendance(course_id):
                            enrolled_total=enrolled_total,
                            avg_present=avg_present,
                            unassigned=unassigned,
+                           semester=semester,
+                           semester_choices=_course_semester_choices(course),
+                           roster=sorted(course.students,
+                                         key=lambda s: (s.matric_no or '', s.full_name or ''))
+                                  if hasattr(course, 'students') else [],
+                           is_coordinator=(course.coordinator_id == current_user.id),
                            can_manage=_is_course_authorized(course))
 
 
@@ -2008,11 +2097,19 @@ def download_csv(course_id):
     """
     course = Course.query.get_or_404(course_id)
 
-    if not getattr(course, 'coordinator_id') == current_user.id and current_user not in getattr(course, 'instructors', []):
+    if not _attendance_authorized(course):  # same policy as the records page
         return "Unauthorised", 403
 
     safe_code = (course.code or "course").replace(' ', '_')
     session_id = request.args.get('session_id', type=int)
+
+    def _rec_meta(rec):
+        time_str = to_local(rec.timestamp).strftime('%Y-%m-%d %I:%M %p') if rec.timestamp else "N/A"
+        gps = "Yes" if rec.location_verified else "No"
+        device = rec.device_id or "N/A"
+        if rec.marked_by:
+            device = f"manual (by {rec.marked_by})"
+        return time_str, gps, device
 
     # ── Single-session sheet ──
     if session_id:
@@ -2020,17 +2117,16 @@ def download_csv(course_id):
         records = {rec.student_id: rec for rec in sess.attendances}
         enrolled = list(course.students) if hasattr(course, 'students') else []
 
-        csv_data = "Matric Number,Full Name,Level,Status,Time Scanned,Device ID\n"
+        csv_data = "Matric Number,Full Name,Level,Status,Time Scanned,GPS Verified,Device ID\n"
         listed_ids = set()
         for student in sorted(enrolled, key=lambda s: (s.matric_no or '', s.full_name or '')):
             listed_ids.add(student.id)
             rec = records.get(student.id)
             if rec:
-                time_str = rec.timestamp.strftime('%Y-%m-%d %I:%M %p') if rec.timestamp else "N/A"
-                device = rec.device_id or "N/A"
-                row = [student.matric_no, student.full_name, student.level, "Present", time_str, device]
+                time_str, gps, device = _rec_meta(rec)
+                row = [student.matric_no, student.full_name, student.level, "Present", time_str, gps, device]
             else:
-                row = [student.matric_no, student.full_name, student.level, "Absent", "-", "-"]
+                row = [student.matric_no, student.full_name, student.level, "Absent", "-", "-", "-"]
             csv_data += ",".join(_csv_cell(v) for v in row) + "\n"
 
         # Scans from students no longer enrolled (kept for the record)
@@ -2038,14 +2134,14 @@ def download_csv(course_id):
             if rec.student_id in listed_ids:
                 continue
             student = rec.student
-            time_str = rec.timestamp.strftime('%Y-%m-%d %I:%M %p') if rec.timestamp else "N/A"
+            time_str, gps, device = _rec_meta(rec)
             row = [student.matric_no if student else "UNKNOWN",
                    (student.full_name if student else "Deleted User") + " (not enrolled)",
                    student.level if student else "N/A",
-                   "Present", time_str, rec.device_id or "N/A"]
+                   "Present", time_str, gps, device]
             csv_data += ",".join(_csv_cell(v) for v in row) + "\n"
 
-        date_tag = sess.date_created.strftime('%Y-%m-%d') if sess.date_created else "session"
+        date_tag = to_local(sess.date_created).strftime('%Y-%m-%d') if sess.date_created else "session"
         return Response(
             csv_data,
             mimetype='text/csv',
@@ -2053,8 +2149,8 @@ def download_csv(course_id):
         )
 
     # ── Full semester register ──
-    sessions = (ClassSession.query
-                .filter_by(course_id=course_id)
+    semester = request.args.get('semester') or _course_semester(course)
+    sessions = (_semester_sessions_query(course, semester)
                 .order_by(ClassSession.date_created.asc())
                 .all())
 
@@ -2074,7 +2170,7 @@ def download_csv(course_id):
 
     session_labels = []
     for sess in sessions:
-        date_str = sess.date_created.strftime('%Y-%m-%d') if sess.date_created else "?"
+        date_str = to_local(sess.date_created).strftime('%Y-%m-%d') if sess.date_created else "?"
         session_labels.append(f"{sess.title} ({date_str})")
 
     header = ["Matric Number", "Full Name", "Level"] + session_labels + \
@@ -2098,10 +2194,11 @@ def download_csv(course_id):
         row += [len(attended), total_sessions, f"{pct}%"]
         csv_data += ",".join(_csv_cell(v) for v in row) + "\n"
 
+    semester_tag = semester.replace('/', '-').replace(' ', '_')
     return Response(
         csv_data,
         mimetype='text/csv',
-        headers={"Content-Disposition": f"attachment;filename={safe_code}_attendance_register.csv"}
+        headers={"Content-Disposition": f"attachment;filename={safe_code}_{semester_tag}_attendance_register.csv"}
     )
 
     # ============================================================
@@ -2113,30 +2210,57 @@ def download_csv(course_id):
 def course_analytics(course_id):
     course = Course.query.get_or_404(course_id)
 
-    # Security check: Ensure they own the course
-    if not getattr(course, 'coordinator_id') == current_user.id and current_user not in getattr(course, 'instructors', []):
+    if not _attendance_authorized(course):  # same policy as the records page
         return "Unauthorised", 403
+
+    semester = request.args.get('semester') or _course_semester(course)
+    sessions = (_semester_sessions_query(course, semester)
+                .order_by(ClassSession.date_created.asc())
+                .all())
+    session_ids = {s.id for s in sessions}
+    total_sessions = len(sessions)
 
     # One data point PER CLASS SESSION (a session nobody scanned still shows
     # as 0, which a plain group-by-date of scans could never reveal).
-    per_session = (
-        db.session.query(ClassSession, func.count(Attendance.id))
-        .outerjoin(Attendance, Attendance.session_id == ClassSession.id)
-        .filter(ClassSession.course_id == course_id)
-        .group_by(ClassSession.id)
-        .order_by(ClassSession.date_created.asc())
-        .all()
-    )
+    counts_by_session = {}
+    for sess in sessions:
+        counts_by_session[sess.id] = len(sess.attendances)
 
-    # Format the data for Chart.js
-    dates = [sess.date_created.strftime('%b %d') if sess.date_created else '?'
-             for sess, _count in per_session]
-    counts = [count for _sess, count in per_session]
+    dates = [to_local(sess.date_created).strftime('%b %d') if sess.date_created else '?'
+             for sess in sessions]
+    counts = [counts_by_session[s.id] for s in sessions]
+
+    # Per-student standing: who is at risk of missing exam eligibility?
+    attended_by_student = {}
+    for sess in sessions:
+        for rec in sess.attendances:
+            attended_by_student[rec.student_id] = attended_by_student.get(rec.student_id, 0) + 1
+
+    standing = []
+    for student in getattr(course, 'students', []):
+        attended = attended_by_student.get(student.id, 0)
+        pct = round(attended / total_sessions * 100) if total_sessions else 0
+        standing.append({
+            'name': student.full_name,
+            'matric_no': student.matric_no or 'N/A',
+            'level': student.level or 'N/A',
+            'attended': attended,
+            'total': total_sessions,
+            'pct': pct,
+            'at_risk': total_sessions > 0 and pct < DEFAULT_ATTENDANCE_THRESHOLD,
+        })
+    standing.sort(key=lambda s: (s['pct'], s['name']))
+    at_risk_count = sum(1 for s in standing if s['at_risk'])
 
     return render_template('analytics.html',
                            course=course,
                            dates=dates,
-                           counts=counts)
+                           counts=counts,
+                           standing=standing,
+                           at_risk_count=at_risk_count,
+                           threshold=DEFAULT_ATTENDANCE_THRESHOLD,
+                           semester=semester,
+                           semester_choices=_course_semester_choices(course))
 
 
 @app.route('/course/<int:course_id>/start_session', methods=['POST'])
@@ -2150,8 +2274,132 @@ def start_session(course_id):
 
     # Open today's class meeting (or resume it if already started today),
     # then head to the live QR projector page for that session.
-    session_row = _get_or_create_todays_session(course)
+    # extra=1 deliberately opens a SECOND session today (double lectures).
+    force_new = request.form.get('extra') == '1'
+    session_row = _get_or_create_todays_session(course, force_new=force_new)
     return redirect(url_for('session_qr', session_id=session_row.id))
+
+
+@app.route('/session/<int:session_id>/rename', methods=['POST'])
+@login_required
+def rename_session(session_id):
+    session_row = ClassSession.query.get_or_404(session_id)
+    course = Course.query.get_or_404(session_row.course_id)
+    if not _is_course_authorized(course):
+        flash("Unauthorised.", "error")
+        return redirect(url_for('dashboard'))
+
+    title = (request.form.get('title') or '').strip()
+    if title:
+        session_row.title = title[:100]
+        db.session.commit()
+        flash("Session renamed.", "success")
+    return redirect(url_for('view_attendance', course_id=course.id))
+
+
+@app.route('/session/<int:session_id>/manual_mark', methods=['POST'])
+@login_required
+def manual_mark(session_id):
+    """Lecturer marks a student present by matric number — for dead phone
+    batteries and students without smartphones. Tagged with who added it."""
+    session_row = ClassSession.query.get_or_404(session_id)
+    course = Course.query.get_or_404(session_row.course_id)
+    if not _is_course_authorized(course):
+        flash("Unauthorised.", "error")
+        return redirect(url_for('dashboard'))
+
+    matric_no = (request.form.get('matric_no') or '').strip()
+    student = User.query.filter_by(matric_no=matric_no).first() if matric_no else None
+    if not student:
+        flash(f'No student found with matric number "{matric_no}".', 'error')
+        return redirect(url_for('view_attendance', course_id=course.id))
+
+    if course not in getattr(student, 'enrolled_courses', []):
+        flash(f'{student.full_name} is not enrolled in {course.code}.', 'error')
+        return redirect(url_for('view_attendance', course_id=course.id))
+
+    if Attendance.query.filter_by(student_id=student.id, session_id=session_id).first():
+        flash(f'{student.full_name} is already marked for this class.', 'info')
+        return redirect(url_for('view_attendance', course_id=course.id))
+
+    db.session.add(Attendance(
+        student_id=student.id,
+        course_id=course.id,
+        session_id=session_id,
+        device_id='manual',
+        marked_by=current_user.full_name,
+        location_verified=False,
+    ))
+    db.session.commit()
+    flash(f'{student.full_name} marked present (manual entry).', 'success')
+    return redirect(url_for('view_attendance', course_id=course.id))
+
+
+@app.route('/attendance/<int:record_id>/remove', methods=['POST'])
+@login_required
+def remove_attendance(record_id):
+    """Remove an erroneous record (wrong person marked, admitted proxy scan)."""
+    record = Attendance.query.get_or_404(record_id)
+    course = Course.query.get_or_404(record.course_id)
+    if not _is_course_authorized(course):
+        flash("Unauthorised.", "error")
+        return redirect(url_for('dashboard'))
+
+    db.session.delete(record)
+    db.session.commit()
+    flash("Attendance record removed.", "success")
+    return redirect(url_for('view_attendance', course_id=course.id))
+
+
+@app.route('/course/<int:course_id>/new_semester', methods=['POST'])
+@login_required
+def start_new_semester(course_id):
+    """Coordinator rolls the course into a new semester. Old sessions keep
+    their label and stay viewable; new sessions and stats start clean.
+    Optionally clears the roster so the new cohort re-registers."""
+    course = Course.query.get_or_404(course_id)
+    if course.coordinator_id != current_user.id:
+        flash("Only the course coordinator can start a new semester.", "error")
+        return redirect(url_for('dashboard'))
+
+    name = (request.form.get('semester_name') or '').strip()
+    if not name:
+        flash("Please give the new semester a name (e.g. 2026/2027 First Semester).", "error")
+        return redirect(url_for('view_attendance', course_id=course.id))
+    if name == _course_semester(course):
+        flash(f'"{name}" is already the current semester.', 'info')
+        return redirect(url_for('view_attendance', course_id=course.id))
+
+    # Stamp any legacy unlabelled sessions with the OLD semester before switching
+    ClassSession.query.filter_by(course_id=course.id, semester=None) \
+                      .update({'semester': _course_semester(course)})
+    course.current_semester = name
+
+    if request.form.get('clear_roster'):
+        course.students.clear()
+
+    db.session.commit()
+    flash(f'Started "{name}" for {course.code}. Previous records remain '
+          'available under their own semester.', 'success')
+    return redirect(url_for('view_attendance', course_id=course.id))
+
+
+@app.route('/course/<int:course_id>/remove_student/<int:student_id>', methods=['POST'])
+@login_required
+def remove_student(course_id, student_id):
+    """Un-enroll a student (left the course) so they stop diluting stats."""
+    course = Course.query.get_or_404(course_id)
+    if not _is_course_authorized(course):
+        flash("Unauthorised.", "error")
+        return redirect(url_for('dashboard'))
+
+    student = User.query.get_or_404(student_id)
+    if student in course.students:
+        course.students.remove(student)
+        db.session.commit()
+        flash(f'{student.full_name} removed from {course.code}. Their past '
+              'attendance records are kept.', 'success')
+    return redirect(url_for('view_attendance', course_id=course.id))
 
 
 @app.route('/session/<int:session_id>/delete', methods=['POST'])
@@ -2255,11 +2503,14 @@ def run_weekly_reports():
             # Build course data
             courses_data = []
             for course in getattr(student, 'enrolled_courses', []):
-                total_sessions = ClassSession.query.filter_by(course_id=course.id).count()
-                attended = Attendance.query.filter_by(
-                    student_id=student.id,
-                    course_id=course.id
-                ).count()
+                session_ids = [s.id for s in
+                               _semester_sessions_query(course, _course_semester(course))
+                               .with_entities(ClassSession.id).all()]
+                total_sessions = len(session_ids)
+                attended = Attendance.query.filter(
+                    Attendance.student_id == student.id,
+                    Attendance.session_id.in_(session_ids)
+                ).count() if session_ids else 0
                 pct = (attended / total_sessions * 100) if total_sessions > 0 else 0
                 courses_data.append({
                     'code': course.code,
@@ -2334,11 +2585,16 @@ def run_weekly_reports():
                     ClassSession.date_created >= datetime.combine(week_start, datetime.min.time()),
                     ClassSession.date_created <= datetime.combine(week_end, datetime.max.time())
                 ).count()
-                total_sessions = ClassSession.query.filter_by(course_id=course.id).count()
+                session_ids = [s.id for s in
+                               _semester_sessions_query(course, _course_semester(course))
+                               .with_entities(ClassSession.id).all()]
+                total_sessions = len(session_ids)
 
-                # Average attendance
+                # Average attendance (current semester only)
                 if total_sessions > 0 and total_enrolled > 0:
-                    total_att = Attendance.query.filter_by(course_id=course.id).count()
+                    total_att = Attendance.query.filter(
+                        Attendance.session_id.in_(session_ids)
+                    ).count()
                     avg_pct = (total_att / (total_sessions * total_enrolled)) * 100
                 else:
                     avg_pct = 0
@@ -2409,6 +2665,13 @@ with app.app_context():
         # column, so reads/inserts on `attendance` fail until it is added.
         ("attendance", "session_id", "INTEGER"),
         ("attendance", "device_id", "VARCHAR(200)"),
+        ("attendance", "location_verified", "BOOLEAN DEFAULT FALSE"),
+        ("attendance", "marked_by", "VARCHAR(100)"),
+        # Email verification (accounts existing before the feature stay valid)
+        ("user", "email_verified", "BOOLEAN DEFAULT FALSE"),
+        # Semester scoping
+        ("course", "current_semester", "VARCHAR(50)"),
+        ("class_session", "semester", "VARCHAR(50)"),
     ]
     with db.engine.connect() as conn:
         for table, column, col_type in _migrations:
@@ -2418,8 +2681,23 @@ with app.app_context():
                 ))
                 conn.commit()
                 print(f"[MIGRATION] Added {table}.{column}")
+                if (table, column) == ("user", "email_verified"):
+                    # Grandfather every account that predates verification —
+                    # runs exactly once, when the column is first created.
+                    conn.execute(db.text('UPDATE "user" SET email_verified = TRUE'))
+                    conn.commit()
+                    print("[MIGRATION] Marked pre-existing accounts as verified")
             except Exception:
                 conn.rollback()  # Column already exists — skip
+
+        # Label anything unlabelled with the default semester
+        try:
+            conn.execute(db.text(
+                "UPDATE course SET current_semester = :sem WHERE current_semester IS NULL"
+            ), {"sem": DEFAULT_SEMESTER})
+            conn.commit()
+        except Exception:
+            conn.rollback()
 
     # ── Backfill: adopt legacy attendance rows into per-day class sessions ──
     # Before sessions were wired up, scans were saved with session_id NULL.
@@ -2458,6 +2736,38 @@ with app.app_context():
     except Exception as e:
         db.session.rollback()
         print(f"[MIGRATION] Session backfill failed (will retry next boot): {e}")
+
+    # ── Enforce one record per (student, session) at the DB level ──
+    # First remove duplicates left over from the pre-session era, then add a
+    # unique index so concurrent double-scans can never slip through again.
+    try:
+        dupes = (db.session.query(Attendance.student_id, Attendance.session_id,
+                                  func.count(Attendance.id))
+                 .filter(Attendance.session_id.isnot(None))
+                 .group_by(Attendance.student_id, Attendance.session_id)
+                 .having(func.count(Attendance.id) > 1)
+                 .all())
+        removed = 0
+        for student_id, sess_id, _n in dupes:
+            rows = (Attendance.query
+                    .filter_by(student_id=student_id, session_id=sess_id)
+                    .order_by(Attendance.timestamp.asc())
+                    .all())
+            for extra in rows[1:]:  # keep the earliest scan
+                db.session.delete(extra)
+                removed += 1
+        if removed:
+            db.session.commit()
+            print(f"[MIGRATION] Removed {removed} duplicate attendance rows")
+        with db.engine.connect() as conn:
+            conn.execute(db.text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_attendance_student_session "
+                "ON attendance (student_id, session_id)"
+            ))
+            conn.commit()
+    except Exception as e:
+        db.session.rollback()
+        print(f"[MIGRATION] Unique-index step skipped: {e}")
 
     db.engine.dispose()  # Forces Gunicorn workers to create fresh connections
     print("[OK] Database initialized successfully!")

@@ -1,0 +1,99 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container page-wrap" style="max-width: 760px;">
+
+    <div class="page-header d-flex flex-column flex-sm-row align-items-sm-center justify-content-sm-between gap-2">
+        <div>
+            <div class="accent-line"></div>
+            <h1 class="page-title">{{ course.code }} <span style="color: var(--gold);">My Attendance</span></h1>
+            <p class="page-subtitle mb-0">{{ course.title }} · <span class="badge bg-success">{{ semester }}</span></p>
+        </div>
+        <a href="{{ url_for('student_dashboard') }}" class="btn btn-secondary align-self-start">Back</a>
+    </div>
+
+    {% if semester_choices|length > 1 %}
+    <form method="GET" class="mb-3">
+        <select name="semester" class="form-select form-select-sm" onchange="this.form.submit()"
+            style="max-width: 260px;">
+            {% for choice in semester_choices %}
+            <option value="{{ choice }}" {{ 'selected' if choice == semester }}>
+                {{ choice }}{{ ' (current)' if loop.first }}
+            </option>
+            {% endfor %}
+        </select>
+    </form>
+    {% endif %}
+
+    <!-- Summary -->
+    <div class="row g-3 mb-4">
+        <div class="col-6">
+            <div class="glass-card stat-card h-100">
+                <div class="stat-icon" style="background: rgba(0,90,43,0.12);">✅</div>
+                <div class="stat-number">{{ attended }} / {{ history|length }}</div>
+                <div class="stat-label">Classes Attended</div>
+            </div>
+        </div>
+        <div class="col-6">
+            <div class="glass-card stat-card h-100">
+                <div class="stat-icon" style="background: var(--gold-dim);">📊</div>
+                <div class="stat-number">{{ pct if pct is not none else '—' }}{{ '%' if pct is not none }}</div>
+                <div class="stat-label">
+                    {% if pct is none %}No classes yet
+                    {% elif pct >= threshold %}On Track (needs {{ threshold }}%)
+                    {% else %}At Risk (needs {{ threshold }}%)
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Class-by-class breakdown -->
+    <div class="card">
+        <div class="card-body p-0">
+            {% if history %}
+            <table class="table table-hover mb-0">
+                <thead>
+                    <tr>
+                        <th class="ps-4">Class</th>
+                        <th>Date</th>
+                        <th class="text-center">Status</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for h in history %}
+                    <tr>
+                        <td class="ps-4 fw-semibold" style="font-size: 0.9rem;">{{ h.session.title }}</td>
+                        <td style="color: var(--text-secondary); font-size: 0.85rem;">
+                            {{ h.session.date_created | localtime('%a, %d %b %Y') }}
+                        </td>
+                        <td class="text-center">
+                            {% if h.record %}
+                            <span class="badge bg-success">
+                                Present · {{ h.record.timestamp | localtime }}
+                                {% if h.record.marked_by %}(manual){% endif %}
+                            </span>
+                            {% else %}
+                            <span class="badge bg-danger">Absent</span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+            <div class="empty-state">
+                <span class="empty-icon">📭</span>
+                <p class="fw-semibold mb-1" style="color: var(--text-secondary);">No classes held yet</p>
+                <p class="small" style="color: var(--text-muted);">Your record will appear here after the first lecture.</p>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+
+    <p class="small mt-3" style="color: var(--text-muted);">
+        Think a record is wrong? Tell your lecturer during or right after class — they can
+        correct individual sessions.
+    </p>
+</div>
+{% endblock %}

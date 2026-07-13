@@ -113,7 +113,9 @@
                         {% for item in attendance_data %}
                         <tr>
                             <td class="ps-4">
-                                <span class="fw-bold" style="color: var(--green); font-size: 0.9rem;">{{ item.code }}</span>
+                                <a href="{{ url_for('my_course_history', course_id=item.course_id) }}"
+                                    class="fw-bold text-decoration-none" style="color: var(--green); font-size: 0.9rem;"
+                                    title="See which classes you attended or missed">{{ item.code }}</a>
                                 <span class="d-block d-sm-none small" style="color: var(--text-muted);">{{ item.title }}</span>
                             </td>
                             <td class="d-none d-sm-table-cell" style="color: var(--text-secondary); font-size: 0.85rem;">{{ item.title }}</td>
@@ -159,6 +161,18 @@
     let html5QrCode;
     let videoTrack = null;
     const CSRF_TOKEN = "{{ csrf_token() }}";
+
+    // Stable per-device fingerprint so one phone can't mark two students
+    // present in the same class (buddy-punching).
+    function getDeviceId() {
+        let id = localStorage.getItem('scanmark_device_id');
+        if (!id) {
+            id = (crypto.randomUUID ? crypto.randomUUID() :
+                  Date.now().toString(36) + Math.random().toString(36).slice(2));
+            localStorage.setItem('scanmark_device_id', id);
+        }
+        return id;
+    }
 
     function showResult(message, isSuccess) {
         const banner = document.getElementById('result-banner');
@@ -272,7 +286,7 @@
             fetch('/mark_attendance', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'X-CSRFToken': CSRF_TOKEN },
-                body: JSON.stringify({ qr_data: qrData, lat: lat, lon: lon })
+                body: JSON.stringify({ qr_data: qrData, lat: lat, lon: lon, device_id: getDeviceId() })
             })
                 .then(response => {
                     const ct = response.headers.get('content-type');

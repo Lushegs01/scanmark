@@ -112,6 +112,71 @@
         {% endif %}
     </div>
 
+    <!-- ===== CLASS STANDING / AT-RISK LIST ===== -->
+    <div class="glass-card p-4 p-md-5 mb-4">
+        <div class="d-flex flex-wrap align-items-center gap-2 mb-4">
+            <div class="stat-icon flex-shrink-0 m-0" style="background: rgba(220,53,69,0.12); width: 40px; height: 40px; border-radius: 12px; font-size: 1rem;">🚨</div>
+            <div>
+                <p class="mb-0 fw-bold" style="color: var(--text); font-size: 0.95rem;">Class Standing — {{ semester }}</p>
+                <p class="mb-0 small" style="color: var(--text-muted);">
+                    {% if at_risk_count %}
+                    <strong>{{ at_risk_count }}</strong> student{{ 's' if at_risk_count != 1 }} below the {{ threshold }}% attendance threshold
+                    {% else %}
+                    Everyone is at or above the {{ threshold }}% attendance threshold 🎉
+                    {% endif %}
+                </p>
+            </div>
+            {% if semester_choices|length > 1 %}
+            <form method="GET" class="m-0 ms-auto">
+                <select name="semester" class="form-select form-select-sm" onchange="this.form.submit()" style="max-width: 240px;">
+                    {% for choice in semester_choices %}
+                    <option value="{{ choice }}" {{ 'selected' if choice == semester }}>
+                        {{ choice }}{{ ' (current)' if loop.first }}
+                    </option>
+                    {% endfor %}
+                </select>
+            </form>
+            {% endif %}
+        </div>
+
+        {% if standing %}
+        <div class="table-responsive">
+            <table class="table table-hover mb-0">
+                <thead>
+                    <tr>
+                        <th>Student</th>
+                        <th>Matric No</th>
+                        <th class="text-center">Attended</th>
+                        <th class="text-center">%</th>
+                        <th class="text-center">Status</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for s in standing %}
+                    <tr class="{{ 'table-danger' if s.at_risk }}">
+                        <td>{{ s.name }}</td>
+                        <td>{{ s.matric_no }}</td>
+                        <td class="text-center">{{ s.attended }} / {{ s.total }}</td>
+                        <td class="text-center fw-bold">{{ s.pct }}%</td>
+                        <td class="text-center">
+                            {% if s.total == 0 %}
+                            <span class="badge bg-secondary">No classes yet</span>
+                            {% elif s.at_risk %}
+                            <span class="badge bg-danger">At Risk</span>
+                            {% else %}
+                            <span class="badge bg-success">On Track</span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <p class="small mb-0" style="color: var(--text-muted);">No students enrolled yet.</p>
+        {% endif %}
+    </div>
+
 </div>
 
 <script id="chart-dates" type="application/json">{{ dates | tojson | safe }}</script>

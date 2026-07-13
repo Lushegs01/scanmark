@@ -2,11 +2,12 @@
 
 {% block content %}
 <div class="container mt-4">
-    <div class="d-flex flex-column flex-md-row justify-content-between align-items-md-center gap-2 mb-3">
+    <div class="d-flex flex-column flex-md-row justify-content-between align-items-md-center gap-2 mb-2">
         <div>
             <h2>📋 {{ course.code }} Attendance Records</h2>
             <p class="text-muted mb-0">
-                <strong>{{ sessions_data|length }}</strong> class{{ 'es' if sessions_data|length != 1 }} held
+                <span class="badge bg-success">{{ semester }}</span>
+                &nbsp; <strong>{{ sessions_data|length }}</strong> class{{ 'es' if sessions_data|length != 1 }} held
                 &nbsp;·&nbsp; <strong>{{ enrolled_total }}</strong> enrolled
                 {% if sessions_data %}
                 &nbsp;·&nbsp; avg <strong>{{ avg_present }}</strong> present per class
@@ -15,14 +16,36 @@
         </div>
         <div class="d-flex flex-wrap gap-2">
             <a href="/dashboard" class="btn btn-secondary">Back</a>
-            {% if can_manage %}
-            <a href="{{ url_for('download_csv', course_id=course.id) }}" class="btn btn-primary"
+            <a href="{{ url_for('download_csv', course_id=course.id, semester=semester) }}" class="btn btn-primary"
                 title="One row per student, one column per class, with totals and %">
                 📥 Semester Register (CSV)
             </a>
-            {% endif %}
             <button class="btn btn-outline-success" onclick="window.print()">🖨️ Print View</button>
         </div>
+    </div>
+
+    <!-- Semester picker + lecturer tools -->
+    <div class="d-flex flex-wrap align-items-center gap-2 mb-3">
+        {% if semester_choices|length > 1 %}
+        <form method="GET" class="m-0">
+            <select name="semester" class="form-select form-select-sm" onchange="this.form.submit()"
+                style="max-width: 260px;">
+                {% for choice in semester_choices %}
+                <option value="{{ choice }}" {{ 'selected' if choice == semester }}>
+                    {{ choice }}{{ ' (current)' if loop.first }}
+                </option>
+                {% endfor %}
+            </select>
+        </form>
+        {% endif %}
+        {% if can_manage %}
+        <form method="POST" action="{{ url_for('start_session', course_id=course.id) }}" class="m-0"
+            onsubmit="return confirm('Open a SECOND session for today? Use this only for a genuine extra lecture — it counts as another class held.')">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="hidden" name="extra" value="1">
+            <button type="submit" class="btn btn-sm btn-outline-secondary">➕ Extra session today</button>
+        </form>
+        {% endif %}
     </div>
 
     {% if unassigned %}
@@ -44,8 +67,13 @@
                     <div class="d-flex flex-wrap align-items-center gap-2 w-100 me-3">
                         <strong>{{ sess.title }}</strong>
                         <span class="text-muted small">
-                            {{ sess.date_created.strftime('%A, %d %B %Y') if sess.date_created }}
+                            {{ sess.date_created | localtime('%A, %d %B %Y') }}
                         </span>
+                        {% if item.shared_devices %}
+                        <span class="badge bg-warning text-dark" title="Two or more students scanned from the same device">
+                            ⚠ shared device
+                        </span>
+                        {% endif %}
                         <span class="badge bg-success ms-auto">
                             {{ item.present }} / {{ enrolled_total }} present
                             {% if item.pct is not none %}({{ item.pct }}%){% endif %}
@@ -63,7 +91,9 @@
                                 <th>Full Name</th>
                                 <th>Matric No</th>
                                 <th>Level</th>
-                                <th>Time Scanned</th>
+                                <th>Time</th>
+                                <th>Checks</th>
+                                {% if can_manage %}<th></th>{% endif %}
                             </tr>
                         </thead>
                         <tbody>
@@ -73,11 +103,32 @@
                                 <td>{{ record.student.full_name if record.student else 'Deleted User' }}</td>
                                 <td>{{ record.student.matric_no if record.student else 'N/A' }}</td>
                                 <td>{{ record.student.level ~ 'L' if record.student and record.student.level else 'N/A' }}</td>
-                                <td>{{ record.timestamp.strftime('%I:%M %p') if record.timestamp }}</td>
+                                <td>{{ record.timestamp | localtime }}</td>
+                                <td>
+                                    {% if record.marked_by %}
+                                    <span class="badge bg-info text-dark" title="Added manually by {{ record.marked_by }}">manual</span>
+                                    {% elif record.location_verified %}
+                                    <span class="badge bg-success" title="Scanned within {{ 'the classroom geofence' }}">GPS ✓</span>
+                                    {% else %}
+                                    <span class="badge bg-secondary" title="No lecturer location was active — scan location unverified">GPS —</span>
+                                    {% endif %}
+                                    {% if record.device_id in item.shared_devices %}
+                                    <span class="badge bg-warning text-dark" title="Same device used by another student in this class">⚠ shared device</span>
+                                    {% endif %}
+                                </td>
+                                {% if can_manage %}
+                                <td class="text-end pe-3">
+                                    <form method="POST" action="{{ url_for('remove_attendance', record_id=record.id) }}" class="m-0 d-inline"
+                                        onsubmit="return confirm('Remove this attendance record?')">
+                                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                        <button type="submit" class="btn btn-sm btn-outline-danger py-0" title="Remove record">✕</button>
+                                    </form>
+                                </td>
+                                {% endif %}
                             </tr>
                             {% else %}
                             <tr>
-                                <td colspan="5" class="text-center py-4">
+                                <td colspan="{{ 7 if can_manage else 6 }}" class="text-center py-4">
                                     <span class="text-muted">Nobody scanned for this class.</span>
                                 </td>
                             </tr>
@@ -85,11 +136,30 @@
                         </tbody>
                     </table>
                     {% if can_manage %}
-                    <div class="d-flex justify-content-between align-items-center p-2 border-top">
-                        <a href="{{ url_for('download_csv', course_id=course.id, session_id=sess.id) }}"
-                            class="btn btn-sm btn-outline-primary">
-                            📥 This class only (CSV)
-                        </a>
+                    <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 p-2 border-top">
+                        <div class="d-flex flex-wrap gap-2">
+                            <a href="{{ url_for('download_csv', course_id=course.id, session_id=sess.id) }}"
+                                class="btn btn-sm btn-outline-primary">
+                                📥 This class only (CSV)
+                            </a>
+                            <form method="POST" action="{{ url_for('manual_mark', session_id=sess.id) }}"
+                                class="m-0 d-flex gap-1">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <input type="text" name="matric_no" class="form-control form-control-sm"
+                                    placeholder="Matric no." required style="max-width: 140px;">
+                                <button type="submit" class="btn btn-sm btn-outline-success"
+                                    title="Mark a student present manually (dead battery, no smartphone)">
+                                    ✍️ Mark present
+                                </button>
+                            </form>
+                            <form method="POST" action="{{ url_for('rename_session', session_id=sess.id) }}"
+                                class="m-0 d-flex gap-1">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <input type="text" name="title" class="form-control form-control-sm"
+                                    placeholder="Rename (e.g. Midterm)" required style="max-width: 180px;">
+                                <button type="submit" class="btn btn-sm btn-outline-secondary">Rename</button>
+                            </form>
+                        </div>
                         <form method="POST" action="{{ url_for('delete_session', session_id=sess.id) }}" class="m-0"
                             onsubmit="return confirm('Delete “{{ sess.title }}” and its {{ item.present }} record(s)? It will no longer count as a class held.')">
                             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -108,13 +178,83 @@
     <div class="card shadow">
         <div class="card-body text-center py-5">
             <span style="font-size: 2rem;">📭</span>
-            <p class="fw-semibold mb-1">No classes held yet</p>
+            <p class="fw-semibold mb-1">No classes held in {{ semester }} yet</p>
             <p class="text-muted small mb-0">
                 Press <strong>Start Attendance</strong> on your dashboard to open your first class session.
                 Each session keeps its own attendance sheet, week after week.
             </p>
         </div>
     </div>
+    {% endif %}
+
+    {% if can_manage %}
+    <!-- ===== CLASS ROSTER ===== -->
+    <details class="mt-4">
+        <summary class="fw-semibold" style="cursor: pointer;">
+            👥 Class Roster ({{ roster|length }} enrolled)
+        </summary>
+        <div class="card shadow-sm mt-2">
+            <div class="card-body p-0" style="max-height: 420px; overflow-y: auto;">
+                <table class="table table-sm table-striped mb-0">
+                    <thead>
+                        <tr><th class="ps-3">Matric No</th><th>Name</th><th>Level</th><th></th></tr>
+                    </thead>
+                    <tbody>
+                        {% for s in roster %}
+                        <tr>
+                            <td class="ps-3">{{ s.matric_no or 'N/A' }}</td>
+                            <td>{{ s.full_name }}</td>
+                            <td>{{ s.level or 'N/A' }}</td>
+                            <td class="text-end pe-3">
+                                <form method="POST"
+                                    action="{{ url_for('remove_student', course_id=course.id, student_id=s.id) }}"
+                                    class="m-0 d-inline"
+                                    onsubmit="return confirm('Remove {{ s.full_name }} from {{ course.code }}? Their past records are kept.')">
+                                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                    <button type="submit" class="btn btn-sm btn-outline-danger py-0">Remove</button>
+                                </form>
+                            </td>
+                        </tr>
+                        {% else %}
+                        <tr><td colspan="4" class="text-center text-muted py-3">No students enrolled yet.</td></tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </details>
+    {% endif %}
+
+    {% if is_coordinator %}
+    <!-- ===== SEMESTER MANAGEMENT (coordinator only) ===== -->
+    <details class="mt-3 mb-4">
+        <summary class="fw-semibold" style="cursor: pointer;">
+            🗓️ Start a new semester
+        </summary>
+        <div class="card shadow-sm mt-2">
+            <div class="card-body">
+                <p class="small text-muted mb-2">
+                    Current semester: <strong>{{ semester_choices[0] }}</strong>.
+                    Starting a new one keeps all past records viewable under their own semester,
+                    while attendance counts and percentages start fresh.
+                </p>
+                <form method="POST" action="{{ url_for('start_new_semester', course_id=course.id) }}"
+                    class="d-flex flex-wrap gap-2 align-items-center"
+                    onsubmit="return confirm('Start a new semester for {{ course.code }}? Percentages and the register will restart from zero classes held.')">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <input type="text" name="semester_name" class="form-control form-control-sm"
+                        placeholder="e.g. 2026/2027 First Semester" required style="max-width: 260px;">
+                    <div class="form-check m-0">
+                        <input class="form-check-input" type="checkbox" name="clear_roster" id="clearRoster" value="1">
+                        <label class="form-check-label small" for="clearRoster">
+                            Also clear the roster (new cohort re-registers with the course code)
+                        </label>
+                    </div>
+                    <button type="submit" class="btn btn-sm btn-warning">Start new semester</button>
+                </form>
+            </div>
+        </div>
+    </details>
     {% endif %}
 </div>
 {% endblock %}

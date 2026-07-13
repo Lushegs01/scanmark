@@ -8,7 +8,7 @@
         <h4 class="text-success mb-1">{{ course.code }} — {{ course.title }}</h4>
         <p class="text-muted mb-4">
             <span class="badge bg-success">{{ session.title }}</span>
-            <span class="ms-1">{{ session.date_created.strftime('%A, %d %B %Y') }}</span>
+            <span class="ms-1">{{ session.date_created | localtime('%A, %d %B %Y') }}</span>
         </p>
 
         <!-- QR Code Image -->
