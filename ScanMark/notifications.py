@@ -217,17 +217,27 @@ def check_attendance_threshold(student, course, db_session, Attendance_model, Cl
     Returns:
         (is_below, attendance_pct, threshold)
     """
+    from sqlalchemy import or_
     from models import NotificationPreference
 
-    # Get total sessions for this course
-    total_sessions = ClassSession_model.query.filter_by(course_id=course.id).count()
+    # Only the course's CURRENT semester counts (legacy unlabelled sessions
+    # are treated as current until a new semester is started).
+    sessions_q = ClassSession_model.query.filter_by(course_id=course.id)
+    current_sem = getattr(course, 'current_semester', None)
+    if current_sem:
+        sessions_q = sessions_q.filter(or_(
+            ClassSession_model.semester == current_sem,
+            ClassSession_model.semester.is_(None),
+        ))
+    session_ids = [s.id for s in sessions_q.with_entities(ClassSession_model.id).all()]
+    total_sessions = len(session_ids)
     if total_sessions == 0:
         return False, 100.0, DEFAULT_ATTENDANCE_THRESHOLD
 
-    # Count how many sessions this student attended
-    attended = Attendance_model.query.filter_by(
-        student_id=student.id,
-        course_id=course.id
+    # Count how many of those sessions this student attended
+    attended = Attendance_model.query.filter(
+        Attendance_model.student_id == student.id,
+        Attendance_model.session_id.in_(session_ids)
     ).count()
 
     attendance_pct = (attended / total_sessions) * 100

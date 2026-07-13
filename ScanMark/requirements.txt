@@ -55,4 +55,4 @@ wrapt==2.1.1
 WTForms==3.2.1
 twilio>=9.0.0
 reportlab>=4.1
-APScheduler>=3.10
+APScheduler>=3.10tzdata>=2024.1
