@@ -61,12 +61,15 @@
                     </div>
                     <p class="course-title">{{ course.title }}</p>
 
-                    <!-- Primary CTA -->
-                    <a href="{{ url_for('generate_qr', course_id=course.id) }}"
-                        class="btn btn-success w-100 mb-3 d-flex align-items-center justify-content-center gap-2">
-                        <i class="fas fa-qrcode"></i>
-                        <span>Start Attendance</span>
-                    </a>
+                    <!-- Primary CTA: opens (or resumes) TODAY's class session -->
+                    <form action="{{ url_for('start_session', course_id=course.id) }}" method="POST" class="mb-3">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <button type="submit"
+                            class="btn btn-success w-100 d-flex align-items-center justify-content-center gap-2">
+                            <i class="fas fa-qrcode"></i>
+                            <span>Start Attendance</span>
+                        </button>
+                    </form>
 
                     <!-- Secondary Actions -->
                     <div class="d-flex gap-2 mb-2">

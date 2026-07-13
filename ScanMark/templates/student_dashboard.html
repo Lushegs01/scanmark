@@ -119,14 +119,22 @@
                             <td class="d-none d-sm-table-cell" style="color: var(--text-secondary); font-size: 0.85rem;">{{ item.title }}</td>
                             <td class="text-center">
                                 <span class="badge bg-primary" style="font-size: 0.85rem; min-width: 32px;">
-                                    {{ item.count }}
+                                    {{ item.count }}{% if item.total_sessions %} / {{ item.total_sessions }}{% endif %}
                                 </span>
                             </td>
                             <td class="text-center">
+                                {% if item.pct is none %}
+                                <span class="badge bg-secondary" style="font-size: 0.75rem;">No classes yet</span>
+                                {% elif item.pct >= threshold %}
                                 <span class="badge"
                                     style="background: rgba(0,90,43,0.12); color: var(--green); font-size: 0.75rem;">
-                                    <i class="fas fa-circle fa-xs me-1" style="font-size: 0.5rem; vertical-align: middle;"></i>Active
+                                    <i class="fas fa-circle fa-xs me-1" style="font-size: 0.5rem; vertical-align: middle;"></i>{{ item.pct }}% · On Track
                                 </span>
+                                {% else %}
+                                <span class="badge bg-danger" style="font-size: 0.75rem;">
+                                    {{ item.pct }}% · At Risk
+                                </span>
+                                {% endif %}
                             </td>
                         </tr>
                         {% endfor %}

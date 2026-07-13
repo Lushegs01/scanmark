@@ -77,7 +77,9 @@ class Attendance(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     student_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     course_id = db.Column(db.Integer, db.ForeignKey('course.id'), nullable=False)
-    session_id = db.Column(db.Integer, db.ForeignKey('class_session.id'), nullable=False)
+    # Nullable only for legacy rows created before sessions existed; the
+    # startup backfill in app.py adopts those into per-day sessions.
+    session_id = db.Column(db.Integer, db.ForeignKey('class_session.id'), nullable=True)
     timestamp = db.Column(db.DateTime, default=datetime.utcnow)
     device_id = db.Column(db.String(200), nullable=True)
 
