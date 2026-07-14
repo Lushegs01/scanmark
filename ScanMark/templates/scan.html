@@ -643,6 +643,16 @@
         return id;
     }
 
+    // Progressive retry backoff: 2s → 3.2s → 5.1s → … capped at 15s, with
+    // ±20% jitter so a room full of failing phones doesn't retry in sync.
+    let retryDelay = 2000;
+    function nextRetryDelay() {
+        const jitter = 0.8 + Math.random() * 0.4;
+        const d = Math.round(retryDelay * jitter);
+        retryDelay = Math.min(retryDelay * 1.6, 15000);
+        return d;
+    }
+
     // Process attendance (your existing logic)
     function processAttendance(qrData) {
         if (!navigator.geolocation) {
@@ -686,15 +696,19 @@
 
                     if (data.status === 'success') {
                         stopScanner();
+                        retryDelay = 2000;
+                        // No page reload — the success banner is the confirmation,
+                        // and hundreds of simultaneous reloads flood the server.
                         showResult("✅ " + data.message, true);
-                        setTimeout(() => location.reload(), 1500);
                     } else {
                         showScannerStatus("❌ " + data.message, 'error');
+                        // Back off progressively so hundreds of failing phones
+                        // don't hammer the server in lock-step.
                         setTimeout(() => {
                             scanFrame.classList.remove('success');
                             scanningActive = true;
                             scanQRCode();
-                        }, 2000);
+                        }, nextRetryDelay());
                     }
                 })
                 .catch(error => {
@@ -704,7 +718,7 @@
                         scanFrame.classList.remove('success');
                         scanningActive = true;
                         scanQRCode();
-                    }, 2000);
+                    }, nextRetryDelay());
                 });
 
         }, () => {

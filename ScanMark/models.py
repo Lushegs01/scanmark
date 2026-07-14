@@ -86,6 +86,10 @@ class ClassSession(db.Model):
     # This relationship links the session to all the students who scanned it
     attendances = db.relationship('Attendance', backref='session', lazy=True, cascade="all, delete-orphan")
 
+    __table_args__ = (
+        db.Index('ix_class_session_course_id', 'course_id'),
+    )
+
 class Attendance(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     student_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
@@ -106,8 +110,12 @@ class Attendance(db.Model):
 
     # A student can only be marked once per class meeting (the app checks
     # first; this makes concurrent double-scans impossible at the DB level).
+    # The indexes keep the per-scan duplicate/device checks and the per-course
+    # views fast as records grow into the tens of thousands.
     __table_args__ = (
         db.UniqueConstraint('student_id', 'session_id', name='uq_attendance_student_session'),
+        db.Index('ix_attendance_session_id', 'session_id'),
+        db.Index('ix_attendance_course_id', 'course_id'),
     )
 
 
