@@ -96,48 +96,57 @@
 
 <script>
     const sessionId = "{{ session.id }}";
+    let knownPresent = -1;  // lets the server answer "unchanged" with one cheap query
 
     function fetchSessionAttendees() {
         // Live roll call: only students who scanned THIS class session
-        fetch(`/api/session/${sessionId}/attendees`)
+        fetch(`/api/session/${sessionId}/attendees?known=${knownPresent}`)
             .then(response => response.json())
             .then(data => {
-                if (data.status === "success") {
-                    document.getElementById("student-count").innerText = data.present;
-                    document.getElementById("enrolled-count").innerText = data.enrolled;
-                    const listContainer = document.getElementById("live-student-list");
+                if (data.status !== "success") return;
+                document.getElementById("student-count").innerText = data.present;
+                if (data.unchanged) return;  // nothing new since last poll
+                knownPresent = data.present;
+                document.getElementById("enrolled-count").innerText = data.enrolled;
+                const listContainer = document.getElementById("live-student-list");
 
-                    if (data.present === 0) {
-                        listContainer.innerHTML = '<li class="list-group-item text-muted text-center py-4">Waiting for students to scan...</li>';
-                        return;
-                    }
+                if (data.present === 0) {
+                    listContainer.innerHTML = '<li class="list-group-item text-muted text-center py-4">Waiting for students to scan...</li>';
+                    return;
+                }
 
-                    listContainer.innerHTML = "";
+                listContainer.innerHTML = "";
 
-                    // Build the detailed list items (newest scan first)
-                    data.attendees.forEach(student => {
-                        const li = document.createElement("li");
-                        li.className = "list-group-item";
-                        li.innerHTML = `
-                            <div class="d-flex justify-content-between align-items-center">
-                                <div>
-                                    <h6 class="mb-1 fw-bold text-dark">${student.name}</h6>
-                                    <small class="text-muted">
-                                        <strong>Matric:</strong> ${student.matric_no} | <strong>Level:</strong> ${student.level}
-                                    </small>
-                                </div>
-                                <span class="badge bg-success rounded-pill">${student.time}</span>
+                // Newest scans first (the server caps the list; the badge has the full count)
+                data.attendees.forEach(student => {
+                    const li = document.createElement("li");
+                    li.className = "list-group-item";
+                    li.innerHTML = `
+                        <div class="d-flex justify-content-between align-items-center">
+                            <div>
+                                <h6 class="mb-1 fw-bold text-dark">${student.name}</h6>
+                                <small class="text-muted">
+                                    <strong>Matric:</strong> ${student.matric_no} | <strong>Level:</strong> ${student.level}
+                                </small>
                             </div>
-                        `;
-                        listContainer.appendChild(li);
-                    });
+                            <span class="badge bg-success rounded-pill">${student.time}</span>
+                        </div>
+                    `;
+                    listContainer.appendChild(li);
+                });
+
+                if (data.present > data.showing) {
+                    const li = document.createElement("li");
+                    li.className = "list-group-item text-muted text-center small";
+                    li.innerText = `…and ${data.present - data.showing} more already marked`;
+                    listContainer.appendChild(li);
                 }
             })
             .catch(error => console.error("Error fetching session attendees:", error));
     }
 
     fetchSessionAttendees();
-    setInterval(fetchSessionAttendees, 3000);
+    setInterval(fetchSessionAttendees, 10000);
 </script>
 <script>
     // --- 1. QR CODE AUTO-REFRESH ---

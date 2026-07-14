@@ -300,8 +300,9 @@
                 .then(data => {
                     if (!data) return;
                     if (data.status === 'success') {
+                        // No full page reload: 600 students reloading at once
+                        // is its own flood. The banner is the confirmation.
                         showResult("✅ " + data.message, true);
-                        setTimeout(() => location.reload(), 2500);
                     } else {
                         showResult("❌ " + data.message, false);
                     }

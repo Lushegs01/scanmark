@@ -176,6 +176,19 @@ def test_shared_device_blocked():
     assert j['status'] == 'error' and 'another student' in j['message']
 
 
+def test_attendees_feed():
+    lect = as_(LECTURER)
+    j = lect.get(f'/api/session/{week1_id}/attendees').get_json()
+    assert j['present'] == 2 and j['enrolled'] == 3          # Ada & Bola scanned
+    assert j['showing'] == 2 and len(j['attendees']) == 2
+    assert {a['matric_no'] for a in j['attendees']} == {'20230001', '20230002'}
+    # Cheap "nothing changed" shortcut used by the projector's poll loop
+    j = lect.get(f'/api/session/{week1_id}/attendees?known=2').get_json()
+    assert j.get('unchanged') is True and 'attendees' not in j
+    # Students can't read the feed
+    assert as_(ADA).get(f'/api/session/{week1_id}/attendees').status_code == 403
+
+
 def test_manual_mark_and_remove():
     lect = as_(LECTURER)
     r = lect.post(f'/session/{week1_id}/manual_mark',
