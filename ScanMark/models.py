@@ -6,7 +6,10 @@ db = SQLAlchemy()
 
 enrollments = db.Table('enrollments',
     db.Column('user_id', db.Integer, db.ForeignKey('user.id'), primary_key=True),
-    db.Column('course_id', db.Integer, db.ForeignKey('course.id'), primary_key=True)
+    db.Column('course_id', db.Integer, db.ForeignKey('course.id'), primary_key=True),
+    # The composite PK starts with user_id, so course-side lookups (enrolled
+    # counts, class rosters) need their own index.
+    db.Index('ix_enrollments_course_id', 'course_id')
 )
 
 # --- THE HIERARCHY LINK ---
@@ -71,9 +74,14 @@ class ClassSession(db.Model):
     course_id = db.Column(db.Integer, db.ForeignKey('course.id'), nullable=False)
     title = db.Column(db.String(100), nullable=False)  # e.g., "Week 1", "Makeup Class"
     date_created = db.Column(db.DateTime, default=datetime.utcnow)
-    
+
     # This relationship links the session to all the students who scanned it
     attendances = db.relationship('Attendance', backref='session', lazy=True, cascade="all, delete-orphan")
+
+    # Session counts/lookups are always per course
+    __table_args__ = (
+        db.Index('ix_class_session_course_id', 'course_id'),
+    )
 
 class Attendance(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -84,6 +92,19 @@ class Attendance(db.Model):
     session_id = db.Column(db.Integer, db.ForeignKey('class_session.id'), nullable=True)
     timestamp = db.Column(db.DateTime, default=datetime.utcnow)
     device_id = db.Column(db.String(200), nullable=True)
+
+    __table_args__ = (
+        # One scan per student per class session, enforced by the database so
+        # concurrent duplicate requests can't both slip past the app-level
+        # check. Legacy rows with session_id NULL never collide (SQL NULLs
+        # are distinct for unique-index purposes on SQLite and Postgres).
+        db.Index('uq_attendance_student_session', 'student_id', 'session_id',
+                 unique=True),
+        # The live attendee feed filters on session_id; the duplicate check
+        # and early-warning counts filter on (course_id, student_id).
+        db.Index('ix_attendance_session_id', 'session_id'),
+        db.Index('ix_attendance_course_student', 'course_id', 'student_id'),
+    )
 
 
 class NotificationPreference(db.Model):

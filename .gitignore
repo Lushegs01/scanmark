@@ -205,3 +205,7 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# WhiteNoise boot-time compression artifacts
+ScanMark/static/*.gz
+ScanMark/static/*.br

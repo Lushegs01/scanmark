@@ -277,8 +277,16 @@
                 .then(response => {
                     const ct = response.headers.get('content-type');
                     if (!ct || !ct.includes('application/json')) {
-                        showResult("❌ Session expired. Redirecting to login…", false);
-                        setTimeout(() => window.location.href = "/login", 2000);
+                        // Only a real auth failure means the session expired;
+                        // a 502/503/timeout page from a busy server must not
+                        // bounce the whole class to /login.
+                        if (response.status === 401 || response.status === 403 ||
+                            (response.redirected && response.url.includes('/login'))) {
+                            showResult("❌ Session expired. Redirecting to login…", false);
+                            setTimeout(() => window.location.href = "/login", 2000);
+                        } else {
+                            showResult("⏳ Server is busy — please wait a moment and scan again.", false);
+                        }
                         return null;
                     }
                     return response.json();
@@ -287,7 +295,9 @@
                     if (!data) return;
                     if (data.status === 'success') {
                         showResult("✅ " + data.message, true);
-                        setTimeout(() => location.reload(), 2500);
+                        // Refresh so the dashboard stats include this scan, but
+                        // wait a bit to spread the reloads of a full class out.
+                        setTimeout(() => location.reload(), 4000);
                     } else {
                         showResult("❌ " + data.message, false);
                     }
