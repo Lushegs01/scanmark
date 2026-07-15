@@ -45,6 +45,14 @@ export SECRET_KEY=verify-secret-key \
 
 ## Gotchas
 
+- `/static/*` is served by WhiteNoise at the WSGI layer (bypasses Flask
+  routes); boot generates `.gz`/`.br` siblings in `ScanMark/static/`
+  (gitignored). Dynamic responses are gzip'd by Flask-Compress — use
+  `stream=True` + `response.raw.headers` to see `Content-Encoding`.
+- The weekly-report cron job is exercised by calling `run_weekly_reports()`
+  directly in a process with the same env (its surface is the scheduler);
+  run it twice to check the already-sent dedupe.
+
 - `/login` limit counts POSTs per (IP, email); `/mark_attendance` is 10/min per user.
   Limiter counters live in Redis under `LIMIT*` keys — delete only those to reset,
   never FLUSHDB (sessions share the same Redis).
@@ -57,4 +65,6 @@ export SECRET_KEY=verify-secret-key \
 
 scan success → duplicate scan → parallel duplicate race (assert 1 row) → stale-token
 expiry → forged/malformed token → unenrolled student → rate-limit 429 (JSON body) →
-attendees feed shape → second boot on the same DB (migration idempotency).
+attendees feed shape → second boot on the same DB (migration idempotency) →
+remember-me survives dropping the session cookie → dashboard/lecturer views render →
+CSV downloads → compression + cache headers on static → weekly reports twice.

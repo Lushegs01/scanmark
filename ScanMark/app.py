@@ -19,6 +19,7 @@ from flask_login import LoginManager, login_user, login_required, logout_user, c
 from werkzeug.security import generate_password_hash, check_password_hash
 from sqlalchemy import func, event
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import joinedload, selectinload
 import redis
 from flask_session import Session
 from itsdangerous import URLSafeTimedSerializer
@@ -27,6 +28,8 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from flask import send_from_directory
 from flask_wtf.csrf import CSRFProtect
+from flask_compress import Compress
+from whitenoise import WhiteNoise
 import sentry_sdk
 from sentry_sdk.integrations.flask import FlaskIntegration
 
@@ -85,6 +88,40 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False  # 🚨 FIX: Silence SQLAlc
 
 # FIX #2: Enable CSRF protection globally
 csrf = CSRFProtect(app)
+
+# ============================================================
+# STATIC FILES & COMPRESSION
+# ============================================================
+
+# WhiteNoise serves /static at the WSGI layer (before Flask routing) with
+# Cache-Control headers and pre-compressed gzip/brotli variants, so a class
+# of phones pulling CSS/logo doesn't occupy Flask request handlers.
+# Filenames aren't content-hashed, so keep max-age moderate (1 day default).
+_static_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
+
+# Generate .gz/.br siblings at boot so WhiteNoise can serve them (it only
+# serves compressed variants that already exist on disk). Best-effort: on a
+# read-only filesystem the originals are served instead.
+try:
+    from whitenoise.compress import Compressor
+    _compressor = Compressor(quiet=True)
+    for _fname in os.listdir(_static_root):
+        _fpath = os.path.join(_static_root, _fname)
+        if os.path.isfile(_fpath) and _compressor.should_compress(_fname):
+            _compressor.compress(_fpath)
+except Exception as _e:
+    print(f"⚠️ Static pre-compression skipped: {_e}")
+
+app.wsgi_app = WhiteNoise(
+    app.wsgi_app,
+    root=_static_root,
+    prefix='static/',
+    max_age=int(os.environ.get('STATIC_MAX_AGE', 86400)),
+)
+
+# Gzip/brotli-compress dynamic responses (HTML/JSON) — big win on campus
+# mobile connections; compressible responses shrink ~70-85%.
+Compress(app)
 
 def user_based_rate_limit_key():
     """
@@ -544,6 +581,15 @@ login_manager = LoginManager()
 login_manager.init_app(app)
 login_manager.login_view = 'login'
 
+# Keep students signed in across browser restarts (remember-me cookie).
+# Without this every closed browser meant a fresh login — which is what
+# created the before-class login stampede and its scrypt-hashing CPU cost.
+app.config['REMEMBER_COOKIE_DURATION'] = timedelta(
+    days=int(os.environ.get('REMEMBER_COOKIE_DAYS', 30))
+)
+app.config['REMEMBER_COOKIE_HTTPONLY'] = True
+app.config['REMEMBER_COOKIE_SECURE'] = os.environ.get('FLASK_ENV') == 'production'
+
 
 # ============================================================
 # FUNAAB EMAIL VALIDATION
@@ -653,6 +699,17 @@ def get_class_location(course_id):
 _local_locations = {}
 
 
+def _enrolled_count(course_id):
+    """
+    COUNT of students enrolled in a course, straight off the enrollments
+    table. Use this instead of len(course.students), which materialises
+    every enrolled User row (2000 ORM objects) just to take its length.
+    """
+    return (db.session.query(func.count(enrollments.c.user_id))
+            .filter(enrollments.c.course_id == course_id)
+            .scalar()) or 0
+
+
 # ------------------------------------------------------------------
 # FIX #3 & #6: Signed, cached QR tokens
 # ------------------------------------------------------------------
@@ -740,7 +797,7 @@ def get_course_analytics(course_id):
     if not course:
         return None
 
-    total_students = len(course.students) if hasattr(course, 'students') else 0
+    total_students = _enrolled_count(course_id)
     if total_students == 0:
         return {"dates": [], "counts": [], "average": 0, "total_enrolled": 0}
 
@@ -1009,7 +1066,7 @@ def authorize_google():
         
         flash('Account created via Google! Check your email for confirmation.', 'success')
 
-    login_user(user)
+    login_user(user, remember=True)
     return redirect_by_role(user.role)
 
 
@@ -1151,7 +1208,7 @@ def campos_sso_callback():
         if changed:
             db.session.commit()
 
-    login_user(user)
+    login_user(user, remember=True)
 
     # Only allow safe relative redirects (block open-redirect via ?next=).
     if next_path and next_path.startswith('/') and not next_path.startswith('//'):
@@ -1202,7 +1259,7 @@ def login():
         user = User.query.filter_by(email=email).first()
 
         if user and check_password_hash(user.password, password):
-            login_user(user)
+            login_user(user, remember=True)
             return redirect_by_role(user.role)
         else:
             flash('Invalid email or password.', 'error')
@@ -1398,14 +1455,31 @@ def student_dashboard():
     pref = NotificationPreference.query.filter_by(user_id=current_user.id).first()
     threshold = pref.warning_threshold if pref and pref.warning_threshold else 75
 
-    enrolled_courses = getattr(current_user, 'enrolled_courses', [])
+    # Two GROUP BY queries for ALL courses at once — the old loop ran two
+    # COUNT queries per enrolled course (~18 queries per dashboard load),
+    # and this page reloads after every successful scan.
+    enrolled_courses = list(getattr(current_user, 'enrolled_courses', []) or [])
+    course_ids = [c.id for c in enrolled_courses]
+
+    attended_by_course = {}
+    sessions_by_course = {}
+    if course_ids:
+        attended_by_course = dict(
+            db.session.query(Attendance.course_id, func.count(Attendance.id))
+            .filter(Attendance.student_id == current_user.id,
+                    Attendance.course_id.in_(course_ids))
+            .group_by(Attendance.course_id)
+            .all())
+        sessions_by_course = dict(
+            db.session.query(ClassSession.course_id, func.count(ClassSession.id))
+            .filter(ClassSession.course_id.in_(course_ids))
+            .group_by(ClassSession.course_id)
+            .all())
+
     attendance_data = []
     for course in enrolled_courses:
-        count = Attendance.query.filter_by(
-            student_id=current_user.id,
-            course_id=course.id
-        ).count()
-        total_sessions = ClassSession.query.filter_by(course_id=course.id).count()
+        count = attended_by_course.get(course.id, 0)
+        total_sessions = sessions_by_course.get(course.id, 0)
         pct = round(count / total_sessions * 100) if total_sessions else None
         attendance_data.append({
             'code': course.code,
@@ -1739,13 +1813,24 @@ def get_qr_image(session_id):
 
     qr_text = generate_signed_qr(session_id)
 
+    # The projector page re-fetches this image on an interval; render the
+    # PNG once per token and share it via Redis for the token's lifetime
+    # instead of re-encoding on every poll.
+    png_cache_key = f"qr_png:{qr_text}"
+    if redis_client:
+        cached_png = redis_client.get(png_cache_key)
+        if cached_png:
+            return send_file(io.BytesIO(cached_png), mimetype='image/png')
+
     try:
         import qrcode
         img = qrcode.make(qr_text)
         buf = io.BytesIO()
         img.save(buf, format="PNG")
-        buf.seek(0)
-        return send_file(buf, mimetype='image/png')
+        png_bytes = buf.getvalue()
+        if redis_client:
+            redis_client.setex(png_cache_key, QR_TOKEN_TTL, png_bytes)
+        return send_file(io.BytesIO(png_bytes), mimetype='image/png')
     except ImportError:
         return "QR code library not installed", 500
 
@@ -1784,9 +1869,7 @@ def get_session_attendees(session_id):
         "time": ts.strftime('%I:%M %p') if ts else "",
     } for ts, full_name, matric_no, level in rows]
 
-    enrolled_total = (db.session.query(func.count(enrollments.c.user_id))
-                      .filter(enrollments.c.course_id == course.id)
-                      .scalar()) or 0
+    enrolled_total = _enrolled_count(course.id)
 
     payload = json.dumps({
         "status": "success",
@@ -2080,12 +2163,18 @@ def view_attendance(course_id):
         flash("Unauthorised access to attendance list.", "error")
         return redirect(url_for('dashboard'))
 
+    # Eager-load each session's attendances AND their students: without this
+    # the loop below fires one query per session plus one per attendance row
+    # when the template prints student names (a semester of 2000-student
+    # sessions = tens of thousands of queries on one page view).
     sessions = (ClassSession.query
+                .options(selectinload(ClassSession.attendances)
+                         .selectinload(Attendance.student))
                 .filter_by(course_id=course_id)
                 .order_by(ClassSession.date_created.desc())
                 .all())
 
-    enrolled_total = len(course.students) if hasattr(course, 'students') else 0
+    enrolled_total = _enrolled_count(course_id)
 
     sessions_data = []
     for sess in sessions:
@@ -2140,7 +2229,13 @@ def download_csv(course_id):
     # ── Single-session sheet ──
     if session_id:
         sess = ClassSession.query.filter_by(id=session_id, course_id=course_id).first_or_404()
-        records = {rec.student_id: rec for rec in sess.attendances}
+        # One JOINed query (attendances + their students) instead of a lazy
+        # student lookup per scanned row.
+        session_records = (Attendance.query
+                           .options(joinedload(Attendance.student))
+                           .filter_by(session_id=sess.id)
+                           .all())
+        records = {rec.student_id: rec for rec in session_records}
         enrolled = list(course.students) if hasattr(course, 'students') else []
 
         csv_data = "Matric Number,Full Name,Level,Status,Time Scanned,Device ID\n"
@@ -2157,7 +2252,7 @@ def download_csv(course_id):
             csv_data += ",".join(_csv_cell(v) for v in row) + "\n"
 
         # Scans from students no longer enrolled (kept for the record)
-        for rec in sess.attendances:
+        for rec in session_records:
             if rec.student_id in listed_ids:
                 continue
             student = rec.student
@@ -2181,14 +2276,20 @@ def download_csv(course_id):
                 .order_by(ClassSession.date_created.asc())
                 .all())
 
-    # student_id -> set of session_ids attended
+    # student_id -> set of session_ids attended.
+    # One JOINed query over the whole course instead of a lazy attendances
+    # load per session plus a lazy student load per scan row.
+    all_records = (Attendance.query
+                   .options(joinedload(Attendance.student))
+                   .filter(Attendance.course_id == course_id,
+                           Attendance.session_id.isnot(None))
+                   .all())
     attended_map = {}
     students_by_id = {}
-    for sess in sessions:
-        for rec in sess.attendances:
-            attended_map.setdefault(rec.student_id, set()).add(sess.id)
-            if rec.student:
-                students_by_id[rec.student_id] = rec.student
+    for rec in all_records:
+        attended_map.setdefault(rec.student_id, set()).add(rec.session_id)
+        if rec.student:
+            students_by_id[rec.student_id] = rec.student
 
     enrolled = list(course.students) if hasattr(course, 'students') else []
     enrolled_ids = {s.id for s in enrolled}
@@ -2356,33 +2457,65 @@ def run_weekly_reports():
 
         print(f"\n📊 Running weekly reports for {week_range}...")
 
+        # ── Batched aggregates (once, up front) ──
+        # The old version ran two COUNT queries per (student, course) plus a
+        # WeeklyReport lookup per user: with 2000 opted-in students that was
+        # tens of thousands of queries every Monday. These few GROUP BY
+        # queries replace all of them.
+        sessions_per_course = dict(
+            db.session.query(ClassSession.course_id, func.count(ClassSession.id))
+            .group_by(ClassSession.course_id).all())
+        attendance_per_course = dict(
+            db.session.query(Attendance.course_id, func.count(Attendance.id))
+            .group_by(Attendance.course_id).all())
+        enrolled_per_course = dict(
+            db.session.query(enrollments.c.course_id, func.count(enrollments.c.user_id))
+            .group_by(enrollments.c.course_id).all())
+        week_start_dt = datetime.combine(week_start, datetime.min.time())
+        week_end_dt = datetime.combine(week_end, datetime.max.time())
+        sessions_this_week_per_course = dict(
+            db.session.query(ClassSession.course_id, func.count(ClassSession.id))
+            .filter(ClassSession.date_created >= week_start_dt,
+                    ClassSession.date_created <= week_end_dt)
+            .group_by(ClassSession.course_id).all())
+        # (student_id, course_id) -> classes attended, for opted-in students
+        attended_map = {
+            (sid, cid): n for sid, cid, n in (
+                db.session.query(Attendance.student_id, Attendance.course_id,
+                                 func.count(Attendance.id))
+                .join(NotificationPreference,
+                      NotificationPreference.user_id == Attendance.student_id)
+                .filter(NotificationPreference.weekly_report == True)
+                .group_by(Attendance.student_id, Attendance.course_id).all())
+        }
+        # Reports already sent this week, both types, in one query
+        already_sent = {
+            (r.user_id, r.report_type)
+            for r in WeeklyReport.query.filter_by(week_start=week_start).all()
+        }
+
         # ── Student Reports ──
         students_with_pref = (
             db.session.query(User, NotificationPreference)
             .join(NotificationPreference, NotificationPreference.user_id == User.id)
-            .filter(User.role == 'student')
+            # Roles are stored in mixed case ('Student'/'student' both exist —
+            # see the lecturer filter below); the old exact match silently
+            # skipped every 'Student'-cased user.
+            .filter(func.lower(User.role) == 'student')
             .filter(NotificationPreference.weekly_report == True)
+            .options(selectinload(User.enrolled_courses))
             .all()
         )
 
         for student, pref in students_with_pref:
-            # Check if already sent this week
-            existing = WeeklyReport.query.filter_by(
-                user_id=student.id,
-                week_start=week_start,
-                report_type='student'
-            ).first()
-            if existing:
+            if (student.id, 'student') in already_sent:
                 continue
 
-            # Build course data
+            # Build course data from the precomputed aggregates
             courses_data = []
             for course in getattr(student, 'enrolled_courses', []):
-                total_sessions = ClassSession.query.filter_by(course_id=course.id).count()
-                attended = Attendance.query.filter_by(
-                    student_id=student.id,
-                    course_id=course.id
-                ).count()
+                total_sessions = sessions_per_course.get(course.id, 0)
+                attended = attended_map.get((student.id, course.id), 0)
                 pct = (attended / total_sessions * 100) if total_sessions > 0 else 0
                 courses_data.append({
                     'code': course.code,
@@ -2424,25 +2557,30 @@ def run_weekly_reports():
             ))
 
         # ── Lecturer Reports ──
-        lecturers = User.query.filter(
-            User.role.in_(['lecturer', 'Lecturer', 'Course Coordinator', 'course coordinator'])
-        ).all()
+        lecturers = (User.query
+                     .filter(User.role.in_(['lecturer', 'Lecturer',
+                                            'Course Coordinator', 'course coordinator']))
+                     .options(selectinload(User.coordinated_courses),
+                              selectinload(User.teaching_courses))
+                     .all())
+
+        lec_prefs = {
+            p.user_id: p
+            for p in NotificationPreference.query.filter(
+                NotificationPreference.user_id.in_([l.id for l in lecturers])
+            ).all()
+        } if lecturers else {}
 
         for lecturer in lecturers:
-            lec_pref = NotificationPreference.query.filter_by(user_id=lecturer.id).first()
+            lec_pref = lec_prefs.get(lecturer.id)
             if lec_pref and not lec_pref.weekly_report:
                 continue
 
-            existing = WeeklyReport.query.filter_by(
-                user_id=lecturer.id,
-                week_start=week_start,
-                report_type='lecturer'
-            ).first()
-            if existing:
+            if (lecturer.id, 'lecturer') in already_sent:
                 continue
 
-            # Get courses this lecturer manages
-            coordinated = Course.query.filter_by(coordinator_id=lecturer.id).all()
+            # Get courses this lecturer manages (eager-loaded above)
+            coordinated = getattr(lecturer, 'coordinated_courses', [])
             teaching = getattr(lecturer, 'teaching_courses', [])
             all_courses = list(set(list(coordinated) + list(teaching)))
 
@@ -2451,17 +2589,13 @@ def run_weekly_reports():
 
             courses_data = []
             for course in all_courses:
-                total_enrolled = len(course.students) if hasattr(course, 'students') else 0
-                sessions_week = ClassSession.query.filter(
-                    ClassSession.course_id == course.id,
-                    ClassSession.date_created >= datetime.combine(week_start, datetime.min.time()),
-                    ClassSession.date_created <= datetime.combine(week_end, datetime.max.time())
-                ).count()
-                total_sessions = ClassSession.query.filter_by(course_id=course.id).count()
+                total_enrolled = enrolled_per_course.get(course.id, 0)
+                sessions_week = sessions_this_week_per_course.get(course.id, 0)
+                total_sessions = sessions_per_course.get(course.id, 0)
 
                 # Average attendance
                 if total_sessions > 0 and total_enrolled > 0:
-                    total_att = Attendance.query.filter_by(course_id=course.id).count()
+                    total_att = attendance_per_course.get(course.id, 0)
                     avg_pct = (total_att / (total_sessions * total_enrolled)) * 100
                 else:
                     avg_pct = 0
@@ -2612,6 +2746,10 @@ with app.app_context():
             " ON attendance (session_id)",
             "CREATE INDEX IF NOT EXISTS ix_attendance_course_student"
             " ON attendance (course_id, student_id)",
+            "CREATE INDEX IF NOT EXISTS ix_enrollments_course_id"
+            " ON enrollments (course_id)",
+            "CREATE INDEX IF NOT EXISTS ix_class_session_course_id"
+            " ON class_session (course_id)",
         ):
             try:
                 conn.execute(db.text(_index_sql))

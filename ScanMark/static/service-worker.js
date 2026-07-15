@@ -1,10 +1,12 @@
-const CACHE_NAME = 'my-app-cache-v1';
+// v2: the v1 pre-cache list included URLs that don't exist (/base.html,
+// /static/script.js) — cache.addAll() rejects if ANY url 404s, so the
+// service worker never actually installed and offline mode never worked.
+const CACHE_NAME = 'scanmark-cache-v2';
 const urlsToCache = [
-    '/',
-    '/base.html',
     '/static/style.css',
-    '/static/script.js',
     '/static/logo.png',
+    '/static/logo-192.png',
+    '/static/manifest.json',
 ];
 
 // 1. Install & Cache Static Files
@@ -38,10 +40,11 @@ self.addEventListener('fetch', event => {
                 // Save it to the phone's local IndexedDB (Offline Storage)
                 await saveScanOffline(scanData);
 
-                // Lie to the frontend so the student sees a green checkmark instead of an error!
+                // Honest message: the sync is attempted later, but the QR
+                // token may have expired by then and need a fresh scan.
                 return new Response(JSON.stringify({
                     status: "success",
-                    message: "Attendance Saved Offline ✅ (Will sync when internet returns)"
+                    message: "📶 No network — scan saved on this phone. It will try to sync automatically; if the class QR has expired by then, please scan again."
                 }), {
                     headers: { 'Content-Type': 'application/json' }
                 });
@@ -50,10 +53,15 @@ self.addEventListener('fetch', event => {
         return; // Stop here so it doesn't run the static cache logic below
     }
 
-    // SCENARIO B: Normal web traffic (Load images, CSS, HTML)
-    event.respondWith(
-        caches.match(event.request).then(response => response || fetch(event.request))
-    );
+    // SCENARIO B: Static assets only — cache-first. Dynamic pages
+    // (dashboards, login, APIs) always go to the network: serving them
+    // from cache would show stale, per-user content.
+    if (event.request.method === 'GET' && urlsToCache.some(u => event.request.url.endsWith(u))) {
+        event.respondWith(
+            caches.match(event.request).then(response => response || fetch(event.request))
+        );
+    }
+    // Everything else: browser default (no interception).
 });
 
 // --- HELPER DATABASE FUNCTION ---
