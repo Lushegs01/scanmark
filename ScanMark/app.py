@@ -723,6 +723,12 @@ QR_TOKEN_TTL = 12   # seconds a single token stays valid in Redis
 # clients retry, amplifying the burst.
 QR_CODE_WINDOW = 45
 
+# Max distance (metres) between the lecturer's pinned class location and the
+# scanning student. The old code checked 500 while telling students the limit
+# was 50 — anyone within half a kilometre could mark attendance. 100m default
+# balances anti-cheating with real-world phone GPS error inside buildings.
+GEOFENCE_RADIUS_M = int(os.environ.get('GEOFENCE_RADIUS_M', 100))
+
 
 def _make_signature(message: str) -> str:
     """Return a 16-char HMAC-SHA256 hex signature."""
@@ -951,75 +957,6 @@ def reset_password(token):
 
 
 # ============================================================
-# DEBUG ENDPOINT (Remove in production)
-# ============================================================
-
-@app.route('/test_signup', methods=['GET', 'POST'])
-@csrf.exempt
-def test_signup():
-    """Simple signup test page"""
-    if request.method == 'POST':
-        print("\n" + "="*60)
-        print("TEST SIGNUP - Form Submitted")
-        print("="*60)
-        print(f"Form Data: {dict(request.form)}")
-        print(f"Method: {request.method}")
-        print(f"Content-Type: {request.content_type}")
-        
-        name = request.form.get('name', '')
-        email = request.form.get('email', '')
-        password = request.form.get('password', '')
-        
-        print(f"\nExtracted Values:")
-        print(f"  Name: '{name}'")
-        print(f"  Email: '{email}'")
-        print(f"  Password: {'*' * len(password) if password else 'EMPTY'}")
-        print("="*60 + "\n")
-        
-        return f"""
-        <h2>Form Received Successfully!</h2>
-        <ul>
-            <li>Name: {name}</li>
-            <li>Email: {email}</li>
-            <li>Password: {'*' * len(password)}</li>
-        </ul>
-        <a href="/test_signup">Back to form</a>
-        """
-    
-    return '''
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Test Signup</title>
-        <style>
-            body { font-family: Arial; max-width: 500px; margin: 50px auto; padding: 20px; }
-            input { width: 100%; padding: 10px; margin: 10px 0; }
-            button { width: 100%; padding: 12px; background: #28a745; color: white; border: none; cursor: pointer; }
-            button:hover { background: #218838; }
-        </style>
-    </head>
-    <body>
-        <h2>Test Signup Form</h2>
-        <form method="POST" onsubmit="console.log('Form submitting...'); return true;">
-            <label>Name:</label>
-            <input type="text" name="name" value="Test User" required>
-            
-            <label>Email:</label>
-            <input type="email" name="email" value="test@student.funaab.edu.ng" required>
-            
-            <label>Password:</label>
-            <input type="password" name="password" value="test123456" required>
-            
-            <button type="submit">Test Submit</button>
-        </form>
-        <hr>
-        <p><a href="/signup">Go to Real Signup Page</a></p>
-    </body>
-    </html>
-    '''
-
-
-# ============================================================
 # AUTHENTICATION ROUTES
 # ============================================================
 
@@ -1080,18 +1017,17 @@ def authorize_google():
 # student signs in once at CampOS and lands here already authenticated.
 #
 # The signing secret MUST match CampOS Core. Set SSO_JWT_SECRET to the same
-# value in both apps (defaults mirror Core so local dev works out of the box).
+# value in both apps. There is deliberately NO fallback value: a hardcoded
+# default lives in the public repo, so anyone could mint a token and sign in
+# as any user (including staff). Without the env var, SSO simply stays off.
 
 SSO_ISSUER = 'campos-core'
 SSO_AUDIENCE = 'scanmark'
 
 
 def _sso_secret() -> str:
-    return (
-        os.environ.get('SSO_JWT_SECRET')
-        or os.environ.get('JWT_SECRET')
-        or 'campos-jwt-secret-change-in-production'
-    )
+    """Shared HS256 secret, or '' when SSO is not configured."""
+    return os.environ.get('SSO_JWT_SECRET') or os.environ.get('JWT_SECRET') or ''
 
 
 def _sso_b64url_decode(segment: str) -> bytes:
@@ -1118,6 +1054,10 @@ def verify_campos_sso_token(token: str) -> dict:
     library (no extra dependencies). Checks the signature, expiry, issuer
     and audience, and returns the claims dict. Raises ValueError on failure.
     """
+    secret = _sso_secret()
+    if not secret:
+        raise ValueError('SSO is not configured (set SSO_JWT_SECRET); rejecting token')
+
     try:
         header_b64, payload_b64, sig_b64 = token.split('.')
     except ValueError:
@@ -1129,7 +1069,7 @@ def verify_campos_sso_token(token: str) -> dict:
 
     signing_input = f'{header_b64}.{payload_b64}'.encode('ascii')
     expected_sig = hmac.new(
-        _sso_secret().encode('utf-8'), signing_input, hashlib.sha256
+        secret.encode('utf-8'), signing_input, hashlib.sha256
     ).digest()
     if not hmac.compare_digest(expected_sig, _sso_b64url_decode(sig_b64)):
         raise ValueError('bad signature')
@@ -1275,11 +1215,11 @@ def signup():
     print(f"{'='*60}")
     
     if request.method == 'POST':
-        # Get all form data
+        # Get all form data (keys only — never dump request.form itself,
+        # it contains the plaintext password and prints straight into logs)
         print("\n📋 FORM DATA RECEIVED:")
         print(f"Raw form keys: {list(request.form.keys())}")
-        print(f"Raw form: {dict(request.form)}")
-        
+
         # Get main fields
         name = (request.form.get('full_name') or 
                 request.form.get('name') or '').strip()
@@ -2073,10 +2013,10 @@ def mark_attendance():
                 class_loc['lat'], class_loc['lon'],
                 float(student_lat), float(student_lon)
             )
-            if dist > 500:  # 50 meters
+            if dist > GEOFENCE_RADIUS_M:
                 return jsonify({
                     "status": "error",
-                    "message": f"Too far from classroom. You are {int(dist)}m away (max 50m)."
+                    "message": f"Too far from classroom. You are {int(dist)}m away (max {GEOFENCE_RADIUS_M}m)."
                 })
 
         new_record = Attendance(
