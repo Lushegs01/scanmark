@@ -18,6 +18,8 @@ course_instructors = db.Table('course_instructors',
 
 class User(UserMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
+    campos_user_id = db.Column(db.String(100), unique=True, nullable=True, index=True)
+    campos_institution_id = db.Column(db.String(100), nullable=True, index=True)
     full_name = db.Column(db.String(100), nullable=False)
     email = db.Column(db.String(120), unique=True, nullable=False)
     password = db.Column(db.String(200), nullable=False)

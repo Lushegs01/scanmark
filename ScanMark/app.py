@@ -6,18 +6,16 @@ import secrets
 import time
 import math
 import re
-import json
-import base64
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 load_dotenv()
 from authlib.integrations.flask_client import OAuth
 from flask import (Flask, render_template, redirect, url_for,
-                   flash, request, send_file, jsonify, Response)
+                   flash, request, send_file, jsonify, Response, session)
 from flask_login import LoginManager, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
-from sqlalchemy import func
+from sqlalchemy import func, inspect
 import redis
 from flask_session import Session
 from itsdangerous import URLSafeTimedSerializer
@@ -30,6 +28,18 @@ import sentry_sdk
 from sentry_sdk.integrations.flask import FlaskIntegration
 
 from models import db, User, Course, Attendance, ClassSession, NotificationPreference, WeeklyReport
+from campos_integration import (
+    CamposIntegrationError,
+    exchange_campos_sso_code,
+    is_production_environment,
+    map_campos_role,
+    protect_sso_response,
+    report_attendance_event,
+    rotate_flask_session,
+    sanitize_next_path,
+    validate_account_binding,
+    verify_campos_sso_token,
+)
 from notifications import (
     send_attendance_whatsapp,
     send_warning_whatsapp,
@@ -72,13 +82,19 @@ app = Flask(__name__)
 # --- FIX #14: Crash loudly if SECRET_KEY is missing in production ---
 _secret = os.environ.get('SECRET_KEY')
 if not _secret:
-    if os.environ.get('FLASK_ENV') == 'production':
+    if is_production_environment():
         raise RuntimeError("CRITICAL: SECRET_KEY environment variable is not set! Refusing to start.")
     else:
         _secret = 'local_dev_fallback_key_do_not_use_in_prod'
         print("⚠️  WARNING: SECRET_KEY not set. Using insecure fallback for local dev only.")
 
 app.config['SECRET_KEY'] = _secret
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config['SESSION_COOKIE_SECURE'] = is_production_environment()
+app.config['REMEMBER_COOKIE_HTTPONLY'] = True
+app.config['REMEMBER_COOKIE_SAMESITE'] = 'Lax'
+app.config['REMEMBER_COOKIE_SECURE'] = is_production_environment()
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False  # 🚨 FIX: Silence SQLAlchemy warnings
 
 # FIX #2: Enable CSRF protection globally
@@ -116,10 +132,14 @@ else:
 # RATE LIMITER
 # ============================================================
 
-limiter_storage = os.environ.get('REDIS_URL', 'memory://')
+# A copied .env commonly contains REDIS_URL="". Treat that the same as an
+# unset value so local development still uses the documented in-memory store
+# instead of passing an invalid empty storage URI to Flask-Limiter.
+limiter_storage = os.environ.get('REDIS_URL') or 'memory://'
 limiter = Limiter(
     app=app,
     key_func=user_based_rate_limit_key,
+    storage_uri=limiter_storage,
     default_limits=["5000 per day", "1000 per minute"] # Give them some breathing room!
 )
 print(f"🛡️ Rate Limiter Active (Storage: {limiter_storage.split(':')[0]})")
@@ -960,113 +980,79 @@ def authorize_google():
 # ============================================================
 # CAMPOS SSO HAND-OFF  (Single Sign-On from CampOS Core)
 # ============================================================
-# CampOS Core is the identity provider. When a student clicks "ScanMark"
-# inside CampOS, Core mints a short-lived signed token carrying their CampOS
-# identity and redirects here. We verify the token with the SHARED secret,
-# trust the claims, find/create the local user, and log them in — so the
-# student signs in once at CampOS and lands here already authenticated.
-#
-# The signing secret MUST match CampOS Core. Set SSO_JWT_SECRET to the same
-# value in both apps (defaults mirror Core so local dev works out of the box).
-
-SSO_ISSUER = 'campos-core'
-SSO_AUDIENCE = 'scanmark'
+# The browser receives only an opaque, one-time code. ScanMark redeems it with
+# CAMPOS_CORE_URL over a server-to-server request, then verifies the returned
+# JWT using CAMPOS_SSO_SECRET (CampOS Core's SSO_JWT_SECRET_SCANMARK).
 
 
-def _sso_secret() -> str:
-    return (
-        os.environ.get('SSO_JWT_SECRET')
-        or os.environ.get('JWT_SECRET')
-        or 'campos-jwt-secret-change-in-production'
-    )
-
-
-def _sso_b64url_decode(segment: str) -> bytes:
-    """Decode a base64url segment, restoring missing padding."""
-    padding = '=' * (-len(segment) % 4)
-    return base64.urlsafe_b64decode(segment + padding)
-
-
-def _map_campos_role(roles) -> str:
-    """Map CampOS roles onto ScanMark roles. Students are the default."""
-    roles = [str(r).lower().strip() for r in (roles or [])]
-    if any(r in ('lecturer', 'course coordinator', 'instructor') for r in roles):
-        return 'lecturer'
-    if 'hod' in roles:
-        return 'hod'
-    if 'dean' in roles:
-        return 'dean'
-    return 'student'
-
-
-def verify_campos_sso_token(token: str) -> dict:
-    """
-    Verify an HS256 JWT minted by CampOS Core using the Python standard
-    library (no extra dependencies). Checks the signature, expiry, issuer
-    and audience, and returns the claims dict. Raises ValueError on failure.
-    """
-    try:
-        header_b64, payload_b64, sig_b64 = token.split('.')
-    except ValueError:
-        raise ValueError('malformed token')
-
-    header = json.loads(_sso_b64url_decode(header_b64))
-    if header.get('alg') != 'HS256':
-        raise ValueError('unexpected signing algorithm')
-
-    signing_input = f'{header_b64}.{payload_b64}'.encode('ascii')
-    expected_sig = hmac.new(
-        _sso_secret().encode('utf-8'), signing_input, hashlib.sha256
-    ).digest()
-    if not hmac.compare_digest(expected_sig, _sso_b64url_decode(sig_b64)):
-        raise ValueError('bad signature')
-
-    claims = json.loads(_sso_b64url_decode(payload_b64))
-
-    now = int(time.time())
-    if 'exp' in claims and now > int(claims['exp']) + 5:  # 5s clock leeway
-        raise ValueError('token expired')
-    if claims.get('iss') != SSO_ISSUER:
-        raise ValueError('bad issuer')
-    if claims.get('aud') != SSO_AUDIENCE:
-        raise ValueError('bad audience')
-
-    return claims
+def _campos_sso_redirect(location):
+    return protect_sso_response(redirect(location))
 
 
 @app.route('/sso/callback')
 @csrf.exempt
 def campos_sso_callback():
-    token = request.args.get('token')
+    code = request.args.get('code', '')
     next_path = request.args.get('next')
 
-    if not token:
-        flash('Sign-in failed: missing SSO token.', 'error')
-        return redirect(url_for('login'))
+    if not code:
+        flash('Sign-in failed: missing CampOS hand-off code.', 'error')
+        return _campos_sso_redirect(url_for('login'))
 
     try:
+        token = exchange_campos_sso_code(code)
         claims = verify_campos_sso_token(token)
-    except Exception as e:
-        print(f'⚠️  CampOS SSO rejected: {e}')
+        role = map_campos_role(claims.get('roles'))
+    except CamposIntegrationError as e:
+        app.logger.warning('CampOS SSO rejected: %s', e)
         flash('Sign-in failed: the link is invalid or has expired.', 'error')
-        return redirect(url_for('login'))
+        return _campos_sso_redirect(url_for('login'))
 
     email = (claims.get('email') or '').strip().lower()
-    if not email:
+    if not email or len(email) > 120 or not re.fullmatch(
+        r'^[^\s@]+@[^\s@]+\.[^\s@]+$', email
+    ):
         flash('Sign-in failed: no email in identity token.', 'error')
-        return redirect(url_for('login'))
+        return _campos_sso_redirect(url_for('login'))
 
     full_name = ' '.join(
         filter(None, [claims.get('firstName'), claims.get('lastName')])
-    ).strip() or email.split('@')[0]
-    matric_no = claims.get('matricNumber')
-    level = claims.get('level')
-    role = _map_campos_role(claims.get('roles'))
+    ).strip()[:100] or email.split('@')[0][:100]
+    matric_no = str(claims.get('matricNumber') or '').strip()[:20] or None
+    level = str(claims.get('level') or '').strip()[:10] or None
+    campos_user_id = claims['sub'].strip()
+    campos_institution_id = claims['institutionId'].strip()
 
-    user = User.query.filter_by(email=email).first()
+    # Resolve the stable CampOS subject first. Email is only a guarded
+    # migration path for ordinary legacy accounts that are not linked yet.
+    user = User.query.filter_by(campos_user_id=campos_user_id).first()
+    email_user = User.query.filter_by(email=email).first()
+    if user and email_user and user.id != email_user.id:
+        app.logger.warning('CampOS SSO rejected: email belongs to another local account')
+        flash('Sign-in failed: this identity cannot be linked automatically.', 'error')
+        return _campos_sso_redirect(url_for('login'))
+    if not user:
+        user = email_user
+
+    if user:
+        try:
+            validate_account_binding(
+                existing_campos_user_id=user.campos_user_id,
+                existing_institution_id=user.campos_institution_id,
+                existing_role=user.role,
+                incoming_campos_user_id=campos_user_id,
+                incoming_institution_id=campos_institution_id,
+            )
+        except CamposIntegrationError as e:
+            app.logger.warning('CampOS SSO account linking rejected: %s', e)
+            flash('Sign-in failed: this identity cannot be linked automatically.', 'error')
+            return _campos_sso_redirect(url_for('login'))
+
     if not user:
         # First arrival from CampOS — provision the local account.
         user = User(
+            campos_user_id=campos_user_id,
+            campos_institution_id=campos_institution_id,
             full_name=full_name,
             email=email,
             password=generate_password_hash(secrets.token_hex(32), method='scrypt'),
@@ -1083,24 +1069,42 @@ def campos_sso_callback():
     else:
         # Keep identity fresh from the source of truth.
         changed = False
+        if user.campos_user_id != campos_user_id:
+            user.campos_user_id = campos_user_id
+            changed = True
+        if user.campos_institution_id != campos_institution_id:
+            user.campos_institution_id = campos_institution_id
+            changed = True
+        if user.email != email:
+            user.email = email
+            changed = True
         if full_name and user.full_name != full_name:
             user.full_name = full_name
             changed = True
-        if matric_no and not user.matric_no and not User.query.filter_by(matric_no=matric_no).first():
+        matric_owner = User.query.filter_by(matric_no=matric_no).first() if matric_no else None
+        if matric_no and (not matric_owner or matric_owner.id == user.id) and user.matric_no != matric_no:
             user.matric_no = matric_no
             changed = True
-        if level and not user.level:
+        if level and user.level != level:
             user.level = level
+            changed = True
+        # CampOS is authoritative for ordinary student/lecturer access. Local
+        # HOD/dean/DAP assignments remain explicitly managed in ScanMark.
+        if (user.role or '').lower() in ('student', 'lecturer') and user.role != role:
+            user.role = role
             changed = True
         if changed:
             db.session.commit()
 
-    login_user(user)
+    # Clear anonymous/pre-existing state and rotate the server-side session ID
+    # when Flask-Session provides that capability.
+    rotate_flask_session(app.session_interface, session)
+    login_user(user, remember=False, fresh=True)
 
-    # Only allow safe relative redirects (block open-redirect via ?next=).
-    if next_path and next_path.startswith('/') and not next_path.startswith('//'):
-        return redirect(next_path)
-    return redirect_by_role(user.role)
+    safe_next = sanitize_next_path(next_path)
+    if safe_next:
+        return _campos_sso_redirect(safe_next)
+    return protect_sso_response(redirect_by_role(user.role))
 
 
 @app.route('/complete_profile', methods=['GET', 'POST'])
@@ -1726,10 +1730,22 @@ def scan_page():
 @app.route('/set_location/<int:course_id>', methods=['POST'])
 @login_required
 def set_location(course_id):
-    data = request.get_json()
+    course = Course.query.get_or_404(course_id)
+    if not _is_course_authorized(course):
+        return jsonify({"status": "error", "message": "Unauthorised"}), 403
+
+    data = request.get_json(silent=True) or {}
+    try:
+        latitude = float(data['lat'])
+        longitude = float(data['lon'])
+    except (KeyError, TypeError, ValueError):
+        return jsonify({"status": "error", "message": "Valid latitude and longitude are required."}), 400
+    if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+        return jsonify({"status": "error", "message": "Latitude or longitude is out of range."}), 400
+
     # FIX #4: Persisted in Redis (not a local dict)
-    set_class_location(course_id, data['lat'], data['lon'])
-    print(f"📍 Location set for Course {course_id} at ({data['lat']}, {data['lon']})")
+    set_class_location(course_id, latitude, longitude)
+    app.logger.info('Class location set for course %s', course_id)
     return jsonify({"status": "ok"})
 
 
@@ -1742,41 +1758,42 @@ def set_location(course_id):
 # ============================================================
 # After attendance is recorded locally, report it to CampOS Core so it appears
 # on the student's CampOS dashboard. Keyed by the shared identity (matric/email).
-# Best-effort and fully isolated — never affects attendance marking. Configure
-# CAMPOS_API_URL and CAMPOS_API_KEY in the environment to enable it.
+# Delivery stays off the scan request path and retries bounded transient errors.
+# Configure CAMPOS_CORE_URL and CAMPOS_API_KEY to enable it.
 
-def report_attendance_to_campos(matric_no, email, course_code, course_title, external_id, scanned_at_iso):
-    import requests
-    base = os.environ.get('CAMPOS_API_URL')
-    api_key = os.environ.get('CAMPOS_API_KEY')
-    if not base or not api_key:
-        return  # CampOS reporting not configured
+def report_attendance_to_campos(
+    matric_no,
+    email,
+    course_code,
+    course_title,
+    session_id,
+    session_title,
+    external_id,
+    scanned_at_iso,
+):
+    if not os.environ.get('CAMPOS_API_KEY'):
+        return
     try:
-        resp = requests.post(
-            f"{base.rstrip('/')}/api/modules/attendance",
-            json={
-                'matricNumber': matric_no,
-                'email': email,
-                'courseCode': course_code,
-                'courseTitle': course_title,
-                'status': 'present',
-                'externalId': str(external_id),
-                'scannedAt': scanned_at_iso,
-            },
-            headers={'X-API-Key': api_key},
-            timeout=8,
-        )
-        if resp.status_code >= 300:
-            print(f"⚠️ CampOS attendance report failed ({resp.status_code}): {resp.text[:200]}")
-    except Exception as e:
-        print(f"⚠️ CampOS attendance report error: {e}")
+        report_attendance_event({
+            'matricNumber': matric_no,
+            'email': email,
+            'courseCode': course_code,
+            'courseTitle': course_title,
+            'sessionId': str(session_id),
+            'sessionTitle': session_title,
+            'status': 'present',
+            'externalId': str(external_id),
+            'scannedAt': scanned_at_iso,
+        })
+    except CamposIntegrationError as e:
+        app.logger.warning('CampOS attendance report failed: %s', e)
 
 
 @app.route('/mark_attendance', methods=['POST'])
 @limiter.limit("10 per minute", error_message="Too many scan attempts. Please wait.")
 @login_required
 def mark_attendance():
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
     qr_text = data.get('qr_data')
     student_lat = data.get('lat')
     student_lon = data.get('lon')
@@ -1831,7 +1848,7 @@ def mark_attendance():
                 class_loc['lat'], class_loc['lon'],
                 float(student_lat), float(student_lon)
             )
-            if dist > 500:  # 50 meters
+            if dist > 50:
                 return jsonify({
                     "status": "error",
                     "message": f"Too far from classroom. You are {int(dist)}m away (max 50m)."
@@ -1855,7 +1872,9 @@ def mark_attendance():
                 current_user.email,
                 course.code,
                 course.title,
-                new_record.id,
+                class_session.id,
+                class_session.title,
+                f'scanmark-attendance:{new_record.id}',
                 scanned_iso,
             )
         except Exception as e:
@@ -2409,17 +2428,61 @@ with app.app_context():
         # column, so reads/inserts on `attendance` fail until it is added.
         ("attendance", "session_id", "INTEGER"),
         ("attendance", "device_id", "VARCHAR(200)"),
+        # Stable CampOS identity binding; email is not an identity key.
+        ("user", "campos_user_id", "VARCHAR(100)"),
+        ("user", "campos_institution_id", "VARCHAR(100)"),
     ]
+    database_inspector = inspect(db.engine)
+    existing_columns = {
+        table: {column['name'] for column in database_inspector.get_columns(table)}
+        for table in {table for table, _column, _type in _migrations}
+    }
     with db.engine.connect() as conn:
         for table, column, col_type in _migrations:
-            try:
-                conn.execute(db.text(
-                    f"ALTER TABLE {table} ADD COLUMN {column} {col_type}"
-                ))
-                conn.commit()
-                print(f"[MIGRATION] Added {table}.{column}")
-            except Exception:
-                conn.rollback()  # Column already exists — skip
+            if column in existing_columns[table]:
+                continue
+            quote = db.engine.dialect.identifier_preparer.quote
+            add_column = (
+                "ADD COLUMN IF NOT EXISTS"
+                if db.engine.dialect.name == "postgresql"
+                else "ADD COLUMN"
+            )
+            conn.execute(db.text(
+                f"ALTER TABLE {quote(table)} {add_column} {quote(column)} {col_type}"
+            ))
+            conn.commit()
+            existing_columns[table].add(column)
+            print(f"[MIGRATION] Added {table}.{column}")
+
+        # Nullable links keep standalone/local accounts valid while enforcing
+        # one ScanMark account per CampOS subject. New databases may already
+        # have equivalent ORM-generated indexes; avoid creating redundant
+        # indexes under different names.
+        user_indexes = database_inspector.get_indexes("user")
+        user_unique_constraints = database_inspector.get_unique_constraints("user")
+        has_campos_user_unique = any(
+            index.get("unique")
+            and index.get("column_names") == ["campos_user_id"]
+            for index in user_indexes
+        ) or any(
+            constraint.get("column_names") == ["campos_user_id"]
+            for constraint in user_unique_constraints
+        )
+        has_campos_institution_index = any(
+            index.get("column_names") == ["campos_institution_id"]
+            for index in user_indexes
+        )
+        if not has_campos_user_unique:
+            conn.execute(db.text(
+                'CREATE UNIQUE INDEX IF NOT EXISTS "user_campos_user_id_key" '
+                'ON "user" (campos_user_id) WHERE campos_user_id IS NOT NULL'
+            ))
+        if not has_campos_institution_index:
+            conn.execute(db.text(
+                'CREATE INDEX IF NOT EXISTS "user_campos_institution_id_idx" '
+                'ON "user" (campos_institution_id)'
+            ))
+        conn.commit()
 
     # ── Backfill: adopt legacy attendance rows into per-day class sessions ──
     # Before sessions were wired up, scans were saved with session_id NULL.
