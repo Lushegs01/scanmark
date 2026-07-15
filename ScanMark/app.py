@@ -17,7 +17,8 @@ from flask import (Flask, render_template, redirect, url_for,
                    flash, request, send_file, jsonify, Response)
 from flask_login import LoginManager, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
-from sqlalchemy import func
+from sqlalchemy import func, event
+from sqlalchemy.exc import IntegrityError
 import redis
 from flask_session import Session
 from itsdangerous import URLSafeTimedSerializer
@@ -29,7 +30,7 @@ from flask_wtf.csrf import CSRFProtect
 import sentry_sdk
 from sentry_sdk.integrations.flask import FlaskIntegration
 
-from models import db, User, Course, Attendance, ClassSession, NotificationPreference, WeeklyReport
+from models import db, User, Course, Attendance, ClassSession, NotificationPreference, WeeklyReport, enrollments
 from notifications import (
     send_attendance_whatsapp,
     send_warning_whatsapp,
@@ -52,12 +53,13 @@ if sentry_dsn:
         dsn=sentry_dsn,
         integrations=[FlaskIntegration()],
         
-        # Set traces_sample_rate to 1.0 to capture 100%
-        # of transactions for performance monitoring.
-        traces_sample_rate=1.0,
-        
+        # Sample a fraction of transactions: tracing/profiling every request
+        # adds per-request overhead and burns the Sentry quota during a
+        # 2000-scan burst. Raise via env if you need a deep-dive.
+        traces_sample_rate=float(os.environ.get('SENTRY_TRACES_SAMPLE_RATE', '0.1')),
+
         # Profiles sample rate helps you find CPU bottlenecks (like slow DB queries)
-        profiles_sample_rate=1.0,
+        profiles_sample_rate=float(os.environ.get('SENTRY_PROFILES_SAMPLE_RATE', '0.1')),
         
         environment=os.environ.get('FLASK_ENV', 'production')
     )
@@ -120,6 +122,10 @@ limiter_storage = os.environ.get('REDIS_URL', 'memory://')
 limiter = Limiter(
     app=app,
     key_func=user_based_rate_limit_key,
+    # Shared Redis storage so limits are counted once across all gunicorn
+    # workers (previously this value was computed but never passed, so the
+    # limiter silently fell back to per-process memory).
+    storage_uri=limiter_storage,
     default_limits=["5000 per day", "1000 per minute"] # Give them some breathing room!
 )
 print(f"🛡️ Rate Limiter Active (Storage: {limiter_storage.split(':')[0]})")
@@ -141,8 +147,18 @@ mail = Mail(app)
 # EMAIL UTILITY FUNCTIONS
 # ============================================================
 
-# 🚨 THE FIX: Create a pool of 5 workers to handle all emails safely
-email_executor = ThreadPoolExecutor(max_workers=5)
+# 🚨 THE FIX: Create a bounded pool of workers to handle all emails safely.
+# 10 workers: this pool also runs the post-scan notification tasks, and a
+# full class marking attendance queues one task per student.
+email_executor = ThreadPoolExecutor(max_workers=10)
+
+# Escape hatch for very large events: one confirmation email per scan can
+# exceed the SMTP provider's quota (Gmail allows ~500-2000 sends/day), so
+# ops can switch confirmations off with SCAN_CONFIRMATION_EMAILS=false
+# without redeploying code.
+SCAN_CONFIRMATION_EMAILS = os.environ.get(
+    'SCAN_CONFIRMATION_EMAILS', 'true'
+).strip().lower() not in ('false', '0', 'no', 'off')
 
 def send_async_email(app_instance, msg):
     """Send email asynchronously to avoid blocking"""
@@ -466,15 +482,49 @@ db_url = os.environ.get('DATABASE_URL')
 if db_url and db_url.startswith("postgres://"):
     db_url = db_url.replace("postgres://", "postgresql://", 1)
 
-app.config['SQLALCHEMY_DATABASE_URI'] = db_url or 'sqlite:///scanmark_v2.db'
-if db_url and db_url.startswith("postgresql://"):
+_db_uri = db_url or 'sqlite:///scanmark_v2.db'
+app.config['SQLALCHEMY_DATABASE_URI'] = _db_uri
+
+if _db_uri.startswith("postgresql://"):
+    # Pool sizing is PER gunicorn worker: the server sees up to
+    # workers × (pool_size + max_overflow) connections. With the default
+    # 4 workers this is 4 × (5 + 5) = 40 — make sure the Postgres plan
+    # allows at least that many, or tune these env vars down.
     app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
-        "pool_size": 10,          
-        "max_overflow": 20,       
-        "pool_recycle": 1800,     
+        "pool_size": int(os.environ.get('DB_POOL_SIZE', 5)),
+        "max_overflow": int(os.environ.get('DB_MAX_OVERFLOW', 5)),
+        "pool_recycle": 1800,
         "pool_timeout": 30,
         "pool_pre_ping": True     # 🚨 THE FIX: Silently tests the connection before running a query
     }
+else:
+    # SQLite fallback. Fine for local dev, NOT for a real class load:
+    # it allows one writer at a time and (on most PaaS hosts) sits on an
+    # ephemeral disk that is wiped on every restart/deploy.
+    if os.environ.get('FLASK_ENV') == 'production':
+        print("🚨 WARNING: DATABASE_URL is not set — running production on SQLite!")
+        print("   SQLite is single-writer and on ephemeral disk: it cannot handle")
+        print("   concurrent scan load and attendance data will be LOST on restart.")
+        print("   Provision Postgres and set DATABASE_URL before real classes use this.")
+
+    # WAL mode + a generous busy timeout so the multi-worker/multi-thread
+    # gunicorn setup doesn't instantly hit "database is locked" in dev.
+    app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
+        "pool_pre_ping": True,
+        "connect_args": {"timeout": 30, "check_same_thread": False},
+    }
+
+    from sqlalchemy.engine import Engine as _SAEngine
+
+    @event.listens_for(_SAEngine, "connect")
+    def _set_sqlite_pragmas(dbapi_connection, connection_record):
+        try:
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA busy_timeout=30000")
+            cursor.close()
+        except Exception:
+            pass  # Non-SQLite connection or pragma unsupported — ignore
 app.config['GOOGLE_CLIENT_ID'] = os.environ.get('GOOGLE_CLIENT_ID', '')
 app.config['GOOGLE_CLIENT_SECRET'] = os.environ.get('GOOGLE_CLIENT_SECRET', '')
 
@@ -608,7 +658,13 @@ _local_locations = {}
 # ------------------------------------------------------------------
 
 QR_TOKEN_TTL = 12   # seconds a single token stays valid in Redis
-QR_CODE_WINDOW = 15  # seconds before the attendance endpoint rejects the token
+# Seconds before the attendance endpoint rejects the token. Deliberately
+# wider than the 12s on-screen rotation: expiry is checked when the request
+# is PROCESSED, not when the student scanned, and during a full-class burst
+# a legitimate scan can wait ~30s (the platform router timeout) in the queue.
+# Without the headroom those queued scans bounce as "expired" and the
+# clients retry, amplifying the burst.
+QR_CODE_WINDOW = 45
 
 
 def _make_signature(message: str) -> str:
@@ -1125,7 +1181,17 @@ def complete_profile():
     return render_template('complete_profile.html')
 
 @app.route('/login', methods=['GET', 'POST'])
-@limiter.limit("5 per minute", error_message="Too many login attempts. Please try again later.")
+# Count only actual login ATTEMPTS (POSTs) — the old limit also counted GETs,
+# so viewing the page burned an attempt and one login cost 2 of the 5 hits.
+# Key by IP + submitted email: brute-forcing one account stays capped, but a
+# whole class logging in from behind one campus NAT IP before a lecture no
+# longer shares a single 5-request bucket.
+@limiter.limit(
+    "10 per minute",
+    methods=["POST"],
+    key_func=lambda: f"login:{get_remote_address()}:{(request.form.get('email') or '').strip().lower()}",
+    error_message="Too many login attempts. Please try again later."
+)
 def login():
     if current_user.is_authenticated:
         return redirect_by_role(current_user.role)
@@ -1694,27 +1760,43 @@ def get_session_attendees(session_id):
     if not _is_course_authorized(course):
         return jsonify({"error": "Unauthorised"}), 403
 
-    records = (Attendance.query
-               .filter_by(session_id=session_id)
-               .order_by(Attendance.timestamp.desc())
-               .all())
-    attendees = []
-    for rec in records:
-        student = rec.student
-        attendees.append({
-            "name": student.full_name if student else "Unknown",
-            "matric_no": (student.matric_no if student else None) or "N/A",
-            "level": (student.level if student else None) or "N/A",
-            "time": rec.timestamp.strftime('%I:%M %p') if rec.timestamp else "",
-        })
+    # Every open projector screen polls this every 3 seconds, so it has to
+    # stay cheap even with 2000 scans in one session: a short shared cache
+    # plus one JOINed query (the old version lazy-loaded each row's student
+    # — 2000 extra queries per poll — and loaded every enrolled User just
+    # to count them).
+    cache_key = f"attendees_cache:{session_id}"
+    if redis_client:
+        cached = redis_client.get(cache_key)
+        if cached:
+            return Response(cached, mimetype='application/json')
 
-    enrolled_total = len(course.students) if hasattr(course, 'students') else 0
-    return jsonify({
+    rows = (db.session.query(Attendance.timestamp, User.full_name,
+                             User.matric_no, User.level)
+            .join(User, User.id == Attendance.student_id)
+            .filter(Attendance.session_id == session_id)
+            .order_by(Attendance.timestamp.desc())
+            .all())
+    attendees = [{
+        "name": full_name or "Unknown",
+        "matric_no": matric_no or "N/A",
+        "level": level or "N/A",
+        "time": ts.strftime('%I:%M %p') if ts else "",
+    } for ts, full_name, matric_no, level in rows]
+
+    enrolled_total = (db.session.query(func.count(enrollments.c.user_id))
+                      .filter(enrollments.c.course_id == course.id)
+                      .scalar()) or 0
+
+    payload = json.dumps({
         "status": "success",
         "present": len(attendees),
         "enrolled": enrolled_total,
         "attendees": attendees,
     })
+    if redis_client:
+        redis_client.setex(cache_key, 3, payload)
+    return Response(payload, mimetype='application/json')
 
 
 @app.route('/scan_page')
@@ -1770,6 +1852,83 @@ def report_attendance_to_campos(matric_no, email, course_code, course_title, ext
             print(f"⚠️ CampOS attendance report failed ({resp.status_code}): {resp.text[:200]}")
     except Exception as e:
         print(f"⚠️ CampOS attendance report error: {e}")
+
+
+def _post_scan_notifications(app_instance, student_id, course_id, timestamp_str):
+    """
+    Everything that used to run inside /mark_attendance after the row was
+    committed: confirmation email, WhatsApp + parent alerts, and the
+    early-warning check. Runs on the executor so the scan response returns
+    immediately — at 2000 scans per class these extra queries and template
+    renders would otherwise hold the request workers hostage.
+    """
+    with app_instance.app_context():
+        try:
+            student = db.session.get(User, student_id)
+            course = db.session.get(Course, course_id)
+            if not student or not course:
+                return
+
+            pref = NotificationPreference.query.filter_by(user_id=student_id).first()
+
+            # Send attendance confirmation email (honours the user's
+            # email_alerts preference and the global kill switch).
+            if SCAN_CONFIRMATION_EMAILS and (not pref or pref.email_alerts):
+                send_attendance_confirmation(
+                    user_email=student.email,
+                    user_name=student.full_name,
+                    course_code=course.code,
+                    course_title=course.title,
+                    timestamp=timestamp_str
+                )
+
+            # ── Real-time WhatsApp alert ──
+            if pref and pref.whatsapp_alerts and pref.phone_number:
+                send_attendance_whatsapp(
+                    phone=pref.phone_number,
+                    student_name=student.full_name,
+                    course_code=course.code,
+                    course_title=course.title,
+                    timestamp_str=timestamp_str
+                )
+
+            # ── Parent/Guardian real-time alerts ──
+            if pref and pref.notify_parent:
+                parent_name = pref.parent_name or 'Parent/Guardian'
+                # WhatsApp to parent
+                if pref.parent_phone:
+                    send_parent_attendance_whatsapp(
+                        phone=pref.parent_phone,
+                        parent_name=parent_name,
+                        student_name=student.full_name,
+                        course_code=course.code,
+                        course_title=course.title,
+                        timestamp_str=timestamp_str
+                    )
+                # Email to parent
+                if pref.parent_email:
+                    send_parent_attendance_email(
+                        app_instance=app_instance,
+                        mail_func=send_email,
+                        pref=pref,
+                        student_name=student.full_name,
+                        course_code=course.code,
+                        course_title=course.title,
+                        timestamp_str=timestamp_str
+                    )
+
+            # ── Early-warning check (alerts student + parent if below threshold) ──
+            process_early_warning(
+                student=student,
+                course=course,
+                app_instance=app_instance,
+                mail_func=send_email,
+                Attendance_model=Attendance,
+                ClassSession_model=ClassSession,
+                db_session=db.session
+            )
+        except Exception as e:
+            print(f"⚠️ Post-scan notification error for user {student_id}: {e}")
 
 
 @app.route('/mark_attendance', methods=['POST'])
@@ -1844,7 +2003,17 @@ def mark_attendance():
             device_id=data.get('device_id', 'browser')
         )
         db.session.add(new_record)
-        db.session.commit()
+        try:
+            db.session.commit()
+        except IntegrityError:
+            # Two simultaneous requests from the same student both passed the
+            # SELECT above; the unique index on (student_id, session_id)
+            # keeps the second insert out.
+            db.session.rollback()
+            return jsonify({
+                "status": "error",
+                "message": "You are already marked present for this class! Double-scanning is not allowed."
+            })
 
         # Report to CampOS Core (best-effort, async — never blocks the scan).
         try:
@@ -1861,62 +2030,16 @@ def mark_attendance():
         except Exception as e:
             print(f"⚠️ Could not queue CampOS attendance report: {e}")
 
-        # Send attendance confirmation email
+        # Confirmation email, WhatsApp, parent alerts and the early-warning
+        # check all run AFTER the response, on the executor — see
+        # _post_scan_notifications above.
         timestamp_str = datetime.now().strftime('%B %d, %Y at %I:%M %p')
-        send_attendance_confirmation(
-            user_email=current_user.email,
-            user_name=current_user.full_name,
-            course_code=course.code,
-            course_title=course.title,
-            timestamp=timestamp_str
-        )
-
-        # ── Real-time WhatsApp alert ──
-        pref = NotificationPreference.query.filter_by(user_id=current_user.id).first()
-        if pref and pref.whatsapp_alerts and pref.phone_number:
-            send_attendance_whatsapp(
-                phone=pref.phone_number,
-                student_name=current_user.full_name,
-                course_code=course.code,
-                course_title=course.title,
-                timestamp_str=timestamp_str
+        try:
+            email_executor.submit(
+                _post_scan_notifications, app, current_user.id, course_id, timestamp_str
             )
-
-        # ── Parent/Guardian real-time alerts ──
-        if pref and pref.notify_parent:
-            parent_name = pref.parent_name or 'Parent/Guardian'
-            # WhatsApp to parent
-            if pref.parent_phone:
-                send_parent_attendance_whatsapp(
-                    phone=pref.parent_phone,
-                    parent_name=parent_name,
-                    student_name=current_user.full_name,
-                    course_code=course.code,
-                    course_title=course.title,
-                    timestamp_str=timestamp_str
-                )
-            # Email to parent
-            if pref.parent_email:
-                send_parent_attendance_email(
-                    app_instance=app,
-                    mail_func=send_email,
-                    pref=pref,
-                    student_name=current_user.full_name,
-                    course_code=course.code,
-                    course_title=course.title,
-                    timestamp_str=timestamp_str
-                )
-
-        # ── Early-warning check (alerts student + parent if below threshold) ──
-        process_early_warning(
-            student=current_user,
-            course=course,
-            app_instance=app,
-            mail_func=send_email,
-            Attendance_model=Attendance,
-            ClassSession_model=ClassSession,
-            db_session=db.session
-        )
+        except Exception as e:
+            print(f"⚠️ Could not queue post-scan notifications: {e}")
 
         return jsonify({"status": "success", "message": "Attendance marked successfully! ✅"})
 
@@ -2458,6 +2581,44 @@ with app.app_context():
     except Exception as e:
         db.session.rollback()
         print(f"[MIGRATION] Session backfill failed (will retry next boot): {e}")
+
+    # ── Load-capacity indexes (idempotent) ──
+    # db.create_all() adds these on fresh databases via the model's
+    # __table_args__, but never touches existing tables — so create them
+    # here for databases that predate the indexes. The unique index is the
+    # race-proof duplicate-scan guard; the others serve the live attendee
+    # feed and the per-student early-warning counts.
+    with db.engine.connect() as conn:
+        try:
+            # The old check-then-insert flow could let two simultaneous
+            # requests both insert; remove any such duplicates (keeping the
+            # earliest scan) so the unique index can be created.
+            result = conn.execute(db.text(
+                "DELETE FROM attendance WHERE session_id IS NOT NULL AND id NOT IN ("
+                " SELECT MIN(id) FROM attendance WHERE session_id IS NOT NULL"
+                " GROUP BY student_id, session_id)"
+            ))
+            conn.commit()
+            if result.rowcount:
+                print(f"[MIGRATION] Removed {result.rowcount} duplicate attendance rows")
+        except Exception as e:
+            conn.rollback()
+            print(f"[MIGRATION] Duplicate-attendance cleanup failed: {e}")
+
+        for _index_sql in (
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_attendance_student_session"
+            " ON attendance (student_id, session_id)",
+            "CREATE INDEX IF NOT EXISTS ix_attendance_session_id"
+            " ON attendance (session_id)",
+            "CREATE INDEX IF NOT EXISTS ix_attendance_course_student"
+            " ON attendance (course_id, student_id)",
+        ):
+            try:
+                conn.execute(db.text(_index_sql))
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                print(f"[MIGRATION] Index creation failed (will retry next boot): {e}")
 
     db.engine.dispose()  # Forces Gunicorn workers to create fresh connections
     print("[OK] Database initialized successfully!")
