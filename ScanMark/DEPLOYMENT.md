@@ -23,6 +23,8 @@ logging in and scanning within a couple of minutes.
 | `GUNICORN_TIMEOUT` | 60 | Above the 30s platform router timeout on purpose. |
 | `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` | 5 / 5 | **Per worker.** Postgres sees up to `workers × (pool + overflow)` connections — 40 with defaults. Keep below your plan's connection cap, or put PgBouncer in front when scaling out. |
 | `SCAN_CONFIRMATION_EMAILS` | true | Set `false` during huge events to stop sending one email per scan. |
+| `GEOFENCE_RADIUS_M` | 100 | Max metres between the pinned class location and a scanning student. Phone GPS inside buildings is often 20–50m off — don't set this too tight. |
+| `SSO_JWT_SECRET` | — | Shared secret for CampOS SSO. **No fallback**: SSO token verification is disabled until this is set (must match CampOS Core). |
 | `REMEMBER_COOKIE_DAYS` | 30 | How long "remember me" keeps students signed in. Longer = fewer morning login stampedes. |
 | `STATIC_MAX_AGE` | 86400 | Cache-Control max-age (seconds) WhiteNoise puts on /static files. |
 | `SENTRY_DSN` | — | Optional error monitoring. |
