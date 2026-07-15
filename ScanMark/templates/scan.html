@@ -446,6 +446,27 @@
     let currentZoom = 1;
     let torchEnabled = false;
 
+    // Exponential backoff for transient server errors (busy/timeout). Starts
+    // at 2s and doubles up to 15s so 2000 phones retrying don't hammer the
+    // server in lock-step; resets whenever the server answers properly.
+    const RETRY_BASE_MS = 2000;
+    const RETRY_MAX_MS = 15000;
+    let retryDelayMs = RETRY_BASE_MS;
+
+    function nextRetryDelay() {
+        const delay = retryDelayMs + Math.floor(Math.random() * 1000); // jitter
+        retryDelayMs = Math.min(retryDelayMs * 2, RETRY_MAX_MS);
+        return delay;
+    }
+
+    function resumeScanning(delayMs) {
+        setTimeout(() => {
+            scanFrame.classList.remove('success');
+            scanningActive = true;
+            scanQRCode();
+        }, delayMs);
+    }
+
     // Elements
     const scannerContainer = document.getElementById('scanner-container');
     const video = document.getElementById('camera-feed');
@@ -661,37 +682,50 @@
                 .then(response => {
                     const contentType = response.headers.get('content-type');
                     if (!contentType || !contentType.includes('application/json')) {
-                        stopScanner();
-                        showResult("❌ Session expired. Please log in again.", false);
-                        setTimeout(() => window.location.href = "/login", 2000);
+                        // Only a real auth failure means the session expired.
+                        // Any other non-JSON reply (502/503 from the router,
+                        // a gateway timeout page) is the server being busy —
+                        // redirecting everyone to /login would turn one
+                        // hiccup into a login stampede.
+                        if (response.status === 401 || response.status === 403 ||
+                            (response.redirected && response.url.includes('/login'))) {
+                            stopScanner();
+                            showResult("❌ Session expired. Please log in again.", false);
+                            setTimeout(() => window.location.href = "/login", 2000);
+                            return null;
+                        }
+                        const delay = nextRetryDelay();
+                        showScannerStatus(`⏳ Server busy — retrying in ${Math.round(delay / 1000)}s…`, 'error');
+                        resumeScanning(delay);
                         return null;
                     }
-                    return response.json();
+                    return response.json().then(data => ({ data, httpStatus: response.status }));
                 })
-                .then(data => {
-                    if (!data) return;
+                .then(result => {
+                    if (!result) return;
+                    const { data, httpStatus } = result;
+                    retryDelayMs = RETRY_BASE_MS; // server answered — reset backoff
 
                     if (data.status === 'success') {
                         stopScanner();
                         showResult("✅ " + data.message, true);
-                        setTimeout(() => location.reload(), 1500);
+                    } else if (data.message && data.message.includes('already marked')) {
+                        stopScanner();
+                        showResult("✅ " + data.message, true);
+                    } else if (httpStatus === 429) {
+                        // Rate-limited: wait out the window instead of hammering.
+                        showScannerStatus("⏳ " + data.message, 'error');
+                        resumeScanning(6000);
                     } else {
                         showScannerStatus("❌ " + data.message, 'error');
-                        setTimeout(() => {
-                            scanFrame.classList.remove('success');
-                            scanningActive = true;
-                            scanQRCode();
-                        }, 2000);
+                        resumeScanning(2000);
                     }
                 })
                 .catch(error => {
                     console.error("Fetch error:", error);
-                    showScannerStatus("❌ Network error", 'error');
-                    setTimeout(() => {
-                        scanFrame.classList.remove('success');
-                        scanningActive = true;
-                        scanQRCode();
-                    }, 2000);
+                    const delay = nextRetryDelay();
+                    showScannerStatus(`❌ Network error — retrying in ${Math.round(delay / 1000)}s…`, 'error');
+                    resumeScanning(delay);
                 });
 
         }, () => {

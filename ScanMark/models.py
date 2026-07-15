@@ -83,6 +83,19 @@ class Attendance(db.Model):
     timestamp = db.Column(db.DateTime, default=datetime.utcnow)
     device_id = db.Column(db.String(200), nullable=True)
 
+    __table_args__ = (
+        # One scan per student per class session, enforced by the database so
+        # concurrent duplicate requests can't both slip past the app-level
+        # check. Legacy rows with session_id NULL never collide (SQL NULLs
+        # are distinct for unique-index purposes on SQLite and Postgres).
+        db.Index('uq_attendance_student_session', 'student_id', 'session_id',
+                 unique=True),
+        # The live attendee feed filters on session_id; the duplicate check
+        # and early-warning counts filter on (course_id, student_id).
+        db.Index('ix_attendance_session_id', 'session_id'),
+        db.Index('ix_attendance_course_student', 'course_id', 'student_id'),
+    )
+
 
 class NotificationPreference(db.Model):
     """Per-user notification settings for alerts and reports."""
