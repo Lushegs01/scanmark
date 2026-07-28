@@ -234,6 +234,13 @@ def test_role_mapping_requires_an_explicit_supported_role_and_lecturer_wins():
     assert map_campos_role(["student"]) == "student"
     assert map_campos_role(["student", "lecturer"]) == "lecturer"
     assert map_campos_role([" Lecturer "]) == "lecturer"
+    assert map_campos_role(["institution_admin"], "admin") == "dap"
+    assert map_campos_role(["institution_owner"], "admin") == "dap"
+    assert map_campos_role(["super_admin"], "admin") == "dap"
+    assert (
+        map_campos_role(["student", "institution_admin"], "student")
+        == "student"
+    )
 
 
 @pytest.mark.parametrize(
@@ -242,7 +249,6 @@ def test_role_mapping_requires_an_explicit_supported_role_and_lecturer_wins():
         None,
         "student",
         [],
-        ["institution_admin"],
         ["faculty_admin"],
         ["course coordinator"],
         ["student", 42],
@@ -251,6 +257,11 @@ def test_role_mapping_requires_an_explicit_supported_role_and_lecturer_wins():
 def test_role_mapping_rejects_unsupported_or_missing_roles(roles):
     with pytest.raises(CamposIntegrationError, match="role is not allowed"):
         map_campos_role(roles)
+
+
+def test_role_mapping_rejects_a_student_requesting_the_admin_surface():
+    with pytest.raises(CamposIntegrationError, match="role is not allowed"):
+        map_campos_role(["student"], "admin")
 
 
 def test_sso_response_is_always_non_cacheable_and_sends_no_referrer():

@@ -7,6 +7,12 @@ browser with an opaque one-time `code`; ScanMark exchanges it server-to-server
 at `POST /api/modules/sso/exchange`, validates the returned HS256 JWT for
 issuer `campos-core` and audience `scanmark`, then creates or refreshes the
 local Flask login session. The signed JWT is never placed in browser history.
+Its signed `launchContext` selects the intended surface for multi-role users:
+students reach the student dashboard, lecturers reach the lecturer dashboard,
+and an institution owner/admin (or a time-limited CampOS support operator)
+reaches ScanMark's institution-wide DAP dashboard. Faculty and department
+administrator roles are not guessed into Dean/HOD privileges; those require a
+future signed resource-scope contract.
 
 Configure these variables in the ScanMark deployment:
 

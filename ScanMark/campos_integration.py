@@ -318,8 +318,13 @@ def report_attendance_event(
     raise CamposIntegrationError(last_error)
 
 
-def map_campos_role(roles: Any) -> str:
-    """Map an explicitly supported CampOS role, rejecting every other role."""
+def map_campos_role(roles: Any, launch_context: Any = None) -> str:
+    """Map a signed CampOS workspace launch to the least privileged local role.
+
+    ScanMark's existing institution-wide administrative surface is the DAP
+    dashboard. Faculty/department roles are deliberately not guessed here:
+    those require a signed resource scope before they may become dean or HOD.
+    """
     if (
         not isinstance(roles, (list, tuple))
         or not all(isinstance(role, str) for role in roles)
@@ -330,6 +335,36 @@ def map_campos_role(roles: Any) -> str:
         for role in roles
         if role.strip()
     }
+    context = (
+        launch_context.lower().strip()
+        if isinstance(launch_context, str)
+        else None
+    )
+    if context not in {None, "student", "lecturer", "admin"}:
+        raise CamposIntegrationError("CampOS launch context is invalid")
+
+    institution_admin_roles = {
+        "institution_owner",
+        "institution_admin",
+        "super_admin",
+    }
+    if context == "admin":
+        if normalized.intersection(institution_admin_roles):
+            return "dap"
+        raise CamposIntegrationError("CampOS role is not allowed by ScanMark")
+    if context == "lecturer":
+        if "lecturer" in normalized:
+            return "lecturer"
+        raise CamposIntegrationError("CampOS role is not allowed by ScanMark")
+    if context == "student":
+        if "student" in normalized:
+            return "student"
+        raise CamposIntegrationError("CampOS role is not allowed by ScanMark")
+
+    # Receiver-first deployment compatibility for tokens issued by the
+    # preceding Core version, which did not yet sign a launch context.
+    if normalized.intersection(institution_admin_roles):
+        return "dap"
     if "lecturer" in normalized:
         return "lecturer"
     if "student" in normalized:
