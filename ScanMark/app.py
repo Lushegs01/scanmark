@@ -1046,7 +1046,10 @@ def campos_sso_callback():
     try:
         token = exchange_campos_sso_code(code)
         claims = verify_campos_sso_token(token)
-        role = map_campos_role(claims.get('roles'))
+        role = map_campos_role(
+            claims.get('roles'),
+            claims.get('launchContext'),
+        )
     except CamposIntegrationError as e:
         app.logger.warning('CampOS SSO rejected: %s', e)
         flash('Sign-in failed: the link is invalid or has expired.', 'error')
@@ -1132,8 +1135,10 @@ def campos_sso_callback():
         if level and user.level != level:
             user.level = level
             changed = True
-        # CampOS is authoritative for ordinary student/lecturer access. Local
-        # HOD/dean/DAP assignments remain explicitly managed in ScanMark.
+        # CampOS is authoritative for roles on an account already bound to the
+        # same stable CampOS subject. It can promote an ordinary account into
+        # the institution-wide DAP surface, but it never silently replaces a
+        # separately managed HOD/dean/DAP account that has no CampOS binding.
         if (user.role or '').lower() in ('student', 'lecturer') and user.role != role:
             user.role = role
             changed = True
