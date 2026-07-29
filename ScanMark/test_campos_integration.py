@@ -11,6 +11,7 @@ from campos_integration import (
     exchange_campos_sso_code,
     get_campos_core_url,
     get_sso_secret,
+    map_campos_launch_identity,
     map_campos_role,
     protect_sso_response,
     report_attendance_event,
@@ -262,6 +263,144 @@ def test_role_mapping_rejects_unsupported_or_missing_roles(roles):
 def test_role_mapping_rejects_a_student_requesting_the_admin_surface():
     with pytest.raises(CamposIntegrationError, match="role is not allowed"):
         map_campos_role(["student"], "admin")
+
+
+def launch_claims(role, scope_type, scope_id="scope-1", display_name=None, **extra):
+    claims = {
+        "roles": ["institution_admin", "lecturer"],
+        "launchContext": extra.pop("context", "admin"),
+        "launchRole": role,
+        "launchScope": {
+            "scopeType": scope_type,
+            "scopeId": scope_id,
+            "displayName": display_name,
+        },
+    }
+    claims.update(extra)
+    return claims
+
+
+def test_the_signed_scope_separates_the_dap_from_a_dean_and_an_hod():
+    # Identical CampOS roles and an identical role list. Only the scope differs,
+    # and it is what decides the surface.
+    assert map_campos_launch_identity(
+        launch_claims("institution_admin", "INSTITUTION", display_name="Demo University")
+    ) == ("dap", None, None, True)
+
+    assert map_campos_launch_identity(
+        launch_claims("institution_admin", "FACULTY", display_name="Faculty of Science")
+    ) == ("dean", "Faculty of Science", None, True)
+
+    assert map_campos_launch_identity(
+        launch_claims("institution_admin", "DEPARTMENT", display_name="Computer Science")
+    ) == ("hod", None, "Computer Science", True)
+
+
+def test_a_faculty_admin_reaches_the_dean_surface_through_its_faculty_scope():
+    assert map_campos_launch_identity(
+        launch_claims("faculty_admin", "FACULTY", display_name="Faculty of Science")
+    ) == ("dean", "Faculty of Science", None, True)
+
+
+def test_a_faculty_post_granted_institution_wide_is_not_promoted_to_the_dap():
+    with pytest.raises(CamposIntegrationError, match="role is not allowed"):
+        map_campos_launch_identity(launch_claims("faculty_admin", "INSTITUTION"))
+
+
+def test_the_full_role_list_never_widens_the_chosen_identity():
+    # The launch carries super_admin in `roles`, but the user chose to open
+    # ScanMark as a head of department. Reading `roles` would land the DAP.
+    claims = launch_claims(
+        "institution_admin",
+        "DEPARTMENT",
+        display_name="Computer Science",
+    )
+    claims["roles"] = ["super_admin", "institution_owner", "institution_admin"]
+
+    assert map_campos_launch_identity(claims).role == "hod"
+
+
+def test_a_lecturer_keeps_the_department_the_launch_named():
+    identity = map_campos_launch_identity(
+        launch_claims(
+            "lecturer",
+            "DEPARTMENT",
+            display_name="Computer Science",
+            context="lecturer",
+        )
+    )
+    assert identity == ("lecturer", None, "Computer Science", True)
+
+
+def test_a_student_launch_carries_no_hierarchy_placement():
+    identity = map_campos_launch_identity(
+        launch_claims("student", "INSTITUTION", context="student")
+    )
+    assert identity == ("student", None, None, True)
+
+
+def test_a_scope_name_is_truncated_to_the_local_column_width():
+    identity = map_campos_launch_identity(
+        launch_claims("faculty_admin", "FACULTY", display_name="F" * 120)
+    )
+    assert identity.faculty == "F" * 50
+
+
+def test_an_administrative_scope_scanmark_cannot_filter_on_is_refused():
+    for scope_type in ("PROGRAM", "COURSE", "SELF"):
+        with pytest.raises(CamposIntegrationError, match="role is not allowed"):
+            map_campos_launch_identity(
+                launch_claims("institution_admin", scope_type, display_name="Anything")
+            )
+
+
+def test_a_dean_or_hod_scope_the_source_could_not_name_is_refused():
+    # The dashboards filter on the name, so an unnamed scope would silently
+    # present an empty faculty rather than fail.
+    for scope_type in ("FACULTY", "DEPARTMENT"):
+        with pytest.raises(CamposIntegrationError, match="scope is unnamed"):
+            map_campos_launch_identity(
+                launch_claims("institution_admin", scope_type, display_name=None)
+            )
+
+
+def test_a_launch_context_that_contradicts_the_chosen_role_is_refused():
+    with pytest.raises(CamposIntegrationError, match="launch context is invalid"):
+        map_campos_launch_identity(
+            launch_claims("institution_admin", "FACULTY", display_name="F", context="student")
+        )
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        None,
+        "INSTITUTION",
+        {"scopeType": "GALAXY", "scopeId": "s-1", "displayName": None},
+        {"scopeType": "FACULTY", "scopeId": "", "displayName": None},
+        {"scopeType": "FACULTY", "displayName": None},
+        {"scopeType": "FACULTY", "scopeId": "s-1", "displayName": 7},
+    ],
+)
+def test_a_malformed_launch_scope_is_refused(scope):
+    claims = {
+        "roles": ["institution_admin"],
+        "launchContext": "admin",
+        "launchRole": "institution_admin",
+        "launchScope": scope,
+    }
+    with pytest.raises(CamposIntegrationError, match="launch scope is invalid"):
+        map_campos_launch_identity(claims)
+
+
+def test_a_token_from_a_campos_that_predates_the_picker_still_signs_in():
+    identity = map_campos_launch_identity(
+        {"roles": ["institution_admin"], "launchContext": "admin"}
+    )
+    assert identity == ("dap", None, None, False)
+
+    legacy_student = map_campos_launch_identity({"roles": ["student", "lecturer"]})
+    assert legacy_student == ("lecturer", None, None, False)
 
 
 def test_sso_response_is_always_non_cacheable_and_sends_no_referrer():

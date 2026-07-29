@@ -15,7 +15,7 @@ import json
 import os
 import re
 import time
-from typing import Any, Mapping
+from typing import Any, Mapping, NamedTuple
 from urllib.parse import unquote, urlsplit
 
 import requests
@@ -27,6 +27,21 @@ SSO_MAX_TOKEN_LIFETIME_SECONDS = 120
 SSO_CLOCK_SKEW_SECONDS = 5
 
 _SSO_CODE_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
+
+# CampOS roles that carry institution-wide authority. A narrower post — a dean
+# or an HOD — reaches ScanMark through the scope its grant is bound to, never
+# through the role name alone.
+CAMPOS_INSTITUTION_ADMIN_ROLES = frozenset(
+    {"institution_owner", "institution_admin", "super_admin"}
+)
+CAMPOS_ADMIN_ROLES = CAMPOS_INSTITUTION_ADMIN_ROLES | frozenset({"faculty_admin"})
+CAMPOS_SCOPE_TYPES = frozenset(
+    {"INSTITUTION", "FACULTY", "DEPARTMENT", "PROGRAM", "COURSE", "SELF"}
+)
+CAMPOS_LAUNCH_CONTEXTS = frozenset({"student", "lecturer", "admin"})
+
+# User.faculty and User.department are String(50).
+SCOPE_NAME_MAX_LENGTH = 50
 
 
 class CamposIntegrationError(ValueError):
@@ -316,6 +331,136 @@ def report_attendance_event(
             sleep(0.5 * (2 ** attempt))
 
     raise CamposIntegrationError(last_error)
+
+
+class CamposLaunchIdentity(NamedTuple):
+    """The ScanMark placement a signed CampOS launch resolves to."""
+
+    role: str
+    faculty: str | None
+    department: str | None
+    #: True when CampOS signed an explicit identity rather than a bare role list.
+    scoped: bool
+
+
+def _normalized_launch_context(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise CamposIntegrationError("CampOS launch context is invalid")
+    context = value.strip().lower()
+    if context not in CAMPOS_LAUNCH_CONTEXTS:
+        raise CamposIntegrationError("CampOS launch context is invalid")
+    return context
+
+
+def _parse_launch_scope(value: Any) -> tuple[str, str | None]:
+    """Validate the signed scope and return its type and display name."""
+    if not isinstance(value, Mapping):
+        raise CamposIntegrationError("CampOS launch scope is invalid")
+
+    scope_type = value.get("scopeType")
+    if not isinstance(scope_type, str):
+        raise CamposIntegrationError("CampOS launch scope is invalid")
+    scope_type = scope_type.strip().upper()
+    if scope_type not in CAMPOS_SCOPE_TYPES:
+        raise CamposIntegrationError("CampOS launch scope is invalid")
+
+    scope_id = value.get("scopeId")
+    if (
+        not isinstance(scope_id, str)
+        or not scope_id.strip()
+        or len(scope_id) > 200
+    ):
+        raise CamposIntegrationError("CampOS launch scope is invalid")
+
+    display_name = value.get("displayName")
+    if display_name is not None and (
+        not isinstance(display_name, str) or len(display_name) > 200
+    ):
+        raise CamposIntegrationError("CampOS launch scope is invalid")
+
+    name = (display_name or "").strip()[:SCOPE_NAME_MAX_LENGTH] or None
+    return scope_type, name
+
+
+def map_campos_launch_identity(claims: Any) -> CamposLaunchIdentity:
+    """Resolve which ScanMark surface a signed CampOS launch opens.
+
+    CampOS asks the user which of their identities they are opening ScanMark
+    with, then signs that single choice as `launchRole` and `launchScope`. The
+    scope is what separates a dean from an HOD from the DAP — three people whose
+    CampOS role names may be identical and who differ only in what slice of the
+    institution their grant covers.
+
+    Reading the flat `roles` list instead would land the most privileged surface
+    every time, which is exactly the behaviour the picker exists to remove. A
+    token minted by a CampOS that predates the picker carries neither claim and
+    falls back to the previous mapping.
+    """
+    if not isinstance(claims, Mapping):
+        raise CamposIntegrationError("CampOS role is not allowed by ScanMark")
+
+    launch_role = claims.get("launchRole")
+    launch_scope = claims.get("launchScope")
+    context = _normalized_launch_context(claims.get("launchContext"))
+
+    if launch_role is None and launch_scope is None:
+        return CamposLaunchIdentity(
+            role=map_campos_role(claims.get("roles"), context),
+            faculty=None,
+            department=None,
+            scoped=False,
+        )
+
+    if not isinstance(launch_role, str) or not launch_role.strip():
+        raise CamposIntegrationError("CampOS role is not allowed by ScanMark")
+    role = launch_role.strip().lower()
+    scope_type, scope_name = _parse_launch_scope(launch_scope)
+
+    def require_context(expected: str) -> None:
+        if context is not None and context != expected:
+            raise CamposIntegrationError("CampOS launch context is invalid")
+
+    if role in CAMPOS_ADMIN_ROLES:
+        require_context("admin")
+
+        if scope_type == "INSTITUTION":
+            # A faculty-level post granted institution-wide is contradictory
+            # data, not a promotion to the institution-wide surface.
+            if role not in CAMPOS_INSTITUTION_ADMIN_ROLES:
+                raise CamposIntegrationError("CampOS role is not allowed by ScanMark")
+            return CamposLaunchIdentity("dap", None, None, True)
+
+        # A dean's and an HOD's dashboards are filtered by the name of what they
+        # preside over, so a scope CampOS could not name reaches no records.
+        if scope_type == "FACULTY":
+            if not scope_name:
+                raise CamposIntegrationError("CampOS launch scope is unnamed")
+            return CamposLaunchIdentity("dean", scope_name, None, True)
+
+        if scope_type == "DEPARTMENT":
+            if not scope_name:
+                raise CamposIntegrationError("CampOS launch scope is unnamed")
+            return CamposLaunchIdentity("hod", None, scope_name, True)
+
+        # ScanMark has no administrative surface below a department.
+        raise CamposIntegrationError("CampOS role is not allowed by ScanMark")
+
+    if role == "lecturer":
+        require_context("lecturer")
+        return CamposLaunchIdentity(
+            "lecturer",
+            scope_name if scope_type == "FACULTY" else None,
+            scope_name if scope_type == "DEPARTMENT" else None,
+            True,
+        )
+
+    if role == "student":
+        require_context("student")
+        return CamposLaunchIdentity("student", None, None, True)
+
+    raise CamposIntegrationError("CampOS role is not allowed by ScanMark")
 
 
 def map_campos_role(roles: Any, launch_context: Any = None) -> str:

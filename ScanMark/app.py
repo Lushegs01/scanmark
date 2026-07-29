@@ -34,7 +34,7 @@ from campos_integration import (
     CamposIntegrationError,
     exchange_campos_sso_code,
     is_production_environment,
-    map_campos_role,
+    map_campos_launch_identity,
     protect_sso_response,
     report_attendance_event,
     rotate_flask_session,
@@ -1046,10 +1046,8 @@ def campos_sso_callback():
     try:
         token = exchange_campos_sso_code(code)
         claims = verify_campos_sso_token(token)
-        role = map_campos_role(
-            claims.get('roles'),
-            claims.get('launchContext'),
-        )
+        identity = map_campos_launch_identity(claims)
+        role = identity.role
     except CamposIntegrationError as e:
         app.logger.warning('CampOS SSO rejected: %s', e)
         flash('Sign-in failed: the link is invalid or has expired.', 'error')
@@ -1110,6 +1108,12 @@ def campos_sso_callback():
             user.matric_no = matric_no
         if level:
             user.level = level
+        # A dean's and an HOD's dashboards filter on these, so the signed scope
+        # is what places them in the hierarchy.
+        if identity.faculty:
+            user.faculty = identity.faculty
+        if identity.department:
+            user.department = identity.department
         db.session.add(user)
         db.session.commit()
         print(f'🟢 Created ScanMark user via CampOS SSO: {email}')
@@ -1135,13 +1139,26 @@ def campos_sso_callback():
         if level and user.level != level:
             user.level = level
             changed = True
-        # CampOS is authoritative for roles on an account already bound to the
-        # same stable CampOS subject. It can promote an ordinary account into
-        # the institution-wide DAP surface, but it never silently replaces a
-        # separately managed HOD/dean/DAP account that has no CampOS binding.
-        if (user.role or '').lower() in ('student', 'lecturer') and user.role != role:
-            user.role = role
-            changed = True
+        # CampOS is authoritative for placement on an account bound to the same
+        # stable CampOS subject; validate_account_binding already refused an
+        # unlinked privileged local account above. A signed launch identity
+        # therefore switches the surface — without that, choosing a different
+        # hierarchy would only ever work on a user's very first sign-in.
+        # A legacy token names no identity, so it keeps the narrower rule of
+        # only ever promoting an ordinary account.
+        if identity.scoped or (user.role or '').lower() in ('student', 'lecturer'):
+            if user.role != role:
+                user.role = role
+                changed = True
+        # Placement follows the signed scope. A legacy token carries none, so it
+        # must not erase what the local record already holds.
+        if identity.scoped:
+            if user.faculty != identity.faculty:
+                user.faculty = identity.faculty
+                changed = True
+            if user.department != identity.department:
+                user.department = identity.department
+                changed = True
         if changed:
             db.session.commit()
 
