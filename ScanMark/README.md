@@ -33,6 +33,11 @@ public ScanMark origin. It appends `/sso/callback` automatically. Keep Redis
 enabled in both production deployments: CampOS stores single-use SSO codes in
 Redis, while ScanMark uses Redis for server-side sessions and live QR state.
 
+`HEAD /healthz` is a process-only probe that performs no database or session
+work. CampOS calls it without credentials while the admin shell is loading so
+a possible Render cold start can complete before the signed SSO callback
+arrives.
+
 After a successful scan, ScanMark asynchronously sends the student identity,
 course, class-session details, timestamp, and a stable external attendance ID
 to CampOS. Transient network, rate-limit, and server failures are retried with
