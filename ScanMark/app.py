@@ -981,6 +981,12 @@ def home():
     return redirect(url_for('login'))
 
 
+@app.route('/healthz', methods=['GET', 'HEAD'])
+def healthz():
+    """Process-only probe used to overlap a cold start with CampOS SSO."""
+    return '', 204
+
+
 @app.route('/login/google')
 def login_google():
     redirect_uri = url_for('authorize_google', _external=True)
