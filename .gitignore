@@ -209,3 +209,10 @@ __marimo__/
 # WhiteNoise boot-time compression artifacts
 ScanMark/static/*.gz
 ScanMark/static/*.br
+
+# ScanMark runtime artefacts
+*.db
+*.dump
+ScanMark/gunicorn.ctl
+ScanMark/static/*.gz
+ScanMark/static/*.br

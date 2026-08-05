@@ -1,5 +1,6 @@
 import os
 import io
+import json
 import hmac
 import hashlib
 import secrets
@@ -13,9 +14,12 @@ load_dotenv()
 from authlib.integrations.flask_client import OAuth
 from flask import (Flask, render_template, redirect, url_for,
                    flash, request, send_file, jsonify, Response, session)
+from markupsafe import escape
 from flask_login import LoginManager, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
-from sqlalchemy import func, inspect
+from sqlalchemy import event, func, inspect
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import joinedload, selectinload
 import redis
 from flask_session import Session
 from itsdangerous import URLSafeTimedSerializer
@@ -29,7 +33,8 @@ from whitenoise import WhiteNoise
 import sentry_sdk
 from sentry_sdk.integrations.flask import FlaskIntegration
 
-from models import db, User, Course, Attendance, ClassSession, NotificationPreference, WeeklyReport
+from models import (db, enrollments, User, Course, Attendance, ClassSession,
+                    NotificationPreference, WeeklyReport)
 from campos_integration import (
     CamposIntegrationError,
     exchange_campos_sso_code,
@@ -44,8 +49,6 @@ from campos_integration import (
 )
 from notifications import (
     send_attendance_whatsapp,
-    send_warning_whatsapp,
-    check_attendance_threshold,
     process_early_warning,
     generate_student_weekly_pdf,
     generate_lecturer_weekly_pdf,
@@ -137,6 +140,55 @@ app.wsgi_app = WhiteNoise(
 # mobile connections; compressible responses shrink ~70-85%.
 Compress(app)
 
+
+# ============================================================
+# SECURITY HEADERS
+# ============================================================
+
+# Inline <script>/<style> blocks are used throughout the templates, and the
+# dashboards pull Chart.js from a CDN, so the policy has to permit both. It
+# still shuts the door on plugins, framing and form posts to other origins.
+CONTENT_SECURITY_POLICY = (
+    "default-src 'self'; "
+    "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; "
+    "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com "
+    "https://fonts.googleapis.com; "
+    "font-src 'self' data: https://fonts.gstatic.com https://cdnjs.cloudflare.com; "
+    "img-src 'self' data: blob:; "
+    "connect-src 'self'; "
+    "object-src 'none'; "
+    "base-uri 'self'; "
+    "form-action 'self'; "
+    "frame-ancestors 'none'"
+)
+
+HSTS_MAX_AGE = int(os.environ.get('HSTS_MAX_AGE', 31536000))   # one year
+
+
+@app.after_request
+def set_security_headers(response):
+    """
+    Baseline hardening on every response. The platform terminates TLS but does
+    not add any of these, so without them the app shipped with no HSTS, no
+    clickjacking defence and no MIME-sniffing protection.
+    """
+    response.headers.setdefault('X-Content-Type-Options', 'nosniff')
+    response.headers.setdefault('X-Frame-Options', 'DENY')
+    response.headers.setdefault('Referrer-Policy', 'strict-origin-when-cross-origin')
+    response.headers.setdefault('Content-Security-Policy', CONTENT_SECURITY_POLICY)
+    response.headers.setdefault(
+        'Permissions-Policy',
+        # The scan page legitimately needs the camera and GPS; nothing else does.
+        'camera=(self), geolocation=(self), microphone=(), payment=()'
+    )
+    if is_production_environment():
+        response.headers.setdefault(
+            'Strict-Transport-Security',
+            f'max-age={HSTS_MAX_AGE}; includeSubDomains'
+        )
+    return response
+
+
 def user_based_rate_limit_key():
     """
     If the user is logged in, use their unique database ID.
@@ -144,7 +196,7 @@ def user_based_rate_limit_key():
     """
     if current_user.is_authenticated:
         return f"user_{current_user.id}"
-    return request.remote_addr
+    return get_remote_address()
 
 # ============================================================
 # REDIS SESSION CONFIGURATION
@@ -173,11 +225,30 @@ else:
 # unset value so local development still uses the documented in-memory store
 # instead of passing an invalid empty storage URI to Flask-Limiter.
 limiter_storage = os.environ.get('REDIS_URL') or 'memory://'
+
+# Anonymous requests are keyed by IP, and a whole campus sits behind a handful
+# of NAT addresses — so at 5000 students the default per-user allowance is the
+# wrong shape for them. One bucket per (IP, endpoint) shared by 5000 phones
+# opening /login before a 9am lecture would 429 the login page itself. The
+# endpoints where a per-IP cap actually protects something (login POST, signup,
+# password reset, verification resend) each carry their own tight limit, which
+# applies on top of this, so the shared default can afford to be generous.
+ANON_DEFAULT_PER_MINUTE = int(os.environ.get('ANON_RATE_LIMIT_PER_MINUTE', 20000))
+ANON_DEFAULT_PER_DAY = int(os.environ.get('ANON_RATE_LIMIT_PER_DAY', 500000))
+
+
+def _default_rate_limits():
+    """Per-user when we know who it is; per-shared-NAT when we don't."""
+    if current_user.is_authenticated:
+        return "5000 per day;1000 per minute"
+    return f"{ANON_DEFAULT_PER_DAY} per day;{ANON_DEFAULT_PER_MINUTE} per minute"
+
+
 limiter = Limiter(
     app=app,
     key_func=user_based_rate_limit_key,
     storage_uri=limiter_storage,
-    default_limits=["5000 per day", "1000 per minute"] # Give them some breathing room!
+    default_limits=[_default_rate_limits],
 )
 print(f"🛡️ Rate Limiter Active (Storage: {limiter_storage.split(':')[0]})")
 
@@ -201,7 +272,48 @@ mail = Mail(app)
 # 🚨 THE FIX: Create a bounded pool of workers to handle all emails safely.
 # 10 workers: this pool also runs the post-scan notification tasks, and a
 # full class marking attendance queues one task per student.
-email_executor = ThreadPoolExecutor(max_workers=10)
+#
+# The QUEUE is bounded too. ThreadPoolExecutor's own queue is unbounded, so a
+# 2000-student burst could pile up thousands of pending tasks — each one
+# holding a database connection when it eventually runs, competing with the
+# request threads for the same small pool, and all of it lost anyway if the
+# dyno restarts. Past the cap we drop the notification and keep the scan:
+# the attendance row is the record that matters, the confirmation email is a
+# courtesy.
+BACKGROUND_QUEUE_MAXSIZE = int(os.environ.get('BACKGROUND_QUEUE_MAXSIZE', 2000))
+
+
+class _BoundedExecutor:
+    """ThreadPoolExecutor that sheds work instead of queueing without limit."""
+
+    def __init__(self, max_workers, max_queued):
+        self._pool = ThreadPoolExecutor(max_workers=max_workers)
+        self._max_queued = max_queued
+        self._dropped = 0
+
+    def submit(self, fn, *args, **kwargs):
+        if self._pool._work_queue.qsize() >= self._max_queued:
+            self._dropped += 1
+            # Log the first drop and then every 100th, so a saturated queue is
+            # visible without the log itself becoming the bottleneck.
+            if self._dropped == 1 or self._dropped % 100 == 0:
+                app.logger.warning(
+                    'Background queue full (%s waiting); dropped %s task(s) so far. '
+                    'Consider SCAN_CONFIRMATION_EMAILS=false during large events.',
+                    self._max_queued, self._dropped
+                )
+            return None
+        return self._pool.submit(fn, *args, **kwargs)
+
+    @property
+    def dropped(self):
+        return self._dropped
+
+
+email_executor = _BoundedExecutor(
+    max_workers=int(os.environ.get('BACKGROUND_WORKERS', 10)),
+    max_queued=BACKGROUND_QUEUE_MAXSIZE,
+)
 
 # Escape hatch for very large events: one confirmation email per scan can
 # exceed the SMTP provider's quota (Gmail allows ~500-2000 sends/day), so
@@ -216,9 +328,10 @@ def send_async_email(app_instance, msg):
     with app_instance.app_context():
         try:
             mail.send(msg)
-            print(f"✅ Email sent successfully to {msg.recipients}")
+            # Recipients are student addresses — count them, don't print them.
+            app_instance.logger.info('Email sent to %d recipient(s)', len(msg.recipients))
         except Exception as e:
-            print(f"❌ Failed to send email: {str(e)}")
+            app_instance.logger.warning('Failed to send email: %s', e)
 
 
 def send_email(subject, recipients, text_body, html_body, sender=None):
@@ -609,51 +722,82 @@ app.config['REMEMBER_COOKIE_SECURE'] = os.environ.get('FLASK_ENV') == 'productio
 # FUNAAB EMAIL VALIDATION
 # ============================================================
 
-# Valid FUNAAB email domains
-FUNAAB_DOMAINS = [
-    'funaab.edu.ng',
-    'student.funaab.edu.ng',
-    'staff.funaab.edu.ng',
-    'gmail.com'
-]
+FUNAAB_DOMAIN = 'funaab.edu.ng'
+STAFF_DOMAIN = '@staff.' + FUNAAB_DOMAIN
+
+# Roles a stranger may hand themselves by filling in the public signup form.
+# The keys are the normalised form the form may submit; the values are the
+# canonical spelling stored on the User row. Privileged posts (hod, dean, dap)
+# are deliberately absent: they carry cross-course and institution-wide read
+# access, so they only ever arrive from a signed CampOS launch identity or a
+# deliberate change by someone who already holds the database.
+SELF_SERVICE_STAFF_ROLES = {
+    'lecturer': 'Lecturer',
+    'course coordinator': 'Course Coordinator',
+}
+
+# Minimum password length for accounts ScanMark itself authenticates.
+MIN_PASSWORD_LENGTH = int(os.environ.get('MIN_PASSWORD_LENGTH', 10))
+
+# Self-service accounts must confirm their address before the password works.
+# Defaults on in production and off elsewhere, so a local checkout without SMTP
+# still logs in. Never disable it in production: the signup form accepts any
+# address, including a @staff one the registrant does not own.
+REQUIRE_EMAIL_VERIFICATION = (
+    os.environ.get('REQUIRE_EMAIL_VERIFICATION', '').strip().lower()
+    or ('true' if is_production_environment() else 'false')
+) not in ('false', '0', 'no', 'off')
+
+
+def validate_password_strength(password):
+    """Return None when acceptable, else a message explaining what's missing."""
+    if not password or len(password) < MIN_PASSWORD_LENGTH:
+        return f"Password must be at least {MIN_PASSWORD_LENGTH} characters long."
+    if password.isdigit() or password.isalpha():
+        return "Password must mix letters and numbers."
+    return None
+
+
+@app.context_processor
+def inject_password_policy():
+    """So the signup/reset forms advertise the same rule the server enforces."""
+    return {'min_password_length': MIN_PASSWORD_LENGTH}
 
 
 def is_valid_funaab_email(email):
     """
-    Check if email is a valid FUNAAB email address OR a standard Gmail
+    Check if email is a valid FUNAAB email address OR a standard Gmail.
+
+    Returns (is_valid, message, default_role). The role here is only the
+    STARTING point for a self-service signup: a staff address defaults to
+    'lecturer' and may narrow to another self-service role, but no address
+    can ever mint a privileged role on its own — see SELF_SERVICE_STAFF_ROLES.
     """
     if not email:
         return False, "Email is required", None
-    
+
     # Basic email format validation
     email_regex = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
     if not re.match(email_regex, email):
         return False, "Invalid email format", None
-    
+
     email = email.lower().strip()
-    
-    is_valid = False
-    role = None
-    
-    # Check domains and assign roles
-    if email.endswith('@gmail.com'):
-        is_valid = True
-        role = 'student'
-    elif email.endswith('@staff.funaab.edu.ng'):
-        is_valid = True
-        role = 'lecturer'  # Default for staff
-    elif email.endswith('@funaab.edu.ng'):
-        is_valid = True
-        role = 'student'
-    # 🚨 THE NEW GMAIL RULE: Allowed, but strictly as a student
-    elif email.endswith('@gmail.com'):
-        is_valid = True
-        role = 'student'
-    
-    if is_valid:
-        return True, "Valid email", role
-    else:
-        return False, "Only FUNAAB (@funaab.edu.ng) or Gmail (@gmail.com) addresses are allowed.", None
+
+    domain = email.rsplit('@', 1)[-1]
+
+    if email.endswith(STAFF_DOMAIN):
+        return True, "Valid email", 'lecturer'
+    # The bare domain AND its subdomains — student.funaab.edu.ng is what most
+    # undergraduates actually hold. Matching on the parsed domain (not a bare
+    # endswith on the whole address) keeps a lookalike like
+    # "evilfunaab.edu.ng" out.
+    if domain == FUNAAB_DOMAIN or domain.endswith('.' + FUNAAB_DOMAIN):
+        return True, "Valid email", 'student'
+    # Gmail is allowed, but strictly as a student.
+    if domain == 'gmail.com':
+        return True, "Valid email", 'student'
+
+    return False, "Only FUNAAB (@funaab.edu.ng) or Gmail (@gmail.com) addresses are allowed.", None
 
 def extract_name_from_funaab_email(email):
     """
@@ -810,34 +954,8 @@ def verify_signed_qr(qr_text: str):
 # ------------------------------------------------------------------
 # FIX #11: Optimised analytics (single query, no N+1)
 # ------------------------------------------------------------------
-
-def get_course_analytics(course_id):
-    """Return attendance stats for a single course."""
-    course = Course.query.get(course_id)
-    if not course:
-        return None
-
-    total_students = _enrolled_count(course_id)
-    if total_students == 0:
-        return {"dates": [], "counts": [], "average": 0, "total_enrolled": 0}
-
-    attendance_trends = (
-        db.session.query(func.date(Attendance.timestamp), func.count(Attendance.id))
-        .filter_by(course_id=course_id)
-        .group_by(func.date(Attendance.timestamp))
-        .all()
-    )
-
-    dates = [str(row[0]) for row in attendance_trends]
-    counts = [row[1] for row in attendance_trends]
-    avg = (sum(counts) / len(counts) / total_students * 100) if counts else 0
-
-    return {
-        "dates": dates,
-        "counts": counts,
-        "average": round(avg, 1),
-        "total_enrolled": total_students,
-    }
+# (get_course_analytics() lived here and had no callers — /course/<id>/analytics
+# builds its per-session series inline. Removed rather than left to rot.)
 
 
 def get_department_analytics(dept_name):
@@ -904,10 +1022,7 @@ def redirect_by_role(role: str):
     }
     
     target = mapping.get(role, 'student_dashboard')
-    
-    # Log for debugging (remove in production)
-    print(f"🔀 Redirecting role '{role}' to '{target}'")
-    
+
     if target == 'student_dashboard' and role not in mapping:
         flash(f"Role '{role}' not recognized. Defaulting to student view.", "warning")
     
@@ -915,23 +1030,117 @@ def redirect_by_role(role: str):
 
 
 # ============================================================
+# EMAIL VERIFICATION
+# ============================================================
+
+EMAIL_VERIFY_MAX_AGE = 24 * 60 * 60   # link is good for a day
+
+
+def send_verification_email(user):
+    """Mail a signed, single-use confirmation link to a new self-service account."""
+    token = serializer.dumps(user.email, salt='email-verify-salt')
+    verify_url = url_for('verify_email', token=token, _external=True)
+    msg = Message(
+        "Confirm your ScanMark email",
+        recipients=[user.email],
+        sender=app.config['MAIL_DEFAULT_SENDER'],
+    )
+    msg.body = (
+        f"Hello {user.full_name},\n\n"
+        "Confirm your ScanMark account by opening the link below "
+        "(valid for 24 hours):\n\n"
+        f"{verify_url}\n\n"
+        "If you did not create a ScanMark account, ignore this email — "
+        "no account can be used until this link is opened.\n"
+    )
+    email_executor.submit(send_async_email, app, msg)
+
+
+@app.route('/verify_email/<token>')
+def verify_email(token):
+    try:
+        email = serializer.loads(token, salt='email-verify-salt',
+                                 max_age=EMAIL_VERIFY_MAX_AGE)
+    except Exception:
+        flash("That verification link is invalid or has expired. "
+              "Sign in to request a new one.", "error")
+        return redirect(url_for('login'))
+
+    user = User.query.filter_by(email=email).first()
+    if not user:
+        flash("That verification link is invalid or has expired.", "error")
+        return redirect(url_for('login'))
+
+    if user.email_verified is not True:
+        user.email_verified = True
+        db.session.commit()
+        app.logger.info('Email verified for user id=%s', user.id)
+
+    flash("Email confirmed! You can now sign in.", "success")
+    return redirect(url_for('login'))
+
+
+@app.route('/resend_verification', methods=['POST'])
+@limiter.limit(
+    "3 per hour",
+    key_func=lambda: f"verify:{get_remote_address()}:"
+                     f"{(request.form.get('email') or '').strip().lower()}",
+    error_message="Too many requests. Please try again later."
+)
+def resend_verification():
+    email = (request.form.get('email') or '').strip().lower()
+    user = User.query.filter_by(email=email).first()
+    # Only ever send to an account that actually needs it, but say the same
+    # thing either way so this cannot be used to test which addresses exist.
+    if user and user.email_verified is False:
+        send_verification_email(user)
+    flash("If that account still needs confirming, a new link is on its way.", "info")
+    return redirect(url_for('login'))
+
+
+# ============================================================
 # PASSWORD RESET
 # ============================================================
 
+RESET_TOKEN_MAX_AGE = 900   # 15 minutes
+
+
+def _password_fingerprint(password_hash):
+    """
+    Short HMAC of the stored password hash. Embedding it in a reset token
+    makes that token single-use: the moment the password changes the
+    fingerprint changes with it, so a link cannot be replayed inside its
+    15-minute window (nor can an old link undo a newer reset).
+    """
+    return _make_signature(f"pwreset:{password_hash}")
+
+
 @app.route('/forgot_password', methods=['GET', 'POST'])
+# Unauthenticated and it sends mail, so it is both an enumeration probe and a
+# way to spam somebody's inbox. Keyed per (IP, address).
+@limiter.limit(
+    "5 per hour;20 per day",
+    methods=["POST"],
+    key_func=lambda: f"forgot:{get_remote_address()}:"
+                     f"{(request.form.get('email') or '').strip().lower()}",
+    error_message="Too many password reset requests. Please try again later."
+)
 def forgot_password():
     if request.method == 'POST':
-        email = request.form.get('email')
+        email = (request.form.get('email') or '').strip().lower()
         user = User.query.filter_by(email=email).first()
 
         if user:
-            token = serializer.dumps(email, salt='password-reset-salt')
+            token = serializer.dumps(
+                {'email': user.email, 'pw': _password_fingerprint(user.password)},
+                salt='password-reset-salt',
+            )
             reset_url = url_for('reset_password', token=token, _external=True)
 
             msg = Message(
                 "Reset Your ScanMark Password",
-                sender=app.config.get('MAIL_USERNAME'),
-                recipients=[email]
+                sender=app.config['MAIL_DEFAULT_SENDER'],
+                recipients=[user.email]
             )
             msg.body = (
                 f"Hello {user.full_name},\n\n"
@@ -949,23 +1158,49 @@ def forgot_password():
     return render_template('forgot_password.html')
 
 
-@app.route('/reset_password/<token>', methods=['GET', 'POST'])
-def reset_password(token):
+def _load_reset_token(token):
+    """Return the User a still-valid reset token names, else None."""
     try:
-        email = serializer.loads(token, salt='password-reset-salt', max_age=900)
+        payload = serializer.loads(token, salt='password-reset-salt',
+                                   max_age=RESET_TOKEN_MAX_AGE)
     except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None   # a link minted before tokens carried a fingerprint
+    user = User.query.filter_by(email=payload.get('email')).first()
+    if not user:
+        return None
+    if not hmac.compare_digest(payload.get('pw') or '',
+                               _password_fingerprint(user.password)):
+        return None   # already redeemed, or the password changed since
+    return user
+
+
+@app.route('/reset_password/<token>', methods=['GET', 'POST'])
+@limiter.limit("10 per hour", methods=["POST"], key_func=get_remote_address,
+               error_message="Too many attempts. Please request a new link.")
+def reset_password(token):
+    user = _load_reset_token(token)
+    if not user:
         flash("The password reset link is invalid or has expired. Please request a new one.", "error")
         return redirect(url_for('forgot_password'))
 
     if request.method == 'POST':
-        new_password = request.form.get('password')
-        user = User.query.filter_by(email=email).first()
-        if user:
-            # FIX #1: Consistent hashing method (scrypt everywhere)
-            user.password = generate_password_hash(new_password, method='scrypt')
-            db.session.commit()
-            flash("Password updated! You can now log in.", "success")
-            return redirect(url_for('login'))
+        new_password = request.form.get('password') or ''
+        problem = validate_password_strength(new_password)
+        if problem:
+            flash(problem, "error")
+            return render_template('reset_password.html')
+
+        # FIX #1: Consistent hashing method (scrypt everywhere)
+        user.password = generate_password_hash(new_password, method='scrypt')
+        # Reaching the inbox proves the address; an account stuck unverified
+        # can legitimately recover this way.
+        user.email_verified = True
+        db.session.commit()
+        app.logger.info('Password reset completed for user id=%s', user.id)
+        flash("Password updated! You can now log in.", "success")
+        return redirect(url_for('login'))
 
     return render_template('reset_password.html')
 
@@ -995,16 +1230,33 @@ def login_google():
 
 @app.route('/authorize/google')
 def authorize_google():
-    token = google.authorize_access_token()
-    user_info = token.get('userinfo')
-    email = user_info.get('email')
-    full_name = user_info.get('name')
+    # An interrupted or replayed OAuth round trip (stale state cookie, someone
+    # opening the callback directly, the user hitting back) raises out of
+    # authlib. Unhandled, that is a 500 on a route real users land on.
+    try:
+        token = google.authorize_access_token()
+        user_info = token.get('userinfo') or {}
+    except Exception as e:
+        app.logger.warning('Google OAuth callback failed: %s', e)
+        flash('Google sign-in failed or expired. Please try again.', 'error')
+        return redirect(url_for('login'))
+
+    email = (user_info.get('email') or '').strip().lower()
+    full_name = (user_info.get('name') or '').strip()[:100]
+
+    # Google marks addresses it has actually confirmed; an unconfirmed one is
+    # no better evidence than a stranger typing the address into our own form.
+    if not email or user_info.get('email_verified') is False:
+        flash('Google sign-in failed: no confirmed email address.', 'error')
+        return redirect(url_for('login'))
 
     # Validate FUNAAB email
     is_valid, message, auto_role = is_valid_funaab_email(email)
     if not is_valid:
         flash(f'Access Denied: {message}', 'error')
         return redirect(url_for('login'))
+
+    full_name = full_name or email.split('@')[0][:100]
 
     user = User.query.filter_by(email=email).first()
     if not user:
@@ -1013,15 +1265,23 @@ def authorize_google():
             full_name=full_name,
             email=email,
             password=generate_password_hash(secrets.token_hex(32), method='scrypt'),
-            role=auto_role or 'student'
+            # Google only hands us an address it has already verified, and a
+            # Google sign-in never mints a staff role.
+            role='student' if (auto_role or 'student') != 'lecturer' else auto_role,
+            email_verified=True,
         )
         db.session.add(user)
         db.session.commit()
-        
+
         # Send welcome email
-        send_welcome_email(email, full_name, auto_role or 'student')
-        
+        send_welcome_email(email, full_name, user.role)
+
         flash('Account created via Google! Check your email for confirmation.', 'success')
+    elif user.email_verified is not True:
+        # Proving control of the address through Google clears any pending
+        # self-service confirmation for the same address.
+        user.email_verified = True
+        db.session.commit()
 
     login_user(user, remember=True)
     return redirect_by_role(user.role)
@@ -1108,6 +1368,9 @@ def campos_sso_callback():
             email=email,
             password=generate_password_hash(secrets.token_hex(32), method='scrypt'),
             role=role,
+            # CampOS is the identity provider; the address arrives inside a
+            # signed token, so there is nothing left for ScanMark to confirm.
+            email_verified=True,
         )
         # CampOS is the source of truth for matric number (guard uniqueness).
         if matric_no and not User.query.filter_by(matric_no=matric_no).first():
@@ -1122,10 +1385,25 @@ def campos_sso_callback():
             user.department = identity.department
         db.session.add(user)
         db.session.commit()
-        print(f'🟢 Created ScanMark user via CampOS SSO: {email}')
+        app.logger.info('Created ScanMark user via CampOS SSO (id=%s)', user.id)
     else:
         # Keep identity fresh from the source of truth.
         changed = False
+        if user.email_verified is False:
+            # This local account was opened through the public signup form and
+            # never confirmed — i.e. somebody claimed this address without
+            # proving they hold it, and the real owner is only arriving now.
+            # Adopting it as-is would leave the squatter's password working, so
+            # retire that password; the owner can set a new one through
+            # "forgot password" if they ever want to sign in without CampOS.
+            user.password = generate_password_hash(secrets.token_hex(32), method='scrypt')
+            app.logger.warning(
+                'CampOS SSO adopted an unconfirmed local account (id=%s); '
+                'its password was retired', user.id
+            )
+        if user.email_verified is not True:
+            user.email_verified = True
+            changed = True
         if user.campos_user_id != campos_user_id:
             user.campos_user_id = campos_user_id
             changed = True
@@ -1217,11 +1495,17 @@ def login():
         return redirect_by_role(current_user.role)
 
     if request.method == 'POST':
-        email = request.form.get('email')
-        password = request.form.get('password')
+        email = (request.form.get('email') or '').strip().lower()
+        password = request.form.get('password') or ''
         user = User.query.filter_by(email=email).first()
 
         if user and check_password_hash(user.password, password):
+            # An unconfirmed self-service account is not yet proof that the
+            # person typing owns the address they registered.
+            if REQUIRE_EMAIL_VERIFICATION and user.email_verified is False:
+                flash("Please confirm your email address first. "
+                      "Check your inbox for the verification link.", "warning")
+                return render_template('login.html', unverified_email=email)
             login_user(user, remember=True)
             return redirect_by_role(user.role)
         else:
@@ -1231,157 +1515,102 @@ def login():
 
 
 @app.route('/signup', methods=['GET', 'POST'])
-@csrf.exempt  # Temporarily exempt for debugging
+# Account creation is unauthenticated, so it is keyed by IP. The default
+# 1000/minute bucket let one host mint accounts faster than a human ever
+# could; a real person signs up once.
+@limiter.limit(
+    "5 per hour;20 per day",
+    methods=["POST"],
+    key_func=get_remote_address,
+    error_message="Too many signup attempts from this network. Please try again later."
+)
 def signup():
-    print(f"\n{'='*60}")
-    print(f"SIGNUP REQUEST - Method: {request.method}")
-    print(f"{'='*60}")
-    
     if request.method == 'POST':
-        # Get all form data (keys only — never dump request.form itself,
-        # it contains the plaintext password and prints straight into logs)
-        print("\n📋 FORM DATA RECEIVED:")
-        print(f"Raw form keys: {list(request.form.keys())}")
-
-        # Get main fields
-        name = (request.form.get('full_name') or 
-                request.form.get('name') or '').strip()
-        
+        name = (request.form.get('full_name') or
+                request.form.get('name') or '').strip()[:100]
         email = (request.form.get('email') or '').strip().lower()
-        password = (request.form.get('password') or '').strip()
-        
-        # Get optional student fields
-        matric_no = request.form.get('matric_no', '').strip()
-        level = request.form.get('level', '').strip()
-        
-        # Get staff role selection (if provided)
+        password = request.form.get('password') or ''
+        matric_no = request.form.get('matric_no', '').strip()[:20]
+        level = request.form.get('level', '').strip()[:10]
         staff_role = request.form.get('staff_role', '').strip()
-        
-        print(f"\n📝 PARSED VALUES:")
-        print(f"  Name: '{name}' (length: {len(name)})")
-        print(f"  Email: '{email}' (length: {len(email)})")
-        print(f"  Password: {'*' * len(password)} (length: {len(password)})")
-        print(f"  Staff Role Selection: '{staff_role}'")
-        print(f"  Matric No: '{matric_no}'")
-        print(f"  Level: '{level}'")
-        
-        # Step 1: Check if all required fields are provided
+
+        def reject(message, category='danger'):
+            flash(message, category)
+            return render_template('signup.html')
+
         if not name:
-            print("❌ VALIDATION FAILED: Name is empty")
-            flash('Please enter your full name!', 'danger')
-            return render_template('signup.html')
-            
+            return reject('Please enter your full name!')
         if not email:
-            print("❌ VALIDATION FAILED: Email is empty")
-            flash('Please enter your email address!', 'danger')
-            return render_template('signup.html')
-            
+            return reject('Please enter your email address!')
         if not password:
-            print("❌ VALIDATION FAILED: Password is empty")
-            flash('Please enter a password!', 'danger')
-            return render_template('signup.html')
-        
-        print("✅ All required fields have values")
-        
-        # Step 2: Validate FUNAAB email
-        print(f"\n🔍 Validating email: {email}")
+            return reject('Please enter a password!')
+
         is_valid, message, auto_role = is_valid_funaab_email(email)
-        print(f"  Valid: {is_valid}")
-        print(f"  Message: {message}")
-        print(f"  Auto Role: {auto_role}")
-        
         if not is_valid:
-            print(f"❌ EMAIL VALIDATION FAILED: {message}")
-            flash(message, 'danger')
-            return render_template('signup.html')
-        
-        # Step 2.5: Override role if staff selected a specific role
+            return reject(message)
+
+        # A staff address may pick between the self-service staff roles and
+        # nothing else. The previous code assigned request.form['staff_role']
+        # verbatim, so posting staff_role=dap minted an account that reads
+        # every course's attendance in the institution.
         final_role = auto_role
-        if email.endswith('@staff.funaab.edu.ng') and staff_role:
-            # Staff member selected their specific role
-            final_role = staff_role
-            print(f"  Staff role override: {staff_role}")
-        elif email.endswith('@staff.funaab.edu.ng') and not staff_role:
-            # Staff email but no role selected
-            print("❌ VALIDATION FAILED: Staff must select a role")
-            flash('Please select your role (Lecturer or Course Coordinator)', 'danger')
-            return render_template('signup.html')
-        
-        print(f"✅ Email validated - Final Role: {final_role}")
-        
-        # Step 3: Password strength check
-        if len(password) < 6:
-            print(f"❌ VALIDATION FAILED: Password too short ({len(password)} chars)")
-            flash('Password must be at least 6 characters long!', 'danger')
-            return render_template('signup.html')
-        
-        print("✅ Password validated")
-        
-        # Step 4: Check if user already exists
-        print(f"\n🔍 Checking if user exists...")
-        existing_user = User.query.filter_by(email=email).first()
-        if existing_user:
-            print(f"❌ USER EXISTS: {email}")
+        if email.endswith(STAFF_DOMAIN):
+            if not staff_role:
+                return reject('Please select your role (Lecturer or Course Coordinator)')
+            final_role = SELF_SERVICE_STAFF_ROLES.get(staff_role.lower())
+            if not final_role:
+                app.logger.warning(
+                    'Rejected signup requesting non-self-service role %r', staff_role[:40]
+                )
+                return reject('Please select your role (Lecturer or Course Coordinator)')
+
+        password_problem = validate_password_strength(password)
+        if password_problem:
+            return reject(password_problem)
+
+        if User.query.filter_by(email=email).first():
             flash('This FUNAAB email is already registered!', 'warning')
             return redirect(url_for('login'))
-        
-        print("✅ Email is available")
-        
-        # Step 5: Create new user
-        print(f"\n👤 Creating new user...")
-        print(f"  Name: {name}")
-        print(f"  Email: {email}")
-        print(f"  Role: {final_role}")
-        print(f"  Matric No: {matric_no or 'N/A'}")
-        print(f"  Level: {level or 'N/A'}")
-        
-        hashed_password = generate_password_hash(password, method='scrypt')
-        print(f"  Password hashed: {hashed_password[:20]}...")
-        
+
         new_user = User(
             full_name=name,
             email=email,
-            password=hashed_password,
+            password=generate_password_hash(password, method='scrypt'),
             role=final_role,
-            matric_no=matric_no if matric_no else None,
-            level=level if level else None
+            matric_no=matric_no or None,
+            level=level or None,
+            # Nobody proved they own this address yet.
+            email_verified=False,
         )
-        
+
         try:
             db.session.add(new_user)
             db.session.commit()
-            print("✅ User saved to database")
-            
-            # Step 6: Send welcome email
-            print(f"\n📧 Sending welcome email to {email}...")
-            try:
-                # 🚨 FIX: Don't send password in email (security issue)
-                send_welcome_email(email, name, final_role)
-                print("✅ Welcome email sent successfully")
-            except Exception as email_error:
-                print(f"⚠️ Email sending failed: {email_error}")
-                # Don't fail the signup if email fails
-            
-            print(f"\n{'='*60}")
-            print(f"🎉 SIGNUP SUCCESSFUL!")
-            print(f"{'='*60}\n")
-            
-            flash('Account created successfully! Welcome to ScanMark', 'success')
-            return redirect(url_for('login'))
-            
-        except Exception as e:
+        except IntegrityError:
+            # Two simultaneous signups for the same address, or a matric number
+            # already spoken for by another account.
             db.session.rollback()
-            print(f"\n❌ DATABASE ERROR: {e}")
-            import traceback
-            traceback.print_exc()
-            print(f"{'='*60}\n")
-            flash('Error creating account. Please try again.', 'danger')
-            return render_template('signup.html')
-            
-    # GET request
-    print("📄 Rendering signup form\n")
+            flash('This FUNAAB email is already registered!', 'warning')
+            return redirect(url_for('login'))
+        except Exception:
+            db.session.rollback()
+            app.logger.exception('Signup failed to persist the new account')
+            return reject('Error creating account. Please try again.')
+
+        app.logger.info('Account created (id=%s, role=%s)', new_user.id, final_role)
+        send_verification_email(new_user)
+        send_welcome_email(email, name, final_role)
+
+        if REQUIRE_EMAIL_VERIFICATION:
+            flash('Account created! Check your email for a verification link '
+                  'before you sign in.', 'success')
+        else:
+            flash('Account created successfully! Welcome to ScanMark', 'success')
+        return redirect(url_for('login'))
+
     return render_template('signup.html')
-        
+
+
 @app.route('/logout')
 @login_required
 def logout():
@@ -1565,17 +1794,74 @@ def dap_analytics():
 
 
 # ============================================================
+# AUTHORIZATION HELPERS
+# ============================================================
+# One place decides who may manage or read a course, so a new route cannot
+# quietly invent a weaker rule than its neighbours.
+
+def _is_coordinator():
+    """True when the signed-in user holds the course-coordinator post."""
+    return (current_user.role or '').lower().strip() == 'course coordinator'
+
+
+def _is_course_authorized(course):
+    """
+    True when the current user may MANAGE this course: open its sessions,
+    mint its QR tokens, read its roster, export its register.
+
+    Managing is deliberately narrower than viewing (see _attendance_authorized):
+    it is limited to the people actually teaching the course.
+    """
+    if course.coordinator_id == current_user.id:
+        return True
+    # `instructors` is a dynamic relationship — ask the database for this one
+    # row rather than loading every instructor to run `in` over them.
+    return course.instructors.filter(User.id == current_user.id).first() is not None
+
+
+def _attendance_authorized(course):
+    """
+    FIX #8: Extended to allow HOD, Dean, and DAP to READ attendance
+    in addition to coordinators and instructors.
+    """
+    role = (current_user.role or '').lower().strip()
+    if _is_course_authorized(course):
+        return True
+    # A supervisory post only reaches courses inside its own patch, and only
+    # when that patch is actually recorded — a NULL department must never
+    # match a course whose department is also NULL.
+    if role == 'hod':
+        return bool(current_user.department) and course.department == current_user.department
+    if role == 'dean':
+        return bool(current_user.faculty) and course.faculty == current_user.faculty
+    if role == 'dap':
+        return True
+    return False
+
+
+# ============================================================
 # COURSE MANAGEMENT
 # ============================================================
 
 @app.route('/add_course', methods=['POST'])
 @login_required
 def add_course():
-    code = request.form.get('code')
-    title = request.form.get('title')
+    # Creating a course makes you its coordinator, which carries the roster and
+    # the attendance register. Without this check any signed-in student could
+    # mint courses.
+    if not _is_coordinator():
+        flash("Only a Course Coordinator can create a course.", "error")
+        return redirect(url_for('dashboard'))
+
+    code = (request.form.get('code') or '').strip()[:10]
+    title = (request.form.get('title') or '').strip()[:100]
 
     if not code or not title:
         flash("Course code and title are required!", "error")
+        return redirect(url_for('dashboard'))
+
+    if Course.query.filter_by(code=code).first():
+        flash(f"Course code {code} is already taken.", "error")
         return redirect(url_for('dashboard'))
 
     new_course = Course(
@@ -1586,22 +1872,28 @@ def add_course():
         faculty=getattr(current_user, 'faculty', None),
     )
     db.session.add(new_course)
-    db.session.commit()
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        flash(f"Course code {code} is already taken.", "error")
+        return redirect(url_for('dashboard'))
     flash(f"Course {code} created successfully!", "success")
     return redirect(url_for('dashboard'))
 
+
 @app.route('/api/course/<int:course_id>/enrolled_students')
 @login_required
-@limiter.exempt 
+@limiter.exempt
 def get_enrolled_students(course_id):
     course = Course.query.get_or_404(course_id)
-    
-    if course.coordinator_id != current_user.id and current_user not in getattr(course, 'instructors', []):
+
+    if not _is_course_authorized(course):
         return jsonify({"error": "Unauthorised"}), 403
 
     # Grab all students who have registered for this specific course
     students = User.query.filter(User.enrolled_courses.any(id=course_id)).all()
-    
+
     student_list = []
     for student in students:
         student_list.append({
@@ -1609,7 +1901,7 @@ def get_enrolled_students(course_id):
             "matric_no": student.matric_no or "N/A",
             "level": student.level or "N/A"
         })
-        
+
     return jsonify({
         "status": "success",
         "total": len(student_list),
@@ -1637,51 +1929,66 @@ def delete_course(course_id):
 @app.route('/add_instructor', methods=['POST'])
 @login_required
 def add_instructor():
-    if current_user.role.lower() != 'course coordinator':
-        flash("Unauthorised", "error")
+    course_id = request.form.get('course_id', type=int)
+    lecturer_email = (request.form.get('lecturer_email') or '').strip().lower()
+
+    course = Course.query.get(course_id) if course_id else None
+    if not course:
+        flash("Course or lecturer not found.", "error")
         return redirect(url_for('dashboard'))
 
-    course_id = request.form.get('course_id')
-    lecturer_email = request.form.get('lecturer_email')
+    # Holding the Course Coordinator role was the ONLY check here, so any
+    # coordinator could add themselves as an instructor on somebody else's
+    # course and inherit its roster, live QR tokens and attendance register.
+    # Coordinating THIS course is what grants the right.
+    if course.coordinator_id != current_user.id:
+        flash("Unauthorised: you do not coordinate that course.", "error")
+        return redirect(url_for('dashboard'))
 
-    course = Course.query.get(course_id)
     lecturer = User.query.filter_by(email=lecturer_email).first()
-
-    if course and lecturer:
-        if hasattr(course, 'instructors'):
-            if lecturer not in course.instructors:
-                course.instructors.append(lecturer)
-                db.session.commit()
-                flash(f"Added {lecturer.full_name} to {course.code}.", "success")
-            else:
-                flash("User is already an instructor.", "info")
-        else:
-            flash("Course instructors relationship not configured.", "error")
-    else:
+    if not lecturer:
         flash("Course or lecturer not found.", "error")
+        return redirect(url_for('dashboard'))
 
+    if (lecturer.role or '').lower() not in ('lecturer', 'course coordinator'):
+        flash("Only staff accounts can be added as instructors.", "error")
+        return redirect(url_for('dashboard'))
+
+    if course.instructors.filter(User.id == lecturer.id).first():
+        flash("User is already an instructor.", "info")
+        return redirect(url_for('dashboard'))
+
+    course.instructors.append(lecturer)
+    db.session.commit()
+    flash(f"Added {lecturer.full_name} to {course.code}.", "success")
     return redirect(url_for('dashboard'))
 
 
 @app.route('/register_course', methods=['POST'])
 @login_required
 def register_course():
-    course_code = request.form.get('course_code')
+    # Enrolment is what /mark_attendance checks, so it belongs to students.
+    if (current_user.role or '').lower().strip() != 'student':
+        flash("Only students can register for a course.", "error")
+        return redirect(url_for('dashboard'))
+
+    course_code = (request.form.get('course_code') or '').strip()
     course = Course.query.filter_by(code=course_code).first()
 
     if not course:
         flash("Course not found!", "error")
         return redirect(url_for('student_dashboard'))
 
-    if hasattr(current_user, 'enrolled_courses'):
-        if course in current_user.enrolled_courses:
-            flash(f"You are already registered for {course.code}.", "info")
-        else:
-            current_user.enrolled_courses.append(course)
+    if course in current_user.enrolled_courses:
+        flash(f"You are already registered for {course.code}.", "info")
+    else:
+        current_user.enrolled_courses.append(course)
+        try:
             db.session.commit()
             flash(f"✅ Successfully registered for {course.code}.", "success")
-    else:
-        flash("Enrollment system not configured.", "error")
+        except IntegrityError:
+            db.session.rollback()
+            flash(f"You are already registered for {course.code}.", "info")
 
     return redirect(url_for('student_dashboard'))
 
@@ -1689,13 +1996,6 @@ def register_course():
 # ============================================================
 # QR CODE ROUTES  (FIX #3, #5, #6)
 # ============================================================
-
-def _is_course_authorized(course):
-    """Return True if the current user may manage this course."""
-    is_coordinator = (course.coordinator_id == current_user.id)
-    is_instructor = hasattr(course, 'instructors') and (current_user in course.instructors)
-    return is_coordinator or is_instructor
-
 
 def _get_or_create_todays_session(course):
     """
@@ -1986,8 +2286,10 @@ def _post_scan_notifications(app_instance, student_id, course_id, timestamp_str)
                 ClassSession_model=ClassSession,
                 db_session=db.session
             )
-        except Exception as e:
-            print(f"⚠️ Post-scan notification error for user {student_id}: {e}")
+        except Exception:
+            app_instance.logger.exception(
+                'Post-scan notification failed for user id=%s', student_id
+            )
 
 
 @app.route('/mark_attendance', methods=['POST'])
@@ -2042,14 +2344,25 @@ def mark_attendance():
         # FIX #4: Retrieve location from Redis
         class_loc = get_class_location(course_id)
         if class_loc:
-            if not student_lat or not student_lon:
+            # `not student_lat` also rejects a legitimate 0.0, and the equator
+            # runs through the Gulf of Guinea — close enough to Nigeria to be
+            # worth getting right. Only a genuinely absent reading is refused.
+            if student_lat is None or student_lon is None:
                 return jsonify({"status": "error", "message": "Location required! Please allow GPS access."})
 
-            dist = calculate_distance(
-                class_loc['lat'], class_loc['lon'],
-                float(student_lat), float(student_lon)
-            )
-            if dist > 50:
+            try:
+                dist = calculate_distance(
+                    class_loc['lat'], class_loc['lon'],
+                    float(student_lat), float(student_lon)
+                )
+            except (TypeError, ValueError):
+                return jsonify({"status": "error", "message": "Location required! Please allow GPS access."})
+
+            # Compare against the configured radius. This used to be a
+            # hardcoded 50 while the message quoted GEOFENCE_RADIUS_M, so
+            # students were turned away at 50m by an app telling them the
+            # limit was 100m, and raising the env var changed nothing.
+            if dist > GEOFENCE_RADIUS_M:
                 return jsonify({
                     "status": "error",
                     "message": f"Too far from classroom. You are {int(dist)}m away (max {GEOFENCE_RADIUS_M}m)."
@@ -2088,8 +2401,8 @@ def mark_attendance():
                 f'scanmark-attendance:{new_record.id}',
                 scanned_iso,
             )
-        except Exception as e:
-            print(f"⚠️ Could not queue CampOS attendance report: {e}")
+        except Exception:
+            app.logger.exception('Could not queue CampOS attendance report')
 
         # Confirmation email, WhatsApp, parent alerts and the early-warning
         # check all run AFTER the response, on the executor — see
@@ -2099,33 +2412,17 @@ def mark_attendance():
             email_executor.submit(
                 _post_scan_notifications, app, current_user.id, course_id, timestamp_str
             )
-        except Exception as e:
-            print(f"⚠️ Could not queue post-scan notifications: {e}")
+        except Exception:
+            app.logger.exception('Could not queue post-scan notifications')
 
         return jsonify({"status": "success", "message": "Attendance marked successfully! ✅"})
 
-    except Exception as e:
-        print(f"❌ Server error in mark_attendance: {e}")
-        return jsonify({"status": "error", "message": "An unexpected server error occurred."})
-
-
-def _attendance_authorized(course):
-    """
-    FIX #8: Extended to allow HOD, Dean, and DAP to view attendance
-    in addition to coordinators and instructors.
-    """
-    role = (current_user.role or '').lower()
-    if course.coordinator_id == current_user.id:
-        return True
-    if hasattr(course, 'instructors') and current_user in course.instructors:
-        return True
-    if role == 'hod' and course.department == getattr(current_user, 'department', None):
-        return True
-    if role == 'dean' and course.faculty == getattr(current_user, 'faculty', None):
-        return True
-    if role == 'dap':
-        return True
-    return False
+    except Exception:
+        # Leave no half-finished transaction on this connection for whichever
+        # request picks it up next.
+        db.session.rollback()
+        app.logger.exception('Server error in mark_attendance')
+        return jsonify({"status": "error", "message": "An unexpected server error occurred."}), 500
 
 
 @app.route('/course/<int:course_id>/attendance')
@@ -2198,7 +2495,9 @@ def download_csv(course_id):
     """
     course = Course.query.get_or_404(course_id)
 
-    if not getattr(course, 'coordinator_id') == current_user.id and current_user not in getattr(course, 'instructors', []):
+    # The register carries every enrolled student's name and matric number, so
+    # it follows the same rule as the on-screen attendance view.
+    if not _attendance_authorized(course):
         return "Unauthorised", 403
 
     safe_code = (course.code or "course").replace(' ', '_')
@@ -2316,7 +2615,7 @@ def course_analytics(course_id):
     course = Course.query.get_or_404(course_id)
 
     # Security check: Ensure they own the course
-    if not getattr(course, 'coordinator_id') == current_user.id and current_user not in getattr(course, 'instructors', []):
+    if not _attendance_authorized(course):
         return "Unauthorised", 403
 
     # One data point PER CLASS SESSION (a session nobody scanned still shows
@@ -2347,7 +2646,7 @@ def start_session(course_id):
     course = Course.query.get_or_404(course_id)
 
     # Security check: Ensure they are the lecturer
-    if not getattr(course, 'coordinator_id') == current_user.id and current_user not in getattr(course, 'instructors', []):
+    if not _is_course_authorized(course):
         return "Unauthorised", 403
 
     # Open today's class meeting (or resume it if already started today),
@@ -2618,9 +2917,30 @@ def ratelimit_handler(e):
             "status": "error",
             "message": f"Rate limit exceeded. Please slow down. ({e.description})"
         }), 429
-    
-    # 🚨 STOPS THE LOOP BY RENDERING HTML DIRECTLY
-    return f"<h2>Too Many Requests!</h2><p>Please wait a minute and <a href='{url_for('dashboard')}'>try again</a>.</p>", 429
+
+    # 🚨 STOPS THE LOOP BY RENDERING HTML DIRECTLY.
+    # e.description is set from each limit's error_message, which is ours — but
+    # escape it anyway rather than trusting that every future caller remembers.
+    return Response(
+        "<h2>Too Many Requests!</h2>"
+        f"<p>{escape(str(e.description))}</p>"
+        f"<p>Please wait a minute and <a href='{url_for('dashboard')}'>try again</a>.</p>",
+        status=429, mimetype='text/html'
+    )
+
+
+@app.errorhandler(500)
+def internal_error_handler(e):
+    """Never leave a broken transaction attached to the pooled connection."""
+    db.session.rollback()
+    if request.is_json or request.path.startswith('/api/'):
+        return jsonify({"status": "error",
+                        "message": "An unexpected server error occurred."}), 500
+    return Response(
+        "<h2>Something went wrong</h2>"
+        "<p>The error has been logged. Please try again in a moment.</p>",
+        status=500, mimetype='text/html'
+    )
 
 # ============================================================
 # DATABASE INITIALIZATION & SCHEDULER
@@ -2647,6 +2967,11 @@ with app.app_context():
         # Stable CampOS identity binding; email is not an identity key.
         ("user", "campos_user_id", "VARCHAR(100)"),
         ("user", "campos_institution_id", "VARCHAR(100)"),
+        # Self-service signups must confirm their address. Existing rows are
+        # backfilled TRUE by this DDL default so nobody who could sign in
+        # yesterday is locked out today; only rows inserted after this point
+        # start out unconfirmed (the ORM sets False explicitly).
+        ("user", "email_verified", "BOOLEAN DEFAULT TRUE"),
     ]
     database_inspector = inspect(db.engine)
     existing_columns = {
@@ -2803,16 +3128,28 @@ except ImportError:
     print("   Install with: pip install APScheduler")
 
 if __name__ == '__main__':
-    print("\n" + "="*60)
-    print("🎓 FUNAAB ATTENDANCE SYSTEM STARTING")
-    print("="*60)
+    # Local development entry point only — production runs the Procfile's
+    # `gunicorn --config gunicorn.conf.py app:app`.
+    if is_production_environment():
+        raise RuntimeError(
+            "Refusing to start the development server in production. "
+            "Use: gunicorn --config gunicorn.conf.py app:app"
+        )
+
+    print("\n" + "=" * 60)
+    print("🎓 FUNAAB ATTENDANCE SYSTEM STARTING (development server)")
+    print("=" * 60)
     print(f"📧 Mail Server: {app.config['MAIL_SERVER']}")
-    print(f"📧 Mail Username: {app.config['MAIL_USERNAME']}")
-    print(f"🔐 CSRF Protection: Enabled")
-    print(f"🛡️  Rate Limiting: Enabled")
+    print("🔐 CSRF Protection: Enabled")
+    print("🛡️  Rate Limiting: Enabled")
     print(f"📱 WhatsApp Alerts: {'Enabled' if os.environ.get('TWILIO_ACCOUNT_SID') else 'Disabled'}")
-    print(f"📊 Weekly PDF Reports: Scheduled (Monday 7 AM)")
+    print(f"📧 Email Verification: {'Required' if REQUIRE_EMAIL_VERIFICATION else 'Not required'}")
+    print("📊 Weekly PDF Reports: Scheduled (Monday 7 AM)")
     print(f"⚠️  Early-Warning Threshold: {DEFAULT_ATTENDANCE_THRESHOLD}%")
-    print("="*60 + "\n")
-    
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    print("=" * 60 + "\n")
+
+    # The reloader/debugger is opt-in rather than always-on: `debug=True` here
+    # exposes the Werkzeug console to anything that can reach port 5000.
+    app.run(host=os.environ.get('DEV_HOST', '127.0.0.1'), port=5000,
+            debug=os.environ.get('FLASK_DEBUG', '').strip().lower()
+            in ('1', 'true', 'yes', 'on'))
