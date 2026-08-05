@@ -19,23 +19,48 @@ Setup
 
 2. Install locust (not a runtime dependency): pip install locust
 
-3. On YOUR OWN MACHINE — never on the server, or the load generator competes
-   with the app for CPU and you measure the wrong thing — export the staging
-   config so the test can mint valid QR tokens:
+3. Run locust ON YOUR OWN MACHINE — never on the server, or the load generator
+   competes with the app for CPU and you measure the wrong thing.
 
+   One locust process is single-threaded and becomes the bottleneck long
+   before 2000 users, so a real burst needs one process per core.
+
+   macOS / Linux / WSL
+   -------------------
     export TARGET_SECRET_KEY=<staging SECRET_KEY>
     export TARGET_SESSION_ID=<printed by the seeder>
     export STUDENT_PASSWORD=<printed by the seeder>
-    export STUDENT_POOL=2000       # how many students you actually seeded
-    # optional: export EMAIL_PATTERN='st{n}@student.funaab.edu.ng'
+    export STUDENT_POOL=2000     # how many students you actually seeded
+    export WORKER_COUNT=4        # must match --processes below
 
-4. Run the burst (2000 students, spawning 50/second). `--processes -1` uses
-   every core: one locust process is single-threaded and becomes the
-   bottleneck long before 2000 users, so without it you measure your laptop.
-
-    ulimit -n 8192      # 2000 concurrent sockets need the headroom
+    ulimit -n 8192               # 2000 concurrent sockets need the headroom
     locust -f loadtest/locustfile.py --host https://staging.yourdomain \
-           --users 2000 --spawn-rate 50 --headless --run-time 5m --processes -1
+           --users 2000 --spawn-rate 50 --headless --run-time 5m --processes 4
+
+   Windows
+   -------
+   `--processes` is not supported on Windows (locust forks, which Windows has
+   no equivalent of), and there is no `ulimit`. WSL is by far the easier
+   route — inside it, use the Unix block above verbatim.
+
+   To stay in native cmd.exe, set variables with `set` and start the master
+   and workers as separate processes by hand. In the first window:
+
+    set TARGET_SECRET_KEY=<staging SECRET_KEY>
+    set TARGET_SESSION_ID=<printed by the seeder>
+    set STUDENT_PASSWORD=<printed by the seeder>
+    set STUDENT_POOL=2000
+    set WORKER_COUNT=4
+    locust -f loadtest/locustfile.py --host https://staging.yourdomain ^
+           --users 2000 --spawn-rate 50 --headless --run-time 5m ^
+           --master --expect-workers 4
+
+   Then in four more windows, each with the SAME five `set` lines:
+
+    locust -f loadtest/locustfile.py --worker
+
+   (PowerShell uses $env:NAME="value" instead of `set`, and a backtick ` for
+   line continuation instead of ^.)
 
 Watch for: p95 response time on /mark_attendance, 429/5xx rates, and
 "expired" errors (means the queue is longer than QR_CODE_WINDOW).
@@ -69,11 +94,23 @@ EMAIL_PATTERN = os.environ.get('EMAIL_PATTERN', 'st{n}@student.funaab.edu.ng')
 # present", which this file already counts as a success.
 STUDENT_POOL = int(os.environ.get('STUDENT_POOL', '0'))
 
+# How many locust processes are running (match --processes, or the number of
+# --worker processes you started by hand). Every process gets its OWN copy of
+# the counter below, starting at 1 — so with 4 workers and no offset, all four
+# drive st1, st2, st3 … simultaneously: the first quarter of the pool gets
+# hammered by four concurrent sessions each while the rest is never touched.
+# Duplicate scans answer "already marked present", which this file counts as a
+# success, so the run would look healthy while measuring the duplicate-check
+# path instead of 2000 real inserts. Interleaving by worker index fixes that.
+WORKER_COUNT = int(os.environ.get('WORKER_COUNT', '1'))
+
 _user_counter = itertools.count(1)
 
 
-def _next_email():
-    n = next(_user_counter)
+def _next_email(worker_index=0):
+    local = next(_user_counter)
+    # Worker 0 takes students 1, 1+W, 1+2W …; worker 1 takes 2, 2+W …
+    n = (local - 1) * WORKER_COUNT + worker_index + 1
     if STUDENT_POOL > 0:
         n = ((n - 1) % STUDENT_POOL) + 1
     return EMAIL_PATTERN.format(n=n)
@@ -92,7 +129,8 @@ class ScanningStudent(HttpUser):
     wait_time = between(0.5, 3)
 
     def on_start(self):
-        self.email = _next_email()
+        # 0 when running single-process; distinct per worker otherwise.
+        self.email = _next_email(getattr(self.environment.runner, 'worker_index', 0) or 0)
 
         # Login: GET the form for the CSRF token, then POST credentials.
         page = self.client.get('/login')
