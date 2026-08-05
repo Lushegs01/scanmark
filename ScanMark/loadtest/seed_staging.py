@@ -68,12 +68,18 @@ def main():
                         help='Proceed even if DATABASE_URL looks like production.')
     parser.add_argument('--yes', action='store_true',
                         help='Skip the teardown confirmation prompt.')
+    parser.add_argument('--status', action='store_true',
+                        help='Report what is in the database and exit. Read-only. '
+                             'Use this to decide whether a database is safe to '
+                             'load test.')
     args = parser.parse_args()
 
     db_url = os.environ.get('DATABASE_URL', '')
     if not db_url:
         sys.exit("DATABASE_URL is not set. Point it at STAGING and try again.")
-    if looks_like_production(db_url) and not args.force:
+    # --status only reads, so it is allowed to look at production: deciding
+    # whether a database holds real students is exactly what it is for.
+    if looks_like_production(db_url) and not args.force and not args.status:
         sys.exit(f"DATABASE_URL looks like production ({db_url.split('@')[-1]}). "
                  "Refusing. Pass --force only if you are certain.")
 
@@ -82,6 +88,37 @@ def main():
     from werkzeug.security import generate_password_hash
 
     with app.app.app_context():
+        if args.status:
+            seeded = set(seeded_student_ids(User))
+            total_users = User.query.count()
+            real_users = total_users - len(seeded)
+            print(f"\n  Database   : {db_url.split('@')[-1]}")
+            print(f"  Users      : {total_users} "
+                  f"({len(seeded)} seeded by this script, {real_users} other)")
+            for role, count in db.session.query(
+                    User.role, db.func.count(User.id)).group_by(User.role).all():
+                print(f"      {role or '(none)':<20} {count}")
+            print(f"  Courses    : {Course.query.count()}")
+            print(f"  Sessions   : {ClassSession.query.count()}")
+            print(f"  Attendance : {Attendance.query.count()} rows")
+
+            attendance_rows = Attendance.query.count()
+            if real_users == 0 and attendance_rows == 0:
+                print("\n  No accounts and no attendance history — nothing here to")
+                print("  lose. Safe to load test, and if this IS production it")
+                print("  will give you numbers a free staging tier never could.")
+            else:
+                held = []
+                if real_users:
+                    held.append(f"{real_users} account(s) this script did not create")
+                if attendance_rows:
+                    held.append(f"{attendance_rows} attendance row(s)")
+                print(f"\n  This database holds {' and '.join(held)}.")
+                print("  Do NOT load test it: the burst writes thousands of rows")
+                print("  alongside real records. Take a pg_dump first and use a")
+                print("  separate environment.")
+            return
+
         if args.teardown:
             student_ids = seeded_student_ids(User)
             course = Course.query.filter_by(code=COURSE_CODE).first()
