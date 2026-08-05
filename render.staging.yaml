@@ -1,0 +1,110 @@
+# Render blueprint for a ScanMark STAGING environment, sized for Render's FREE
+# tier.
+#
+# Create it:  Render dashboard -> New -> Blueprint -> pick this repo ->
+#             set "Blueprint file path" to render.staging.yaml
+#
+# Everything is named *-staging so it cannot collide with production. Tear the
+# whole environment down from the dashboard when you are finished.
+#
+# ── WHAT A FREE-TIER RUN CAN AND CANNOT TELL YOU ────────────────────────────
+# A free web service gets a fraction of a CPU, 512 MB of RAM, and sleeps after
+# ~15 minutes idle. So a burst against this environment is a CORRECTNESS test,
+# not a capacity test:
+#
+#   It DOES prove   — the app boots on real Render infra, migrations apply to a
+#                     real Postgres, sessions and QR tokens work through a real
+#                     Redis, students log in and scan, the duplicate guard
+#                     holds, and the lecturer views render.
+#   It does NOT     — predict production latency or throughput. Numbers from a
+#                     0.1-CPU box say nothing about a 2000-student lecture.
+#
+# To answer "can this take 5000 students", raise the three `plan:` fields to
+# whatever production runs, re-run, then scale back down. Until then treat a
+# green run here as "nothing is broken", not as "we are ready".
+#
+# Render's free Postgres is also time-limited — the dashboard shows the expiry
+# date on the database page. Check it before you plan around this environment.
+# ────────────────────────────────────────────────────────────────────────────
+
+databases:
+  - name: scanmark-staging-db
+    databaseName: scanmark_staging
+    plan: free                     # ← raise to match production for real numbers
+    postgresMajorVersion: "16"
+
+services:
+  - type: keyvalue
+    name: scanmark-staging-redis
+    plan: free                     # ← raise to match production
+    # Sessions live here. Evicting them at random signs students out
+    # mid-class, so evict only keys that carry an expiry.
+    maxmemoryPolicy: volatile_lru
+    ipAllowList: []                # private network only
+
+  - type: web
+    name: scanmark-staging
+    runtime: python
+    plan: free                     # ← raise to match production
+    branch: main
+    rootDir: ScanMark
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --config gunicorn.conf.py app:app
+    healthCheckPath: /healthz
+    envVars:
+      # Render generates this and keeps it secret. Read it back from
+      # dashboard -> Environment to give locust TARGET_SECRET_KEY.
+      - key: SECRET_KEY
+        generateValue: true
+
+      - key: DATABASE_URL
+        fromDatabase:
+          name: scanmark-staging-db
+          property: connectionString
+
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: scanmark-staging-redis
+          property: connectionString
+
+      # Behave exactly like production — secure cookies, HSTS, email
+      # verification on — so staging exercises the real code paths.
+      - key: FLASK_ENV
+        value: production
+
+      # A 2000-student burst would otherwise send 2000 confirmation emails and
+      # blow through the SMTP quota. The attendance row is still written.
+      - key: SCAN_CONFIRMATION_EMAILS
+        value: "false"
+
+      # Sized for FREE tier, not for a real lecture. The repo default is 4
+      # workers x 8 threads, tuned for a 1 GB instance; four gunicorn workers
+      # on a fraction of a CPU thrash against each other and crowd 512 MB.
+      # Raise these together with the plans above.
+      - key: WEB_CONCURRENCY
+        value: "2"
+      - key: GUNICORN_THREADS
+        value: "8"
+
+      # Free Postgres allows far fewer connections than a paid plan, and the
+      # pool is PER WORKER: 2 x (3 + 2) = 10 total. Raise with the plans.
+      - key: DB_POOL_SIZE
+        value: "3"
+      - key: DB_MAX_OVERFLOW
+        value: "2"
+
+      # Tracing off during a load test; it adds per-request latency that is
+      # already scarce here.
+      - key: SENTRY_TRACES_SAMPLE_RATE
+        value: "0"
+
+      # ── Deliberately NOT set ────────────────────────────────────────────
+      # CAMPOS_API_KEY  — unset, so the burst does not push fake attendance
+      #                   events into real CampOS Core.
+      # CAMPOS_SSO_*    — unset, so staging cannot accept a production SSO
+      #                   hand-off. Add a separate staging secret if you need
+      #                   to exercise the SSO path.
+      # MAIL_*          — unset, so mail sends fail fast instead of
+      #                   delivering to real students.
+      # ────────────────────────────────────────────────────────────────────
