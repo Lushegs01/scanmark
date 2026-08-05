@@ -90,6 +90,22 @@
                         </div>
                     </form>
 
+                    {% if unverified_email %}
+                    <div class="alert alert-warning mt-3 small" role="alert">
+                        <p class="mb-2">
+                            This account still needs its email address confirmed.
+                            Didn't get the link?
+                        </p>
+                        <form method="POST" action="{{ url_for('resend_verification') }}" class="d-grid">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                            <input type="hidden" name="email" value="{{ unverified_email }}">
+                            <button type="submit" class="btn btn-sm btn-outline-secondary">
+                                Send a new verification link
+                            </button>
+                        </form>
+                    </div>
+                    {% endif %}
+
                     <div class="text-center mt-4">
                         <p class="small text-muted">
                             New to ScanMark? <a href="/signup" class="text-decoration-none fw-bold"
