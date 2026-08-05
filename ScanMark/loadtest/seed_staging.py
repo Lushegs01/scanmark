@@ -26,6 +26,7 @@ Clean up afterwards with --teardown.
 """
 import argparse
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -41,6 +42,22 @@ def looks_like_production(url):
     return any(marker in lowered for marker in ('prod', 'live', 'scanmark-db'))
 
 
+# EMAIL_PATTERN with {n} replaced by "one or more digits, nothing else". A
+# prefix LIKE 'st%' is NOT good enough to identify what this script created:
+# it also matches stella@, stephen@, steve@ — real students, deleted by a
+# teardown that was only ever meant to remove st1@, st2@, st3@.
+_SEEDED_EMAIL_RE = re.compile(
+    '^' + re.escape(EMAIL_PATTERN).replace(re.escape('{n}'), r'\d+') + '$'
+)
+
+
+def seeded_student_ids(User):
+    """IDs of accounts this script created — matched exactly, never by prefix."""
+    prefix = EMAIL_PATTERN.split('{n}')[0]
+    candidates = User.query.filter(User.email.like(f'{prefix}%')).all()
+    return [u.id for u in candidates if _SEEDED_EMAIL_RE.match(u.email or '')]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--students', type=int, default=2000)
@@ -49,6 +66,8 @@ def main():
                         help='Delete everything this script created, then exit.')
     parser.add_argument('--force', action='store_true',
                         help='Proceed even if DATABASE_URL looks like production.')
+    parser.add_argument('--yes', action='store_true',
+                        help='Skip the teardown confirmation prompt.')
     args = parser.parse_args()
 
     db_url = os.environ.get('DATABASE_URL', '')
@@ -64,17 +83,48 @@ def main():
 
     with app.app.app_context():
         if args.teardown:
+            student_ids = seeded_student_ids(User)
             course = Course.query.filter_by(code=COURSE_CODE).first()
+            coordinator = User.query.filter_by(email=COORDINATOR_EMAIL).first()
+
+            print(f"\nWill delete from {db_url.split('@')[-1]}:")
+            print(f"  {len(student_ids)} seeded students "
+                  f"(matching {EMAIL_PATTERN.replace('{n}', '<digits>')})")
+            print(f"  course {COURSE_CODE}: {'yes' if course else 'not found'}"
+                  f" (+ its sessions and attendance)")
+            print(f"  coordinator {COORDINATOR_EMAIL}: "
+                  f"{'yes' if coordinator else 'not found'}")
+            if not (student_ids or course or coordinator):
+                print("\nNothing to remove.")
+                return
+            if not args.yes:
+                if input("\nType 'delete' to confirm: ").strip().lower() != 'delete':
+                    sys.exit("Aborted. Nothing was deleted.")
+
             if course:
-                Attendance.query.filter_by(course_id=course.id).delete()
-                ClassSession.query.filter_by(course_id=course.id).delete()
-                db.session.delete(course)
-            removed = User.query.filter(
-                User.email.like('st%@student.funaab.edu.ng')).delete(
+                Attendance.query.filter_by(course_id=course.id).delete(
                     synchronize_session=False)
-            User.query.filter_by(email=COORDINATOR_EMAIL).delete()
+                ClassSession.query.filter_by(course_id=course.id).delete(
+                    synchronize_session=False)
+            if student_ids:
+                # Attendance and enrolments elsewhere, so a seeded student
+                # never leaves an orphan row behind.
+                Attendance.query.filter(
+                    Attendance.student_id.in_(student_ids)).delete(
+                        synchronize_session=False)
+                for student in User.query.filter(User.id.in_(student_ids)).all():
+                    student.enrolled_courses.clear()
+                db.session.flush()
+            if course:
+                db.session.delete(course)
+            if student_ids:
+                User.query.filter(User.id.in_(student_ids)).delete(
+                    synchronize_session=False)
+            if coordinator:
+                db.session.delete(coordinator)
             db.session.commit()
-            print(f"Removed {removed} load-test students and course {COURSE_CODE}.")
+            print(f"\nRemoved {len(student_ids)} load-test students"
+                  f"{' and course ' + COURSE_CODE if course else ''}.")
             return
 
         # All students share one password, so hash it ONCE. scrypt is
