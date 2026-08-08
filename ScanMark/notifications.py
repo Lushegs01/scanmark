@@ -7,8 +7,9 @@ early-warning notifications when attendance slips.
 
 import os
 import io
+import atexit
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor
+from performance import BoundedExecutor, runtime_metrics
 
 # PDF generation
 from reportlab.lib import colors
