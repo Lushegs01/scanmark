@@ -1,13 +1,17 @@
 import os
 import io
+import atexit
 import hmac
 import hashlib
+import json
 import secrets
+import sys
+import threading
+import tempfile
 import time
 import math
 import re
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 load_dotenv()
 from authlib.integrations.flask_client import OAuth
@@ -15,7 +19,11 @@ from flask import (Flask, render_template, redirect, url_for,
                    flash, request, send_file, jsonify, Response, session)
 from flask_login import LoginManager, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
-from sqlalchemy import func, inspect
+from sqlalchemy import event, func, inspect, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import joinedload, selectinload
+from sqlalchemy.pool import Pool
 import redis
 from flask_session import Session
 from itsdangerous import URLSafeTimedSerializer
@@ -29,7 +37,11 @@ from whitenoise import WhiteNoise
 import sentry_sdk
 from sentry_sdk.integrations.flask import FlaskIntegration
 
-from models import db, User, Course, Attendance, ClassSession, NotificationPreference, WeeklyReport
+from models import (
+    db, User, Course, Attendance, ClassSession, NotificationPreference,
+    WeeklyReport, enrollments,
+)
+from performance import BoundedExecutor, InstrumentedQueuePool, runtime_metrics
 from campos_integration import (
     CamposIntegrationError,
     exchange_campos_sso_code,
@@ -54,6 +66,16 @@ from notifications import (
     send_parent_attendance_email,
     DEFAULT_ATTENDANCE_THRESHOLD,
 )
+
+# Windows' legacy console encoding cannot represent some existing log text.
+# Keep startup diagnostic output from crashing the process on local machines.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(errors="backslashreplace")
+
+
+def _utcnow():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 # ============================================================
 # SENTRY ERROR MONITORING
@@ -126,12 +148,28 @@ try:
 except Exception as _e:
     print(f"⚠️ Static pre-compression skipped: {_e}")
 
-app.wsgi_app = WhiteNoise(
+class HealthcheckMiddleware:
+    """Answer the process probe before Flask opens a session or extension."""
+
+    def __init__(self, wrapped):
+        self.wrapped = wrapped
+
+    def __call__(self, environ, start_response):
+        if environ.get('PATH_INFO') == '/healthz' and environ.get('REQUEST_METHOD') in ('GET', 'HEAD'):
+            start_response('204 No Content', [
+                ('Content-Length', '0'),
+                ('Cache-Control', 'no-store'),
+            ])
+            return [b'']
+        return self.wrapped(environ, start_response)
+
+
+app.wsgi_app = HealthcheckMiddleware(WhiteNoise(
     app.wsgi_app,
     root=_static_root,
     prefix='static/',
     max_age=int(os.environ.get('STATIC_MAX_AGE', 86400)),
-)
+))
 
 # Gzip/brotli-compress dynamic responses (HTML/JSON) — big win on campus
 # mobile connections; compressible responses shrink ~70-85%.
@@ -201,7 +239,25 @@ mail = Mail(app)
 # 🚨 THE FIX: Create a bounded pool of workers to handle all emails safely.
 # 10 workers: this pool also runs the post-scan notification tasks, and a
 # full class marking attendance queues one task per student.
-email_executor = ThreadPoolExecutor(max_workers=10)
+notification_work_executor = BoundedExecutor(
+    name='notification_work',
+    max_workers=int(os.environ.get('NOTIFICATION_WORKERS', 6)),
+    max_queue=int(os.environ.get('NOTIFICATION_QUEUE_SIZE', 2000)),
+    metrics=runtime_metrics,
+)
+campos_executor = BoundedExecutor(
+    name='campos_delivery',
+    max_workers=int(os.environ.get('CAMPOS_WORKERS', 4)),
+    max_queue=int(os.environ.get('CAMPOS_QUEUE_SIZE', 2000)),
+    metrics=runtime_metrics,
+)
+
+
+@atexit.register
+def _shutdown_background_executors():
+    # Do not hold process shutdown open for optional outbound notifications.
+    notification_work_executor.shutdown(wait=False)
+    campos_executor.shutdown(wait=False)
 
 # Escape hatch for very large events: one confirmation email per scan can
 # exceed the SMTP provider's quota (Gmail allows ~500-2000 sends/day), so
@@ -231,7 +287,8 @@ def send_email(subject, recipients, text_body, html_body, sender=None):
     msg.html = html_body
     
     # 🚨 THE FIX: Hand the email to the bouncer instead of spawning an infinite thread
-    email_executor.submit(send_async_email, app, msg)
+    if notification_work_executor.submit(send_async_email, app, msg) is None:
+        app.logger.warning('notification queue full; email dropped')
 
 def send_welcome_email(user_email, user_name, user_role='student'):
     """
@@ -542,6 +599,7 @@ if _db_uri.startswith("postgresql://"):
     # 4 workers this is 4 × (5 + 5) = 40 — make sure the Postgres plan
     # allows at least that many, or tune these env vars down.
     app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
+        "poolclass": InstrumentedQueuePool,
         "pool_size": int(os.environ.get('DB_POOL_SIZE', 5)),
         "max_overflow": int(os.environ.get('DB_MAX_OVERFLOW', 5)),
         "pool_recycle": 1800,
@@ -591,6 +649,40 @@ google = oauth.register(
 serializer = URLSafeTimedSerializer(app.config['SECRET_KEY'])
 
 db.init_app(app)
+
+_pool_lock = threading.Lock()
+_pool_checked_out = 0
+
+
+@event.listens_for(Pool, 'checkout')
+def _pool_checkout(_dbapi_connection, _connection_record, _connection_proxy):
+    global _pool_checked_out
+    with _pool_lock:
+        _pool_checked_out += 1
+        runtime_metrics.gauge('db.pool.checked_out', _pool_checked_out)
+    runtime_metrics.increment('db.pool.checkouts')
+
+
+@event.listens_for(Pool, 'checkin')
+def _pool_checkin(_dbapi_connection, _connection_record):
+    global _pool_checked_out
+    with _pool_lock:
+        _pool_checked_out = max(0, _pool_checked_out - 1)
+        runtime_metrics.gauge('db.pool.checked_out', _pool_checked_out)
+
+
+@event.listens_for(Engine, 'before_cursor_execute')
+def _query_started(connection, _cursor, _statement, _parameters, _context, _many):
+    connection.info.setdefault('scanmark_query_started', []).append(time.perf_counter())
+
+
+@event.listens_for(Engine, 'after_cursor_execute')
+def _query_finished(connection, _cursor, _statement, _parameters, _context, _many):
+    starts = connection.info.get('scanmark_query_started')
+    if starts:
+        runtime_metrics.observe_ms('db.query', (time.perf_counter() - starts.pop()) * 1000)
+        runtime_metrics.increment('db.queries')
+
 login_manager = LoginManager()
 login_manager.init_app(app)
 login_manager.login_view = 'login'
@@ -688,10 +780,23 @@ def calculate_distance(lat1, lon1, lat2, lon2):
 # FIX #4: Class locations stored in Redis, not a global dict
 # ------------------------------------------------------------------
 
+def _redis_timed(operation, function, *args, **kwargs):
+    started = time.perf_counter()
+    try:
+        return function(*args, **kwargs)
+    finally:
+        runtime_metrics.observe_ms(
+            f'redis.{operation}', (time.perf_counter() - started) * 1000
+        )
+        runtime_metrics.increment(f'redis.{operation}')
+
 def set_class_location(course_id, lat, lon):
     """Store lecturer's class location in Redis (expires after 4 hours)."""
     if redis_client:
-        redis_client.setex(f"class_location:{course_id}", 14400, f"{lat},{lon}")
+        _redis_timed(
+            'setex', redis_client.setex,
+            f"class_location:{course_id}", 14400, f"{lat},{lon}"
+        )
     else:
         # Local-dev fallback: module-level dict (single process only)
         _local_locations[course_id] = {'lat': lat, 'lon': lon}
@@ -700,7 +805,7 @@ def set_class_location(course_id, lat, lon):
 def get_class_location(course_id):
     """Retrieve the active class location for a course."""
     if redis_client:
-        val = redis_client.get(f"class_location:{course_id}")
+        val = _redis_timed('get', redis_client.get, f"class_location:{course_id}")
         if val:
             lat_str, lon_str = val.decode().split(',')
             return {'lat': float(lat_str), 'lon': float(lon_str)}
@@ -738,8 +843,8 @@ QR_TOKEN_TTL = 12   # seconds a single token stays valid in Redis
 QR_CODE_WINDOW = 45
 
 # Max distance (metres) between the lecturer's pinned class location and the
-# scanning student. The old code checked 500 while telling students the limit
-# was 50 — anyone within half a kilometre could mark attendance. 100m default
+# scanning student. The old route hard-coded 50 while its message referenced
+# the configurable 100m value. One authoritative value prevents policy drift.
 # balances anti-cheating with real-world phone GPS error inside buildings.
 GEOFENCE_RADIUS_M = int(os.environ.get('GEOFENCE_RADIUS_M', 100))
 
@@ -765,7 +870,7 @@ def generate_signed_qr(session_id: int) -> str:
     cache_key = f"qr_token:session:{session_id}"
 
     if redis_client:
-        cached = redis_client.get(cache_key)
+        cached = _redis_timed('get', redis_client.get, cache_key)
         if cached:
             return cached.decode()
 
@@ -776,7 +881,7 @@ def generate_signed_qr(session_id: int) -> str:
     token = f"{message}|{sig}"
 
     if redis_client:
-        redis_client.setex(cache_key, QR_TOKEN_TTL, token)
+        _redis_timed('setex', redis_client.setex, cache_key, QR_TOKEN_TTL, token)
 
     return token
 
@@ -786,6 +891,9 @@ def verify_signed_qr(qr_text: str):
     Verify the QR payload signature and expiry.
     Returns (session_id, timestamp) on success, or raises ValueError.
     """
+    if not isinstance(qr_text, str) or len(qr_text) > 256:
+        raise ValueError("Invalid QR code format.")
+
     parts = qr_text.split('|')
     if len(parts) != 3:
         raise ValueError("Invalid QR code format.")
@@ -800,8 +908,14 @@ def verify_signed_qr(qr_text: str):
     if not session_part.startswith('S') or not session_part[1:].isdigit():
         raise ValueError("Invalid QR code format.")
 
-    timestamp = int(timestamp_str)
-    if int(time.time()) - timestamp > QR_CODE_WINDOW:
+    try:
+        timestamp = int(timestamp_str)
+    except ValueError as exc:
+        raise ValueError("Invalid QR code format.") from exc
+    age = int(time.time()) - timestamp
+    if age < -5:
+        raise ValueError("QR code timestamp is invalid.")
+    if age > QR_CODE_WINDOW:
         raise ValueError("QR code has expired. Please scan again.")
 
     return int(session_part[1:]), timestamp
@@ -939,8 +1053,9 @@ def forgot_password():
                 f"Click the link below (valid for 15 minutes):\n\n{reset_url}\n\n"
                 "If you did not make this request, ignore this email.\n"
             )
-            # 🚨 FIX: Use email_executor instead of Thread to prevent crashes
-            email_executor.submit(send_async_email, app, msg)
+            # Use the bounded notification executor instead of a per-request thread.
+            if notification_work_executor.submit(send_async_email, app, msg) is None:
+                app.logger.warning('notification queue full; reset email dropped')
 
         # Always show the same message to prevent email enumeration
         flash("If an account with that email exists, a password reset link has been sent.", "info")
@@ -982,9 +1097,24 @@ def home():
 
 
 @app.route('/healthz', methods=['GET', 'HEAD'])
+@limiter.exempt
 def healthz():
     """Process-only probe used to overlap a cold start with CampOS SSO."""
     return '', 204
+
+
+@app.route('/internal/metrics')
+@limiter.exempt
+def internal_metrics():
+    """Prometheus text endpoint protected by an optional bearer token."""
+    expected = os.environ.get('METRICS_TOKEN', '')
+    if expected:
+        supplied = request.headers.get('Authorization', '')
+        if not hmac.compare_digest(supplied, f'Bearer {expected}'):
+            return '', 404
+    elif is_production_environment():
+        return '', 404
+    return Response(runtime_metrics.prometheus(), mimetype='text/plain')
 
 
 @app.route('/login/google')
@@ -1488,8 +1618,12 @@ def hod_dashboard():
         flash("Access denied. Redirecting to your dashboard.", "warning")
         return redirect_by_role(current_user.role)
 
-    courses = Course.query.filter_by(department=current_user.department).all()
-    return render_template('hod_dashboard.html', courses=courses, dept=current_user.department)
+    page = max(1, request.args.get('page', default=1, type=int) or 1)
+    pagination = (Course.query.filter_by(department=current_user.department)
+                  .order_by(Course.code.asc())
+                  .paginate(page=page, per_page=50, error_out=False))
+    return render_template('hod_dashboard.html', courses=pagination.items,
+                           pagination=pagination, dept=current_user.department)
 
 
 @app.route('/hod_analytics')
@@ -1516,12 +1650,12 @@ def dean_dashboard():
         flash("Access denied. Redirecting to your dashboard.", "warning")
         return redirect_by_role(current_user.role)
 
-    courses = Course.query.filter_by(faculty=current_user.faculty).all()
-    lecturers = User.query.filter_by(role='lecturer', faculty=current_user.faculty).all()
+    course_count = Course.query.filter_by(faculty=current_user.faculty).count()
+    lecturer_count = User.query.filter_by(role='lecturer', faculty=current_user.faculty).count()
     return render_template('dean_dashboard.html',
                            faculty=current_user.faculty,
-                           courses=courses,
-                           lecturers=lecturers)
+                           course_count=course_count,
+                           lecturer_count=lecturer_count)
 
 
 @app.route('/dap_dashboard')
@@ -1536,11 +1670,9 @@ def dap_dashboard():
 
     total_students = User.query.filter_by(role='student').count()
     total_courses = Course.query.count()
-    all_courses = Course.query.all()
     return render_template('dap_dashboard.html',
                            total_students=total_students,
-                           total_courses=total_courses,
-                           courses=all_courses)
+                           total_courses=total_courses)
 
 
 @app.route('/dap_analytics')
@@ -1697,6 +1829,10 @@ def _is_course_authorized(course):
     return is_coordinator or is_instructor
 
 
+_daily_session_locks = {}
+_daily_session_locks_guard = threading.Lock()
+
+
 def _get_or_create_todays_session(course):
     """
     Return today's ClassSession for a course, creating it if the lecturer
@@ -1704,20 +1840,40 @@ def _get_or_create_todays_session(course):
     the SAME session, so a refresh never fragments one class meeting into
     several record sets — while next week's class gets a brand-new session.
     """
-    today = datetime.utcnow().date()
-    session_row = (ClassSession.query
-                   .filter(ClassSession.course_id == course.id,
-                           func.date(ClassSession.date_created) == today)
-                   .order_by(ClassSession.date_created.desc())
-                   .first())
-    if not session_row:
+    with _daily_session_locks_guard:
+        course_lock = _daily_session_locks.setdefault(course.id, threading.Lock())
+
+    with course_lock:
+        now = _utcnow()
+        day_start = datetime.combine(now.date(), datetime.min.time())
+        day_end = day_start + timedelta(days=1)
+
+        # The in-process lock covers threads and local SQLite.  The advisory
+        # transaction lock serializes this decision across Gunicorn workers.
+        if db.session.get_bind().dialect.name == 'postgresql':
+            db.session.execute(
+                db.text('SELECT pg_advisory_xact_lock(:namespace, :course_id)'),
+                {'namespace': 835_211, 'course_id': course.id},
+            )
+
+        session_row = (ClassSession.query
+                       .filter(ClassSession.course_id == course.id,
+                               ClassSession.date_created >= day_start,
+                               ClassSession.date_created < day_end)
+                       .order_by(ClassSession.date_created.desc())
+                       .first())
+        if session_row:
+            db.session.commit()
+            return session_row
+
         session_row = ClassSession(
             course_id=course.id,
-            title=f"Lecture on {datetime.utcnow().strftime('%b %d, %Y')}"
+            title=f"Lecture on {now.strftime('%b %d, %Y')}",
+            date_created=now,
         )
         db.session.add(session_row)
         db.session.commit()
-    return session_row
+        return session_row
 
 
 @app.route('/generate_qr/<int:course_id>')
@@ -1781,7 +1937,7 @@ def get_qr_image(session_id):
     # instead of re-encoding on every poll.
     png_cache_key = f"qr_png:{qr_text}"
     if redis_client:
-        cached_png = redis_client.get(png_cache_key)
+        cached_png = _redis_timed('get', redis_client.get, png_cache_key)
         if cached_png:
             return send_file(io.BytesIO(cached_png), mimetype='image/png')
 
@@ -1792,7 +1948,8 @@ def get_qr_image(session_id):
         img.save(buf, format="PNG")
         png_bytes = buf.getvalue()
         if redis_client:
-            redis_client.setex(png_cache_key, QR_TOKEN_TTL, png_bytes)
+            _redis_timed('setex', redis_client.setex,
+                         png_cache_key, QR_TOKEN_TTL, png_bytes)
         return send_file(io.BytesIO(png_bytes), mimetype='image/png')
     except ImportError:
         return "QR code library not installed", 500
@@ -1802,9 +1959,10 @@ def get_qr_image(session_id):
 @login_required
 @limiter.exempt
 def get_session_attendees(session_id):
-    """Live roll-call feed for the projector page: who has scanned THIS session."""
-    session_row = ClassSession.query.get_or_404(session_id)
-    course = Course.query.get_or_404(session_row.course_id)
+    """Incremental roll-call feed; ``after`` is the last attendance id seen."""
+    feed_started = time.perf_counter()
+    session_row = db.get_or_404(ClassSession, session_id)
+    course = db.get_or_404(Course, session_row.course_id)
     if not _is_course_authorized(course):
         return jsonify({"error": "Unauthorised"}), 403
 
@@ -1813,36 +1971,62 @@ def get_session_attendees(session_id):
     # plus one JOINed query (the old version lazy-loaded each row's student
     # — 2000 extra queries per poll — and loaded every enrolled User just
     # to count them).
-    cache_key = f"attendees_cache:{session_id}"
+    after_id = max(0, request.args.get('after', default=0, type=int) or 0)
+    batch_size = min(500, max(1, request.args.get('limit', default=250, type=int) or 250))
+    cache_key = f"attendees_summary:{session_id}"
+    present = enrolled_total = None
     if redis_client:
-        cached = redis_client.get(cache_key)
+        cached = _redis_timed('get', redis_client.get, cache_key)
         if cached:
-            return Response(cached, mimetype='application/json')
+            try:
+                summary = json.loads(cached)
+                present = int(summary['present'])
+                enrolled_total = int(summary['enrolled'])
+            except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+                present = enrolled_total = None
 
-    rows = (db.session.query(Attendance.timestamp, User.full_name,
+    if present is None:
+        present = (db.session.query(func.count(Attendance.id))
+                   .filter(Attendance.session_id == session_id)
+                   .scalar()) or 0
+        enrolled_total = _enrolled_count(course.id)
+        if redis_client:
+            _redis_timed('setex', redis_client.setex, cache_key, 2, json.dumps({
+                'present': present,
+                'enrolled': enrolled_total,
+            }))
+
+    rows = (db.session.query(Attendance.id, Attendance.timestamp, User.full_name,
                              User.matric_no, User.level)
             .join(User, User.id == Attendance.student_id)
-            .filter(Attendance.session_id == session_id)
-            .order_by(Attendance.timestamp.desc())
+            .filter(Attendance.session_id == session_id,
+                    Attendance.id > after_id)
+            .order_by(Attendance.id.asc())
+            .limit(batch_size + 1)
             .all())
+    has_more = len(rows) > batch_size
+    rows = rows[:batch_size]
     attendees = [{
+        "id": attendance_id,
         "name": full_name or "Unknown",
         "matric_no": matric_no or "N/A",
         "level": level or "N/A",
         "time": ts.strftime('%I:%M %p') if ts else "",
-    } for ts, full_name, matric_no, level in rows]
+    } for attendance_id, ts, full_name, matric_no, level in rows]
 
-    enrolled_total = _enrolled_count(course.id)
-
-    payload = json.dumps({
+    payload = {
         "status": "success",
-        "present": len(attendees),
+        "present": present,
         "enrolled": enrolled_total,
-        "attendees": attendees,
-    })
-    if redis_client:
-        redis_client.setex(cache_key, 3, payload)
-    return Response(payload, mimetype='application/json')
+        "new_attendees": attendees,
+        "last_id": attendees[-1]['id'] if attendees else after_id,
+        "has_more": has_more,
+    }
+    runtime_metrics.observe_ms(
+        'attendee_feed.response', (time.perf_counter() - feed_started) * 1000
+    )
+    runtime_metrics.increment('attendee_feed.requests')
+    return jsonify(payload)
 
 
 @app.route('/scan_page')
@@ -1984,129 +2168,212 @@ def _post_scan_notifications(app_instance, student_id, course_id, timestamp_str)
                 mail_func=send_email,
                 Attendance_model=Attendance,
                 ClassSession_model=ClassSession,
-                db_session=db.session
+                db_session=db.session,
+                preference=pref,
             )
         except Exception as e:
             print(f"⚠️ Post-scan notification error for user {student_id}: {e}")
+
+
+def _insert_attendance_once(student_id, course_id, session_id, device_id, scanned_at):
+    """Atomically insert one attendance row and return its id, or ``None``."""
+    values = {
+        'student_id': student_id,
+        'course_id': course_id,
+        'session_id': session_id,
+        'device_id': device_id,
+        'timestamp': scanned_at,
+    }
+    dialect = db.session.get_bind().dialect.name
+    if dialect in {'postgresql', 'sqlite'}:
+        if dialect == 'postgresql':
+            from sqlalchemy.dialects.postgresql import insert
+        else:
+            from sqlalchemy.dialects.sqlite import insert
+        statement = (insert(Attendance)
+                     .values(**values)
+                     .on_conflict_do_nothing(
+                         index_elements=['student_id', 'session_id'])
+                     .returning(Attendance.id))
+        record_id = db.session.execute(statement).scalar_one_or_none()
+        if record_id is None:
+            db.session.rollback()
+            return None
+        db.session.commit()
+        return record_id
+
+    try:
+        record = Attendance(**values)
+        db.session.add(record)
+        db.session.commit()
+        return record.id
+    except IntegrityError:
+        db.session.rollback()
+        return None
 
 
 @app.route('/mark_attendance', methods=['POST'])
 @limiter.limit("10 per minute", error_message="Too many scan attempts. Please wait.")
 @login_required
 def mark_attendance():
+    request_started = time.perf_counter()
+    stage_started = request_started
+    stages = {}
+
+    def checkpoint(name):
+        nonlocal stage_started
+        now = time.perf_counter()
+        duration_ms = (now - stage_started) * 1000
+        stages[name] = duration_ms
+        runtime_metrics.observe_ms(f'scan.stage.{name}', duration_ms)
+        stage_started = now
+
+    def respond(status, message, http_status, outcome):
+        total_ms = (time.perf_counter() - request_started) * 1000
+        runtime_metrics.observe_ms('scan.response', total_ms)
+        runtime_metrics.increment(f'scan.outcome.{outcome}')
+        sample_rate = max(0.0, min(1.0, float(os.environ.get('SCAN_LOG_SAMPLE_RATE', '0.02'))))
+        if status != 'success' or secrets.randbelow(10000) < int(sample_rate * 10000):
+            app.logger.info('scan_performance %s', json.dumps({
+                'outcome': outcome,
+                'total_ms': round(total_ms, 2),
+                'stages_ms': {key: round(value, 2) for key, value in stages.items()},
+            }, separators=(',', ':')))
+        response = jsonify({'status': status, 'message': message})
+        response.headers['Server-Timing'] = ', '.join(
+            f'{name};dur={value:.2f}' for name, value in stages.items()
+        )
+        return response, http_status
+
     data = request.get_json(silent=True) or {}
     qr_text = data.get('qr_data')
-    student_lat = data.get('lat')
-    student_lon = data.get('lon')
+    if not qr_text:
+        return respond('error', 'No QR data provided.', 400, 'missing_qr')
 
     try:
-        if not qr_text:
-            return jsonify({"status": "error", "message": "No QR data provided."})
+        session_id, _token_timestamp = verify_signed_qr(qr_text)
+    except ValueError as error:
+        return respond('error', str(error), 400, 'invalid_qr')
+    checkpoint('qr_verify')
 
-        # FIX #3 & #5: Verify the signed token (3-part format: S<id>|ts|sig)
-        try:
-            session_id, timestamp = verify_signed_qr(qr_text)
-        except ValueError as ve:
-            return jsonify({"status": "error", "message": str(ve)})
-
-        class_session = ClassSession.query.get(session_id)
-        if not class_session:
-            return jsonify({"status": "error", "message": "Invalid QR Code: Class session not found."})
-
-        course = Course.query.get(class_session.course_id)
-        course_id = class_session.course_id
-        if not course:
-            return jsonify({"status": "error", "message": "Invalid QR Code: Course not found."})
-
-        # Enrolment check
-        if hasattr(current_user, 'enrolled_courses'):
-            if course not in current_user.enrolled_courses:
-                return jsonify({
-                    "status": "error",
-                    "message": f"🚫 Access Denied: You are not registered for {course.code}."
-                })
-
-        # Duplicate check: one scan per student per CLASS SESSION.
-        # Next week's lecture is a new session, so scanning again then is fine.
-        existing = Attendance.query.filter_by(
-            student_id=current_user.id,
-            session_id=session_id
-        ).first()
-
-        if existing:
-            return jsonify({
-                "status": "error",
-                "message": "You are already marked present for this class! Double-scanning is not allowed."
-            })
-
-        # FIX #4: Retrieve location from Redis
-        class_loc = get_class_location(course_id)
-        if class_loc:
-            if not student_lat or not student_lon:
-                return jsonify({"status": "error", "message": "Location required! Please allow GPS access."})
-
-            dist = calculate_distance(
-                class_loc['lat'], class_loc['lon'],
-                float(student_lat), float(student_lon)
-            )
-            if dist > 50:
-                return jsonify({
-                    "status": "error",
-                    "message": f"Too far from classroom. You are {int(dist)}m away (max {GEOFENCE_RADIUS_M}m)."
-                })
-
-        new_record = Attendance(
-            student_id=current_user.id,
-            course_id=course_id,
-            session_id=session_id,
-            device_id=data.get('device_id', 'browser')
+    target = db.session.execute(
+        select(
+            ClassSession.id.label('session_id'),
+            ClassSession.title.label('session_title'),
+            Course.id.label('course_id'),
+            Course.code.label('course_code'),
+            Course.title.label('course_title'),
         )
-        db.session.add(new_record)
-        try:
-            db.session.commit()
-        except IntegrityError:
-            # Two simultaneous requests from the same student both passed the
-            # SELECT above; the unique index on (student_id, session_id)
-            # keeps the second insert out.
-            db.session.rollback()
-            return jsonify({
-                "status": "error",
-                "message": "You are already marked present for this class! Double-scanning is not allowed."
-            })
+        .join(Course, Course.id == ClassSession.course_id)
+        .where(ClassSession.id == session_id)
+    ).mappings().one_or_none()
+    checkpoint('session_course')
+    if target is None:
+        return respond('error', 'Invalid QR Code: Class session not found.', 404, 'missing_session')
 
-        # Report to CampOS Core (best-effort, async — never blocks the scan).
+    user_marker = data.get('user_marker')
+    if user_marker is not None and str(user_marker) != str(current_user.id):
+        return respond('error', 'Queued scan belongs to a different signed-in user.', 409, 'wrong_user_queue')
+
+    enrolled = db.session.execute(
+        select(enrollments.c.user_id)
+        .where(enrollments.c.user_id == current_user.id,
+               enrollments.c.course_id == target['course_id'])
+        .limit(1)
+    ).scalar_one_or_none()
+    checkpoint('enrollment')
+    if enrolled is None:
+        return respond(
+            'error',
+            f"Access Denied: You are not registered for {target['course_code']}.",
+            403,
+            'not_enrolled',
+        )
+
+    class_loc = get_class_location(target['course_id'])
+    if class_loc:
         try:
-            scanned_iso = (new_record.timestamp.isoformat() + "Z") if new_record.timestamp else None
-            email_executor.submit(
-                report_attendance_to_campos,
-                current_user.matric_no,
-                current_user.email,
-                course.code,
-                course.title,
-                class_session.id,
-                class_session.title,
-                f'scanmark-attendance:{new_record.id}',
-                scanned_iso,
+            student_lat = float(data['lat'])
+            student_lon = float(data['lon'])
+        except (KeyError, TypeError, ValueError):
+            return respond('error', 'Location required! Please allow GPS access.', 422, 'missing_location')
+        if not (-90 <= student_lat <= 90 and -180 <= student_lon <= 180):
+            return respond('error', 'Location coordinates are invalid.', 422, 'invalid_location')
+        location_age_ms = data.get('location_age_ms')
+        if isinstance(location_age_ms, (int, float)) and location_age_ms > 30000:
+            return respond('error', 'Location fix is stale. Please scan again.', 422, 'stale_location')
+        distance_m = calculate_distance(
+            class_loc['lat'], class_loc['lon'], student_lat, student_lon
+        )
+        if distance_m > GEOFENCE_RADIUS_M:
+            return respond(
+                'error',
+                f'Too far from classroom. You are {int(distance_m)}m away '
+                f'(max {GEOFENCE_RADIUS_M}m).',
+                422,
+                'outside_geofence',
             )
-        except Exception as e:
-            print(f"⚠️ Could not queue CampOS attendance report: {e}")
+    checkpoint('geofence')
 
-        # Confirmation email, WhatsApp, parent alerts and the early-warning
-        # check all run AFTER the response, on the executor — see
-        # _post_scan_notifications above.
-        timestamp_str = datetime.now().strftime('%B %d, %Y at %I:%M %p')
+    client_metrics = data.get('client_metrics')
+    if isinstance(client_metrics, dict):
+        for metric_name in ('camera_ready_ms', 'qr_decode_ms', 'gps_wait_ms', 'capture_to_request_ms'):
+            value = client_metrics.get(metric_name)
+            if isinstance(value, (int, float)) and 0 <= value <= 120000:
+                runtime_metrics.observe_ms(f'client.{metric_name}', value)
+
+    scanned_at = _utcnow()
+    record_id = _insert_attendance_once(
+        current_user.id,
+        target['course_id'],
+        target['session_id'],
+        str(data.get('device_id') or 'browser')[:200],
+        scanned_at,
+    )
+    checkpoint('db_insert')
+    if record_id is None:
+        return respond(
+            'error',
+            'You are already marked present for this class! Double-scanning is not allowed.',
+            409,
+            'duplicate',
+        )
+
+    if redis_client:
         try:
-            email_executor.submit(
-                _post_scan_notifications, app, current_user.id, course_id, timestamp_str
+            _redis_timed('delete', redis_client.delete,
+                f"attendees_summary:{target['session_id']}",
+                f"attendees_cache:{target['session_id']}",
             )
-        except Exception as e:
-            print(f"⚠️ Could not queue post-scan notifications: {e}")
+        except redis.RedisError:
+            runtime_metrics.increment('redis.invalidation_errors')
 
-        return jsonify({"status": "success", "message": "Attendance marked successfully! ✅"})
+    scanned_iso = scanned_at.isoformat() + 'Z'
+    if campos_executor.submit(
+        report_attendance_to_campos,
+        current_user.matric_no,
+        current_user.email,
+        target['course_code'],
+        target['course_title'],
+        target['session_id'],
+        target['session_title'],
+        f'scanmark-attendance:{record_id}',
+        scanned_iso,
+    ) is None:
+        app.logger.warning('CampOS delivery queue full; attendance id %s not queued', record_id)
 
-    except Exception as e:
-        print(f"❌ Server error in mark_attendance: {e}")
-        return jsonify({"status": "error", "message": "An unexpected server error occurred."})
+    timestamp_str = datetime.now().strftime('%B %d, %Y at %I:%M %p')
+    if notification_work_executor.submit(
+        _post_scan_notifications,
+        app,
+        current_user.id,
+        target['course_id'],
+        timestamp_str,
+    ) is None:
+        app.logger.warning('notification queue full; attendance id %s not queued', record_id)
+    checkpoint('enqueue')
+
+    return respond('success', 'Attendance marked successfully!', 200, 'success')
 
 
 def _attendance_authorized(course):
@@ -2145,12 +2412,14 @@ def view_attendance(course_id):
     # the loop below fires one query per session plus one per attendance row
     # when the template prints student names (a semester of 2000-student
     # sessions = tens of thousands of queries on one page view).
-    sessions = (ClassSession.query
-                .options(selectinload(ClassSession.attendances)
-                         .selectinload(Attendance.student))
-                .filter_by(course_id=course_id)
-                .order_by(ClassSession.date_created.desc())
-                .all())
+    page = max(1, request.args.get('page', default=1, type=int) or 1)
+    pagination = (ClassSession.query
+                  .options(selectinload(ClassSession.attendances)
+                           .selectinload(Attendance.student))
+                  .filter_by(course_id=course_id)
+                  .order_by(ClassSession.date_created.desc())
+                  .paginate(page=page, per_page=10, error_out=False))
+    sessions = pagination.items
 
     enrolled_total = _enrolled_count(course_id)
 
@@ -2167,8 +2436,11 @@ def view_attendance(course_id):
             'pct': pct,
         })
 
-    total_scans = sum(s['present'] for s in sessions_data)
-    avg_present = round(total_scans / len(sessions_data)) if sessions_data else 0
+    total_scans = (db.session.query(func.count(Attendance.id))
+                   .filter(Attendance.course_id == course_id,
+                           Attendance.session_id.isnot(None))
+                   .scalar()) or 0
+    avg_present = round(total_scans / pagination.total) if pagination.total else 0
 
     # Rows that never got adopted by the startup backfill (shouldn't happen)
     unassigned = Attendance.query.filter_by(course_id=course_id) \
@@ -2180,12 +2452,38 @@ def view_attendance(course_id):
                            enrolled_total=enrolled_total,
                            avg_present=avg_present,
                            unassigned=unassigned,
+                           pagination=pagination,
                            can_manage=_is_course_authorized(course))
 
 
 def _csv_cell(value):
     """Quote a value for CSV, escaping embedded double quotes."""
     return '"' + str(value if value is not None else "N/A").replace('"', '""') + '"'
+
+
+class _StreamingCSVBuffer:
+    """Append-compatible CSV spool which streams and spills beyond 1 MiB."""
+
+    def __init__(self, initial=''):
+        self._file = tempfile.SpooledTemporaryFile(
+            max_size=1024 * 1024, mode='w+t', encoding='utf-8', newline=''
+        )
+        self._file.write(initial)
+
+    def __iadd__(self, value):
+        self._file.write(value)
+        return self
+
+    def __iter__(self):
+        self._file.seek(0)
+        try:
+            while True:
+                chunk = self._file.read(64 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            self._file.close()
 
 
 @app.route('/course/<int:course_id>/download_csv')
@@ -2196,7 +2494,7 @@ def download_csv(course_id):
     column per class session held, plus attended/total/% columns.
     With ?session_id=<id>: the sheet for that single class meeting.
     """
-    course = Course.query.get_or_404(course_id)
+    course = db.get_or_404(Course, course_id)
 
     if not getattr(course, 'coordinator_id') == current_user.id and current_user not in getattr(course, 'instructors', []):
         return "Unauthorised", 403
@@ -2216,7 +2514,9 @@ def download_csv(course_id):
         records = {rec.student_id: rec for rec in session_records}
         enrolled = list(course.students) if hasattr(course, 'students') else []
 
-        csv_data = "Matric Number,Full Name,Level,Status,Time Scanned,Device ID\n"
+        csv_data = _StreamingCSVBuffer(
+            "Matric Number,Full Name,Level,Status,Time Scanned,Device ID\n"
+        )
         listed_ids = set()
         for student in sorted(enrolled, key=lambda s: (s.matric_no or '', s.full_name or '')):
             listed_ids.add(student.id)
@@ -2281,7 +2581,7 @@ def download_csv(course_id):
 
     header = ["Matric Number", "Full Name", "Level"] + session_labels + \
              ["Classes Attended", "Classes Held", "Attendance %"]
-    csv_data = ",".join(_csv_cell(h) for h in header) + "\n"
+    csv_data = _StreamingCSVBuffer(",".join(_csv_cell(h) for h in header) + "\n")
 
     all_students = sorted(students_by_id.values(),
                           key=lambda s: (s.matric_no or '', s.full_name or ''))
@@ -2428,7 +2728,7 @@ def notification_settings():
 def run_weekly_reports():
     """Generate and email weekly PDF reports for all opted-in users."""
     with app.app_context():
-        today = datetime.utcnow().date()
+        today = _utcnow().date()
         week_end = today
         week_start = today - timedelta(days=7)
         week_range = f"{week_start.strftime('%d %b')} — {week_end.strftime('%d %b %Y')}"
@@ -2622,6 +2922,17 @@ def ratelimit_handler(e):
     # 🚨 STOPS THE LOOP BY RENDERING HTML DIRECTLY
     return f"<h2>Too Many Requests!</h2><p>Please wait a minute and <a href='{url_for('dashboard')}'>try again</a>.</p>", 429
 
+
+@app.errorhandler(500)
+def internal_error_handler(error):
+    runtime_metrics.increment('http.500')
+    if request.path == '/mark_attendance' or request.is_json:
+        return jsonify({
+            'status': 'error',
+            'message': 'The server is temporarily unavailable. Please retry.',
+        }), 500
+    return 'Internal server error', 500
+
 # ============================================================
 # DATABASE INITIALIZATION & SCHEDULER
 # ============================================================
@@ -2710,7 +3021,7 @@ with app.app_context():
         if orphans:
             by_course_day = {}
             for rec in orphans:
-                day = (rec.timestamp or datetime.utcnow()).date()
+                day = (rec.timestamp or _utcnow()).date()
                 by_course_day.setdefault((rec.course_id, day), []).append(rec)
 
             for (course_id, day), recs in sorted(by_course_day.items(),
@@ -2721,7 +3032,7 @@ with app.app_context():
                 ).first()
                 if not session_row:
                     first_ts = min((r.timestamp for r in recs if r.timestamp),
-                                   default=datetime.utcnow())
+                                   default=_utcnow())
                     session_row = ClassSession(
                         course_id=course_id,
                         title=f"Lecture on {day.strftime('%b %d, %Y')}",
@@ -2766,10 +3077,14 @@ with app.app_context():
             " ON attendance (student_id, session_id)",
             "CREATE INDEX IF NOT EXISTS ix_attendance_session_id"
             " ON attendance (session_id)",
+            "CREATE INDEX IF NOT EXISTS ix_attendance_session_cursor"
+            " ON attendance (session_id, id)",
             "CREATE INDEX IF NOT EXISTS ix_attendance_course_student"
             " ON attendance (course_id, student_id)",
             "CREATE INDEX IF NOT EXISTS ix_enrollments_course_id"
             " ON enrollments (course_id)",
+            "CREATE INDEX IF NOT EXISTS ix_course_instructors_course_id"
+            " ON course_instructors (course_id)",
             "CREATE INDEX IF NOT EXISTS ix_class_session_course_id"
             " ON class_session (course_id)",
         ):
@@ -2780,27 +3095,39 @@ with app.app_context():
                 conn.rollback()
                 print(f"[MIGRATION] Index creation failed (will retry next boot): {e}")
 
+    # Release the scoped session before disposing preload connections.  This
+    # also keeps in-memory SQLite smoke tests from tearing down a live session.
+    db.session.remove()
     db.engine.dispose()  # Forces Gunicorn workers to create fresh connections
     print("[OK] Database initialized successfully!")
 
 # APScheduler: Weekly reports every Monday at 7 AM
 try:
     from apscheduler.schedulers.background import BackgroundScheduler
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(
-        func=run_weekly_reports,
-        trigger='cron',
-        day_of_week='mon',
-        hour=7,
-        minute=0,
-        id='weekly_reports',
-        replace_existing=True
-    )
-    scheduler.start()
-    print("📅 Weekly Report Scheduler Active (Every Monday @ 7:00 AM)")
+    scheduler = None
+    if os.environ.get('SCANMARK_DISABLE_SCHEDULER', '').lower() not in {'1', 'true', 'yes'}:
+        scheduler = BackgroundScheduler()
+        scheduler.add_job(
+            func=run_weekly_reports,
+            trigger='cron',
+            day_of_week='mon',
+            hour=7,
+            minute=0,
+            id='weekly_reports',
+            replace_existing=True
+        )
+        scheduler.start()
+        print("[OK] Weekly report scheduler active (Monday 07:00)")
 except ImportError:
     print("⚠️  APScheduler not installed. Weekly reports won't run automatically.")
     print("   Install with: pip install APScheduler")
+
+@atexit.register
+def _shutdown_scheduler():
+    active_scheduler = globals().get('scheduler')
+    if active_scheduler and active_scheduler.running:
+        active_scheduler.shutdown(wait=False)
+
 
 if __name__ == '__main__':
     print("\n" + "="*60)

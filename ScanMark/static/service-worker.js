@@ -1,93 +1,78 @@
-// v2: the v1 pre-cache list included URLs that don't exist (/base.html,
-// /static/script.js) — cache.addAll() rejects if ANY url 404s, so the
-// service worker never actually installed and offline mode never worked.
-const CACHE_NAME = 'scanmark-cache-v2';
-const urlsToCache = [
+const CACHE_NAME = 'scanmark-cache-v3';
+const STATIC_ASSETS = [
     '/static/style.css',
     '/static/logo.png',
     '/static/logo-192.png',
     '/static/manifest.json',
+    '/static/scanner.js',
+    '/static/vendor/jsQR.min.js'
 ];
 
-// 1. Install & Cache Static Files
 self.addEventListener('install', event => {
     self.skipWaiting();
-    event.waitUntil(
-        caches.open(CACHE_NAME).then(cache => cache.addAll(urlsToCache))
-    );
+    event.waitUntil(caches.open(CACHE_NAME).then(cache => cache.addAll(STATIC_ASSETS)));
 });
 
-// 2. Clean Up Old Caches
 self.addEventListener('activate', event => {
     event.waitUntil(
-        caches.keys().then(keys =>
-            Promise.all(keys.filter(k => k !== CACHE_NAME).map(k => caches.delete(k)))
-        )
+        caches.keys().then(keys => Promise.all(
+            keys.filter(key => key !== CACHE_NAME).map(key => caches.delete(key))
+        )).then(() => self.clients.claim())
     );
 });
 
-// 3. THE UPGRADED FETCH ENGINE
 self.addEventListener('fetch', event => {
-    // SCENARIO A: The user is trying to submit an attendance scan (POST request)
-    if (event.request.url.includes('/mark_attendance') && event.request.method === 'POST') {
-        event.respondWith(
-            fetch(event.request.clone()).catch(async () => {
-                console.log("📶 Network dead. Saving scan to local offline queue...");
-
-                // Read the scan data the student tried to send
-                const scanData = await event.request.clone().json();
-
-                // Save it to the phone's local IndexedDB (Offline Storage)
-                await saveScanOffline(scanData);
-
-                // Honest message: the sync is attempted later, but the QR
-                // token may have expired by then and need a fresh scan.
-                return new Response(JSON.stringify({
-                    status: "success",
-                    message: "📶 No network — scan saved on this phone. It will try to sync automatically; if the class QR has expired by then, please scan again."
-                }), {
-                    headers: { 'Content-Type': 'application/json' }
-                });
-            })
-        );
-        return; // Stop here so it doesn't run the static cache logic below
+    const url = new URL(event.request.url);
+    if (url.pathname === '/mark_attendance' && event.request.method === 'POST') {
+        event.respondWith(handleAttendanceRequest(event.request));
+        return;
     }
-
-    // SCENARIO B: Static assets only — cache-first. Dynamic pages
-    // (dashboards, login, APIs) always go to the network: serving them
-    // from cache would show stale, per-user content.
-    if (event.request.method === 'GET' && urlsToCache.some(u => event.request.url.endsWith(u))) {
-        event.respondWith(
-            caches.match(event.request).then(response => response || fetch(event.request))
-        );
+    if (event.request.method === 'GET' && STATIC_ASSETS.includes(url.pathname)) {
+        event.respondWith(caches.match(event.request).then(cached => cached || fetch(event.request)));
     }
-    // Everything else: browser default (no interception).
 });
 
-// --- HELPER DATABASE FUNCTION ---
-// This creates a mini-database right inside the student's phone browser
-function saveScanOffline(data) {
+async function handleAttendanceRequest(request) {
+    const networkRequest = request.clone();
+    const queueRequest = request.clone();
+    try {
+        const response = await fetch(networkRequest);
+        if (response.status < 500) return response;
+        throw new Error(`transient HTTP ${response.status}`);
+    } catch (_) {
+        const data = await queueRequest.json();
+        data.queued_at = new Date().toISOString();
+        data.dedupe_key = `${data.user_marker || 'anonymous'}:${data.qr_data || 'missing'}`;
+        await saveScanOffline(data);
+        return new Response(JSON.stringify({
+            status: 'queued',
+            message: 'No network. This scan is queued on this phone and will retry after connectivity returns.'
+        }), {
+            status: 202,
+            headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }
+        });
+    }
+}
+
+function openOfflineDatabase() {
     return new Promise((resolve, reject) => {
-        const request = indexedDB.open('ScanMarkOfflineDB', 1);
-
+        const request = indexedDB.open('ScanMarkOfflineDB', 2);
         request.onupgradeneeded = event => {
-            const db = event.target.result;
-            if (!db.objectStoreNames.contains('scans')) {
-                db.createObjectStore('scans', { autoIncrement: true });
-            }
+            const database = event.target.result;
+            if (database.objectStoreNames.contains('scans')) database.deleteObjectStore('scans');
+            database.createObjectStore('scans', { keyPath: 'dedupe_key' });
         };
+        request.onsuccess = event => resolve(event.target.result);
+        request.onerror = () => reject(request.error);
+    });
+}
 
-        request.onsuccess = event => {
-            const db = event.target.result;
-            const transaction = db.transaction('scans', 'readwrite');
-            const store = transaction.objectStore('scans');
-
-            // Add a timestamp so we know exactly when they scanned it offline
-            data.offline_timestamp = new Date().toISOString();
-            store.add(data);
-            resolve();
-        };
-
-        request.onerror = () => reject("Failed to open offline database");
+async function saveScanOffline(data) {
+    const database = await openOfflineDatabase();
+    return new Promise((resolve, reject) => {
+        const transaction = database.transaction('scans', 'readwrite');
+        transaction.objectStore('scans').put(data);
+        transaction.oncomplete = resolve;
+        transaction.onerror = () => reject(transaction.error);
     });
 }

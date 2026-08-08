@@ -1,14 +1,14 @@
 """
 Gunicorn configuration for ScanMark.
 
-Sizing note: workers × threads = how many requests one dyno/instance can
-work on at the same time. The defaults below (4 × 8 = 32) are tuned for a
-1 GB instance and a 2000-student scan burst; override per-instance with the
-WEB_CONCURRENCY / GUNICORN_THREADS env vars instead of editing this file.
+Sizing note: workers x threads is the request-slot ceiling. The defaults below
+(4 x 8 = 32) are a starting candidate, not a 2,000-student capacity claim.
+Select 2x8, 4x8, 4x12, or 6x8 from measured staging results in
+loadtest/gunicorn-matrix.md, then override with environment variables.
 
 Postgres note: each worker keeps its own connection pool, so the server
-sees up to workers × (DB_POOL_SIZE + DB_MAX_OVERFLOW) connections
-(4 × 10 = 40 with the app defaults). Size your database plan accordingly.
+sees up to workers x (DB_POOL_SIZE + DB_MAX_OVERFLOW) connections
+(4 x 10 = 40 with the app defaults). Size your database plan accordingly.
 """
 import os
 

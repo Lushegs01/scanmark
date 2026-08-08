@@ -13,6 +13,7 @@ import hashlib
 import hmac
 import json
 import os
+import random
 import re
 import time
 from typing import Any, Mapping, NamedTuple
@@ -328,7 +329,12 @@ def report_attendance_event(
                 f"CampOS rejected attendance reporting with status {response.status_code}"
             )
         if attempt + 1 < attempts:
-            sleep(0.5 * (2 ** attempt))
+            delay = 0.5 * (2 ** attempt)
+            # Production callers get full jitter so a class burst does not
+            # retry CampOS in lock-step. Injected test sleepers stay exact.
+            if sleep is time.sleep:
+                delay *= random.uniform(0.75, 1.25)
+            sleep(delay)
 
     raise CamposIntegrationError(last_error)
 

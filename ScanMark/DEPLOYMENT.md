@@ -1,7 +1,7 @@
 # ScanMark Deployment Guide
 
-How to run ScanMark so it survives a full lecture hall (2000 students)
-logging in and scanning within a couple of minutes.
+Deployment and rehearsal guide for the 2,000-student lecture-hall target.
+Capacity is accepted only from the staging matrix below.
 
 ## Required services
 
@@ -29,12 +29,19 @@ logging in and scanning within a couple of minutes.
 | `STATIC_MAX_AGE` | 86400 | Cache-Control max-age (seconds) WhiteNoise puts on /static files. |
 | `SENTRY_DSN` | — | Optional error monitoring. |
 | `SENTRY_TRACES_SAMPLE_RATE` / `SENTRY_PROFILES_SAMPLE_RATE` | 0.1 | Raise temporarily for deep-dives; 1.0 during a burst burns quota and adds latency. |
+| `METRICS_TOKEN` | — | Required to expose `/internal/metrics` in production. Use as `Authorization: Bearer ...`. |
+| `NOTIFICATION_WORKERS` / `NOTIFICATION_QUEUE_SIZE` | 6 / 2000 | Bounded post-scan work. Alert on rejection or oldest-job age. |
+| `CAMPOS_WORKERS` / `CAMPOS_QUEUE_SIZE` | 4 / 2000 | Separate bounded CampOS delivery path. |
+| `OUTBOUND_NOTIFICATION_WORKERS` / `OUTBOUND_NOTIFICATION_QUEUE_SIZE` | 3 / 2000 | Provider delivery pool. |
+| `SCAN_LOG_SAMPLE_RATE` | 0.02 | Privacy-safe successful scan timing sample; all error outcomes log. |
+| `SCANMARK_DISABLE_SCHEDULER` | false | Set only in tests or a deployment where scheduling is owned externally. |
 | `QR window` | 45s (code) | `QR_CODE_WINDOW` in app.py — how stale a scanned token may be when *processed*. Tied to router timeout; change in code, not env. |
 
 ## Scaling checklist
 
-1. **One instance** (defaults): ~32 concurrent requests, Postgres ≥ 40
-   connections. Handles a 2000-student class arriving over 1–2 minutes.
+1. **One instance** (defaults): 32 request slots and an application-side
+   Postgres ceiling of 40 connections. This is a staging candidate, not a
+   capacity guarantee; accept it only after the checked-in 600/2,000 scenarios.
 2. **Scaling out** (2+ instances): connection math multiplies per instance —
    add **PgBouncer** (transaction pooling) in front of Postgres, keep
    `DB_POOL_SIZE`/`DB_MAX_OVERFLOW` modest.
@@ -61,3 +68,8 @@ locust -f loadtest/locustfile.py --host https://staging.yourdomain \
 Watch p95 latency on `/mark_attendance`, the 429/5xx rate, and
 `token expired in queue` failures (those mean requests are queueing longer
 than `QR_CODE_WINDOW`). See `loadtest/locustfile.py` for seeding details.
+
+Use the complete scenario commands in `loadtest/README.md` and the worker/thread
+decision matrix in `loadtest/gunicorn-matrix.md`. Local reproducible guards live
+under `benchmarks/`; their SQLite results are regression signals, not staging
+capacity claims. The evidence and final scorecard are in `PERFORMANCE_REPORT.md`.
