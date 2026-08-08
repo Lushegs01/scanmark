@@ -33,6 +33,14 @@ class User(UserMixin, db.Model):
     email = db.Column(db.String(120), unique=True, nullable=False)
     password = db.Column(db.String(200), nullable=False)
 
+    # Self-service signup can claim any address, including a @staff address the
+    # registrant does not own, so a password account stays unusable until the
+    # address is confirmed. Deliberately nullable: rows that predate this column
+    # read back as NULL and are treated as already-verified, so a migration
+    # never locks an existing user out. Identity-provider logins (CampOS SSO,
+    # Google) set it True outright — the provider already proved the address.
+    email_verified = db.Column(db.Boolean, default=False)
+
     enrolled_courses = db.relationship('Course', secondary=enrollments, backref='students')
     
     # Roles: 'Student', 'Lecturer', 'Course Coordinator'
@@ -148,5 +156,5 @@ class WeeklyReport(db.Model):
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     week_start = db.Column(db.Date, nullable=False)
     week_end = db.Column(db.Date, nullable=False)
-    sent_at = db.Column(db.DateTime, default=utcnow_naive)
+    sent_at = db.Column(db.DateTime, default=datetime.utcnow)
     report_type = db.Column(db.String(20), nullable=False)  # 'student' or 'lecturer'

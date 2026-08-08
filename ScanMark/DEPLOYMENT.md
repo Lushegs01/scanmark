@@ -24,6 +24,11 @@ Capacity is accepted only from the staging matrix below.
 | `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` | 5 / 5 | **Per worker.** Postgres sees up to `workers × (pool + overflow)` connections — 40 with defaults. Keep below your plan's connection cap, or put PgBouncer in front when scaling out. |
 | `SCAN_CONFIRMATION_EMAILS` | true | Set `false` during huge events to stop sending one email per scan. |
 | `GEOFENCE_RADIUS_M` | 100 | Max metres between the pinned class location and a scanning student. Phone GPS inside buildings is often 20–50m off — don't set this too tight. |
+| `REQUIRE_EMAIL_VERIFICATION` | on in production | Self-service signups must click an emailed link before their password works. **Do not turn this off in production** — the signup form accepts any address, including a `@staff` one the registrant does not own. CampOS SSO and Google sign-ins are pre-verified and unaffected. |
+| `MIN_PASSWORD_LENGTH` | 10 | Enforced identically at signup and at password reset. |
+| `ANON_RATE_LIMIT_PER_MINUTE` / `ANON_RATE_LIMIT_PER_DAY` | 20000 / 500000 | Default budget for *anonymous* requests, which are keyed by IP — one campus NAT is a single key for thousands of phones. Sensitive unauthenticated endpoints carry their own tight per-address limits on top of this. |
+| `BACKGROUND_QUEUE_MAXSIZE` / `BACKGROUND_WORKERS` | 2000 / 10 | Pending background notifications before new ones are shed. Scans are never dropped — only the courtesy email/WhatsApp. A saturated queue logs a warning. |
+| `HSTS_MAX_AGE` | 31536000 | `Strict-Transport-Security` max-age, sent in production only. |
 | `SSO_JWT_SECRET` | — | Shared secret for CampOS SSO. **No fallback**: SSO token verification is disabled until this is set (must match CampOS Core). |
 | `REMEMBER_COOKIE_DAYS` | 30 | How long "remember me" keeps students signed in. Longer = fewer morning login stampedes. |
 | `STATIC_MAX_AGE` | 86400 | Cache-Control max-age (seconds) WhiteNoise puts on /static files. |
@@ -36,6 +41,27 @@ Capacity is accepted only from the staging matrix below.
 | `SCAN_LOG_SAMPLE_RATE` | 0.02 | Privacy-safe successful scan timing sample; all error outcomes log. |
 | `SCANMARK_DISABLE_SCHEDULER` | false | Set only in tests or a deployment where scheduling is owned externally. |
 | `QR window` | 45s (code) | `QR_CODE_WINDOW` in app.py — how stale a scanned token may be when *processed*. Tied to router timeout; change in code, not env. |
+
+## Roles
+
+Only two roles can be self-assigned through the public signup form: **Lecturer**
+and **Course Coordinator**, and only from a `@staff.funaab.edu.ng` address that
+has confirmed its email. The supervisory roles — **HOD**, **Dean**, **DAP** —
+read attendance beyond a single course, so they are never handed out by the
+signup form. They arrive one of two ways:
+
+1. **CampOS SSO**, from a signed launch identity whose scope names the faculty
+   or department (see `campos_integration.py`); or
+2. **a deliberate database change** by someone who already administers the
+   deployment:
+
+   ```sql
+   UPDATE "user" SET role = 'hod', department = 'Computer Science'
+    WHERE email = 'name@staff.funaab.edu.ng';
+   ```
+
+An HOD or Dean with no `department` / `faculty` recorded matches **no** courses —
+placement has to be explicit.
 
 ## Scaling checklist
 

@@ -43,8 +43,34 @@ course, class-session details, timestamp, and a stable external attendance ID
 to CampOS. Transient network, rate-limit, and server failures are retried with
 bounded backoff without delaying the student's scan response.
 
-Run the focused integration tests with:
+## Tests
+
+```bash
+pip install -r requirements.txt
+python -m pytest -q
+```
+
+The suite runs on a throwaway SQLite file with no Redis, so it needs no
+services. It covers the CampOS integration (`test_campos_integration.py`) and
+every route in `app.py` (`test_app.py`) — the scan path, access control,
+the geofence, email verification, the password-reset flow and the security
+headers. `.github/workflows/ci.yml` runs it on every push, alongside a
+`pyflakes` pass and a real gunicorn boot against Postgres + Redis.
+
+To run just the CampOS integration tests:
 
 ```bash
 python -m pytest test_campos_integration.py -q
 ```
+
+## Accounts and roles
+
+The public signup form issues exactly three kinds of account: **student**
+(any `funaab.edu.ng` address or Gmail), **Lecturer** and **Course
+Coordinator** (a `@staff.funaab.edu.ng` address only). A self-service account
+must confirm its email address before its password works, because the form
+cannot tell whether the registrant owns the address they typed.
+
+The supervisory roles — HOD, Dean, DAP — are never self-assigned. They come
+from a signed CampOS launch identity, or from a deliberate database change;
+see the "Roles" section of `DEPLOYMENT.md`.

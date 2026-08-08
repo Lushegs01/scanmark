@@ -7,22 +7,19 @@ early-warning notifications when attendance slips.
 
 import os
 import io
-import atexit
-from datetime import datetime, timedelta
-from performance import BoundedExecutor, runtime_metrics
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 
 # PDF generation
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import inch, mm
+from reportlab.lib.units import mm
 from reportlab.platypus import (
     SimpleDocTemplate, Table, TableStyle, Paragraph,
-    Spacer, Image, HRFlowable
+    Spacer, HRFlowable
 )
-from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
-from reportlab.graphics.shapes import Drawing, Rect, String
-from reportlab.graphics.charts.barcharts import VerticalBarChart
+from reportlab.lib.enums import TA_CENTER
 
 # WhatsApp via Twilio
 try:
@@ -596,7 +593,7 @@ def generate_student_weekly_pdf(student, courses_data, week_start, week_end):
     # ── Header ──
     elements.append(Paragraph("🎓 ScanMark Weekly Report", title_style))
     elements.append(Paragraph(
-        f"Federal University of Agriculture, Abeokuta",
+        "Federal University of Agriculture, Abeokuta",
         subtitle_style
     ))
     elements.append(HRFlowable(
@@ -748,7 +745,6 @@ def generate_lecturer_weekly_pdf(lecturer, courses_data, week_start, week_end):
         title=f"ScanMark Course Report — {lecturer.full_name}",
     )
 
-    styles = getSampleStyleSheet()
     elements = []
 
     title_style = ParagraphStyle(
@@ -849,8 +845,6 @@ def send_weekly_report_email(app_instance, mail_func, recipient_email, recipient
         pdf_buffer: BytesIO with PDF content
         report_type: 'student' or 'lecturer'
     """
-    from flask_mail import Message as MailMessage
-
     subject = f"📊 ScanMark Weekly Report — {week_range_str}"
 
     text_body = (

@@ -1,0 +1,126 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: ScanMark
+
+jobs:
+  test:
+    name: Lint and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: ScanMark/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyflakes
+
+      # Every undefined name that reached main (selectinload, joinedload, json,
+      # enrollments, IntegrityError, event) would have been caught right here,
+      # in under a second, before anything else ran.
+      - name: Static check for undefined names
+        run: python -m pyflakes app.py models.py campos_integration.py notifications.py
+
+      - name: Import the app (runs create_all + migrations + backfill)
+        env:
+          SECRET_KEY: ci-secret-key
+          DATABASE_URL: sqlite:///ci-boot.db
+          FLASK_ENV: ci
+        run: python -c "import app; print('boot ok')"
+
+      # A second import over the same file exercises the idempotent migration
+      # and backfill path that every real redeploy takes.
+      - name: Import a second time on the same database
+        env:
+          SECRET_KEY: ci-secret-key
+          DATABASE_URL: sqlite:///ci-boot.db
+          FLASK_ENV: ci
+        run: python -c "import app; print('reboot ok')"
+
+      - name: Run the test suite
+        run: python -m pytest -q
+
+  postgres:
+    name: Boot against Postgres
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: scanmark
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: ScanMark/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Production runs Postgres + Redis, and some code paths (the migration
+      # DDL, the Redis-backed QR/session/limiter stores) only exist there.
+      - name: Boot the real Procfile command and probe it
+        env:
+          SECRET_KEY: ci-secret-key
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/scanmark
+          REDIS_URL: redis://localhost:6379/0
+          MAIL_SERVER: 127.0.0.1
+          MAIL_PORT: 2525
+          WEB_CONCURRENCY: "2"
+          GUNICORN_CMD_ARGS: "-b 127.0.0.1:8100"
+        run: |
+          gunicorn --config gunicorn.conf.py app:app &
+          for _ in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8100/healthz -o /dev/null; then
+              echo "healthz ok"
+              curl -sf http://127.0.0.1:8100/login -o /dev/null && echo "login ok"
+              pkill -x gunicorn
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "server never became healthy"
+          pkill -x gunicorn || true
+          exit 1
