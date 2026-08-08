@@ -19,7 +19,7 @@
 
         <!-- FIX #1: Removed stray </button> tag. Clean timer display -->
         <p class="text-muted mb-4">
-            Code refreshes in <span id="timer" class="fw-bold text-danger">5</span>s
+            Code refreshes in <span id="timer" class="fw-bold text-danger">12</span>s
         </p>
 
         <!-- FIX #2: Only ONE location status block -->
@@ -97,51 +97,75 @@
 <script>
     const sessionId = "{{ session.id }}";
 
-    function fetchSessionAttendees() {
-        // Live roll call: only students who scanned THIS class session
-        fetch(`/api/session/${sessionId}/attendees`)
-            .then(response => response.json())
-            .then(data => {
-                if (data.status === "success") {
-                    document.getElementById("student-count").innerText = data.present;
-                    document.getElementById("enrolled-count").innerText = data.enrolled;
-                    const listContainer = document.getElementById("live-student-list");
+    let lastAttendanceId = 0;
+    let attendeePollTimer = null;
+    let attendeePollActive = false;
 
-                    if (data.present === 0) {
-                        listContainer.innerHTML = '<li class="list-group-item text-muted text-center py-4">Waiting for students to scan...</li>';
-                        return;
-                    }
+    function attendeeListItem(student) {
+        const li = document.createElement('li');
+        li.className = 'list-group-item';
+        li.dataset.attendanceId = String(student.id);
 
-                    listContainer.innerHTML = "";
+        const row = document.createElement('div');
+        row.className = 'd-flex justify-content-between align-items-center';
+        const details = document.createElement('div');
+        const name = document.createElement('h6');
+        name.className = 'mb-1 fw-bold text-dark';
+        name.textContent = student.name;
+        const meta = document.createElement('small');
+        meta.className = 'text-muted';
+        meta.textContent = `Matric: ${student.matric_no} | Level: ${student.level}`;
+        const scannedAt = document.createElement('span');
+        scannedAt.className = 'badge bg-success rounded-pill';
+        scannedAt.textContent = student.time;
+        details.append(name, meta);
+        row.append(details, scannedAt);
+        li.appendChild(row);
+        return li;
+    }
 
-                    // Build the detailed list items (newest scan first)
-                    data.attendees.forEach(student => {
-                        const li = document.createElement("li");
-                        li.className = "list-group-item";
-                        li.innerHTML = `
-                            <div class="d-flex justify-content-between align-items-center">
-                                <div>
-                                    <h6 class="mb-1 fw-bold text-dark">${student.name}</h6>
-                                    <small class="text-muted">
-                                        <strong>Matric:</strong> ${student.matric_no} | <strong>Level:</strong> ${student.level}
-                                    </small>
-                                </div>
-                                <span class="badge bg-success rounded-pill">${student.time}</span>
-                            </div>
-                        `;
-                        listContainer.appendChild(li);
-                    });
+    async function fetchSessionAttendees() {
+        if (attendeePollActive || document.hidden) return;
+        attendeePollActive = true;
+        try {
+            let hasMore = true;
+            while (hasMore) {
+                const response = await fetch(
+                    `/api/session/${sessionId}/attendees?after=${lastAttendanceId}&limit=250`,
+                    { cache: 'no-store' }
+                );
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const data = await response.json();
+                if (data.status !== 'success') break;
+
+                document.getElementById('student-count').textContent = data.present;
+                document.getElementById('enrolled-count').textContent = data.enrolled;
+                const list = document.getElementById('live-student-list');
+                if (data.new_attendees.length) {
+                    const waiting = list.querySelector('[data-waiting], .text-center');
+                    if (waiting) waiting.remove();
+                    data.new_attendees.forEach(student => list.prepend(attendeeListItem(student)));
+                    lastAttendanceId = data.last_id;
                 }
-            })
-            .catch(error => console.error("Error fetching session attendees:", error));
+                hasMore = data.has_more;
+            }
+        } catch (error) {
+            console.error('Error fetching session attendees:', error);
+        } finally {
+            attendeePollActive = false;
+            clearTimeout(attendeePollTimer);
+            attendeePollTimer = setTimeout(fetchSessionAttendees, 1000);
+        }
     }
 
     fetchSessionAttendees();
-    setInterval(fetchSessionAttendees, 3000);
+    document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) fetchSessionAttendees();
+    });
 </script>
 <script>
     // --- 1. QR CODE AUTO-REFRESH ---
-    let timeLeft = 5;
+    let timeLeft = 12;
     const timerEl = document.getElementById('timer');
     const qrImage = document.getElementById('qrImage');
 
@@ -152,7 +176,7 @@
         if (timeLeft <= 0) {
             // Bust browser cache by appending a timestamp so it fetches a fresh token
             qrImage.src = "{{ url_for('get_qr_image', session_id=session.id) }}" + "?t=" + Date.now();
-            timeLeft = 5;
+            timeLeft = 12;
         }
     }, 1000);
 
@@ -208,7 +232,7 @@
             {
                 enableHighAccuracy: true,
                 timeout: 10000,
-                maximumAge: 0
+                maximumAge: 10000
             }
         );
     }

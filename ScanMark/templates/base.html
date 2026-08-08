@@ -16,6 +16,7 @@
     <link rel="icon" type="image/png" href="{{ url_for('static', filename='logo-192.png') }}">
     <!-- CSRF token for background fetches (offline scan sync) -->
     <meta name="csrf-token" content="{{ csrf_token() }}">
+    <meta name="current-user-id" content="{{ current_user.id if current_user.is_authenticated else '' }}">
 
     <!-- Bootstrap 5 -->
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
@@ -23,10 +24,9 @@
     <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
     <!-- Font Awesome -->
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <!-- Chart.js -->
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <!-- ScanMark Styles -->
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    {% block head_extra %}{% endblock %}
 
     <!-- Apply saved theme immediately (no flash) -->
     <script>
@@ -174,45 +174,69 @@
         }
 
         /* ===== OFFLINE SYNC ===== */
-        function syncOfflineScans() {
-            // CSRF token from <meta> — without it every synced POST got a 400,
-            // stayed queued forever, and re-fired on every single page load.
+        async function syncOfflineScans() {
             const csrfMeta = document.querySelector('meta[name="csrf-token"]');
+            const userMeta = document.querySelector('meta[name="current-user-id"]');
             const csrfToken = csrfMeta ? csrfMeta.content : '';
+            const currentUserId = userMeta ? userMeta.content : '';
+            if (!currentUserId) return;
 
-            const request = indexedDB.open('ScanMarkOfflineDB', 1);
-            request.onsuccess = event => {
-                const db = event.target.result;
-                if (!db.objectStoreNames.contains('scans')) return;
-                const transaction = db.transaction('scans', 'readwrite');
-                const store = transaction.objectStore('scans');
-                store.openCursor().onsuccess = async (event) => {
-                    const cursor = event.target.result;
-                    if (cursor) {
-                        const scanData = cursor.value;
-                        const scanKey = cursor.key;
-                        try {
-                            const response = await fetch('/mark_attendance', {
-                                method: 'POST',
-                                headers: {
-                                    'Content-Type': 'application/json',
-                                    'X-CSRFToken': csrfToken
-                                },
-                                body: JSON.stringify(scanData)
-                            });
-                            // Any definitive server answer — success, "already
-                            // marked", "QR expired", or a 4xx — means this queued
-                            // scan can never succeed later: drop it. Only keep it
-                            // for retry on network failure or a 5xx.
-                            if (response.status < 500) {
-                                const deleteTx = db.transaction('scans', 'readwrite');
-                                deleteTx.objectStore('scans').delete(scanKey);
-                            }
-                        } catch (err) { /* still offline */ }
-                        cursor.continue();
-                    }
+            const database = await new Promise((resolve, reject) => {
+                const request = indexedDB.open('ScanMarkOfflineDB', 2);
+                request.onupgradeneeded = event => {
+                    const db = event.target.result;
+                    if (db.objectStoreNames.contains('scans')) db.deleteObjectStore('scans');
+                    db.createObjectStore('scans', { keyPath: 'dedupe_key' });
                 };
-            };
+                request.onsuccess = event => resolve(event.target.result);
+                request.onerror = () => reject(request.error);
+            }).catch(() => null);
+            if (!database || !database.objectStoreNames.contains('scans')) return;
+
+            const scans = await new Promise((resolve, reject) => {
+                const request = database.transaction('scans', 'readonly')
+                    .objectStore('scans').getAll();
+                request.onsuccess = () => resolve(request.result || []);
+                request.onerror = () => reject(request.error);
+            }).catch(() => []);
+
+            for (const scanData of scans) {
+                const queuedAt = Date.parse(scanData.queued_at || '');
+                if (Number.isFinite(queuedAt) && Date.now() - queuedAt > 300000) {
+                    await new Promise((resolve, reject) => {
+                        const transaction = database.transaction('scans', 'readwrite');
+                        transaction.objectStore('scans').delete(scanData.dedupe_key);
+                        transaction.oncomplete = resolve;
+                        transaction.onerror = () => reject(transaction.error);
+                    });
+                    continue;
+                }
+                if (String(scanData.user_marker || '') !== currentUserId) continue;
+                try {
+                    const response = await fetch('/mark_attendance', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'X-CSRFToken': csrfToken
+                        },
+                        body: JSON.stringify(scanData)
+                    });
+                    const contentType = response.headers.get('content-type') || '';
+                    const definitive = contentType.includes('application/json') &&
+                        response.status !== 401 && response.status !== 429 &&
+                        response.status < 500;
+                    if (definitive) {
+                        await new Promise((resolve, reject) => {
+                            const transaction = database.transaction('scans', 'readwrite');
+                            transaction.objectStore('scans').delete(scanData.dedupe_key);
+                            transaction.oncomplete = resolve;
+                            transaction.onerror = () => reject(transaction.error);
+                        });
+                    }
+                } catch (_) {
+                    break;
+                }
+            }
         }
 
         window.addEventListener('online', syncOfflineScans);

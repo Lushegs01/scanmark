@@ -104,6 +104,19 @@
         </div>
         {% endfor %}
     </div>
+    {% if pagination.pages > 1 %}
+    <nav class="mt-3" aria-label="Attendance session pages">
+        <ul class="pagination justify-content-center">
+            <li class="page-item {{ 'disabled' if not pagination.has_prev }}">
+                <a class="page-link" href="{{ url_for('view_attendance', course_id=course.id, page=pagination.prev_num) if pagination.has_prev else '#' }}">Previous</a>
+            </li>
+            <li class="page-item disabled"><span class="page-link">Page {{ pagination.page }} of {{ pagination.pages }}</span></li>
+            <li class="page-item {{ 'disabled' if not pagination.has_next }}">
+                <a class="page-link" href="{{ url_for('view_attendance', course_id=course.id, page=pagination.next_num) if pagination.has_next else '#' }}">Next</a>
+            </li>
+        </ul>
+    </nav>
+    {% endif %}
     {% else %}
     <div class="card shadow">
         <div class="card-body text-center py-5">

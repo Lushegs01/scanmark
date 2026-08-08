@@ -1,7 +1,7 @@
 # ScanMark Deployment Guide
 
-How to run ScanMark so it survives a full lecture hall (2000 students)
-logging in and scanning within a couple of minutes.
+Deployment and rehearsal guide for the 2,000-student lecture-hall target.
+Capacity is accepted only from the staging matrix below.
 
 ## Required services
 
@@ -34,6 +34,12 @@ logging in and scanning within a couple of minutes.
 | `STATIC_MAX_AGE` | 86400 | Cache-Control max-age (seconds) WhiteNoise puts on /static files. |
 | `SENTRY_DSN` | — | Optional error monitoring. |
 | `SENTRY_TRACES_SAMPLE_RATE` / `SENTRY_PROFILES_SAMPLE_RATE` | 0.1 | Raise temporarily for deep-dives; 1.0 during a burst burns quota and adds latency. |
+| `METRICS_TOKEN` | — | Required to expose `/internal/metrics` in production. Use as `Authorization: Bearer ...`. |
+| `NOTIFICATION_WORKERS` / `NOTIFICATION_QUEUE_SIZE` | 6 / 2000 | Bounded post-scan work. Alert on rejection or oldest-job age. |
+| `CAMPOS_WORKERS` / `CAMPOS_QUEUE_SIZE` | 4 / 2000 | Separate bounded CampOS delivery path. |
+| `OUTBOUND_NOTIFICATION_WORKERS` / `OUTBOUND_NOTIFICATION_QUEUE_SIZE` | 3 / 2000 | Provider delivery pool. |
+| `SCAN_LOG_SAMPLE_RATE` | 0.02 | Privacy-safe successful scan timing sample; all error outcomes log. |
+| `SCANMARK_DISABLE_SCHEDULER` | false | Set only in tests or a deployment where scheduling is owned externally. |
 | `QR window` | 45s (code) | `QR_CODE_WINDOW` in app.py — how stale a scanned token may be when *processed*. Tied to router timeout; change in code, not env. |
 
 ## Roles
@@ -59,8 +65,9 @@ placement has to be explicit.
 
 ## Scaling checklist
 
-1. **One instance** (defaults): ~32 concurrent requests, Postgres ≥ 40
-   connections. Handles a 2000-student class arriving over 1–2 minutes.
+1. **One instance** (defaults): 32 request slots and an application-side
+   Postgres ceiling of 40 connections. This is a staging candidate, not a
+   capacity guarantee; accept it only after the checked-in 600/2,000 scenarios.
 2. **Scaling out** (2+ instances): connection math multiplies per instance —
    add **PgBouncer** (transaction pooling) in front of Postgres, keep
    `DB_POOL_SIZE`/`DB_MAX_OVERFLOW` modest.
@@ -88,60 +95,7 @@ Watch p95 latency on `/mark_attendance`, the 429/5xx rate, and
 `token expired in queue` failures (those mean requests are queueing longer
 than `QR_CODE_WINDOW`). See `loadtest/locustfile.py` for seeding details.
 
-## Tests
-
-```bash
-pip install -r requirements.txt
-python -m pytest -q        # runs on SQLite; no Postgres or Redis needed
-```
-
-`.github/workflows/ci.yml` runs this on every push, plus `pyflakes` over the
-four source modules and a real `gunicorn` boot against Postgres + Redis. The
-pyflakes step exists because a batch of undefined names (`selectinload`,
-`joinedload`, `json`, `enrollments`, `IntegrityError`, `event`) once reached
-`main` and 500'd three lecturer-facing endpoints; that step catches the whole
-class of mistake in under a second.
-
-`test_app.py::TestNoRouteExplodes` walks every GET route in the URL map and
-asserts none returns 5xx. Add new routes and it covers them automatically.
-
-## Backups and recovery
-
-Attendance is the system of record for a student's eligibility to sit an exam,
-so treat the database as irreplaceable.
-
-**Backups**
-
-- Turn on your provider's managed Postgres backups (Render and Heroku both do
-  daily snapshots with point-in-time recovery on paid tiers) — confirm the
-  retention window covers a full semester.
-- Take an extra dump before every deploy that changes the schema, and keep it
-  off the platform:
-
-  ```bash
-  pg_dump "$DATABASE_URL" --format=custom --file="scanmark-$(date +%F-%H%M).dump"
-  ```
-
-- **Rehearse the restore at least once before the semester**, into a scratch
-  database. A backup nobody has restored is a guess:
-
-  ```bash
-  createdb scanmark_restore_test
-  pg_restore --dbname=scanmark_restore_test --clean --if-exists scanmark-YYYY-MM-DD.dump
-  psql scanmark_restore_test -c "SELECT count(*) FROM attendance;"
-  ```
-
-**What is and isn't recoverable**
-
-| Store | Loss impact |
-|---|---|
-| **Postgres** | The attendance record itself. Restore from the most recent dump; scans between the dump and the failure are gone. |
-| **Redis** | Sessions (everyone signs in again), live QR tokens, pinned class locations, rate-limit counters. Nothing durable — a lecturer re-pins the room and re-opens the QR page. Safe to flush. |
-| **Instance disk** | Nothing. It holds only the checkout and generated static gzip files. |
-
-**Schema changes.** Migrations are the idempotent `ALTER TABLE ... IF NOT
-EXISTS` block at the bottom of `app.py`, run once in the gunicorn master at
-boot. It only ever *adds* columns and indexes, so a rollback to the previous
-release keeps working against the newer schema. There is no down-migration:
-to undo a column you write the `ALTER TABLE ... DROP COLUMN` by hand, from a
-fresh dump.
+Use the complete scenario commands in `loadtest/README.md` and the worker/thread
+decision matrix in `loadtest/gunicorn-matrix.md`. Local reproducible guards live
+under `benchmarks/`; their SQLite results are regression signals, not staging
+capacity claims. The evidence and final scorecard are in `PERFORMANCE_REPORT.md`.

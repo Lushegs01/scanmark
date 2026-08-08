@@ -1,6 +1,11 @@
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import UserMixin
-from datetime import datetime
+from datetime import datetime, timezone
+
+
+def utcnow_naive():
+    """UTC compatible with the existing timezone-naive database columns."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 db = SQLAlchemy()
 
@@ -16,7 +21,8 @@ enrollments = db.Table('enrollments',
 # This table connects multiple lecturers to a single course
 course_instructors = db.Table('course_instructors',
     db.Column('user_id', db.Integer, db.ForeignKey('user.id'), primary_key=True),
-    db.Column('course_id', db.Integer, db.ForeignKey('course.id'), primary_key=True)
+    db.Column('course_id', db.Integer, db.ForeignKey('course.id'), primary_key=True),
+    db.Index('ix_course_instructors_course_id', 'course_id')
 )
 
 class User(UserMixin, db.Model):
@@ -81,7 +87,7 @@ class ClassSession(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     course_id = db.Column(db.Integer, db.ForeignKey('course.id'), nullable=False)
     title = db.Column(db.String(100), nullable=False)  # e.g., "Week 1", "Makeup Class"
-    date_created = db.Column(db.DateTime, default=datetime.utcnow)
+    date_created = db.Column(db.DateTime, default=utcnow_naive)
 
     # This relationship links the session to all the students who scanned it
     attendances = db.relationship('Attendance', backref='session', lazy=True, cascade="all, delete-orphan")
@@ -98,7 +104,7 @@ class Attendance(db.Model):
     # Nullable only for legacy rows created before sessions existed; the
     # startup backfill in app.py adopts those into per-day sessions.
     session_id = db.Column(db.Integer, db.ForeignKey('class_session.id'), nullable=True)
-    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+    timestamp = db.Column(db.DateTime, default=utcnow_naive)
     device_id = db.Column(db.String(200), nullable=True)
 
     __table_args__ = (
@@ -111,6 +117,7 @@ class Attendance(db.Model):
         # The live attendee feed filters on session_id; the duplicate check
         # and early-warning counts filter on (course_id, student_id).
         db.Index('ix_attendance_session_id', 'session_id'),
+        db.Index('ix_attendance_session_cursor', 'session_id', 'id'),
         db.Index('ix_attendance_course_student', 'course_id', 'student_id'),
     )
 

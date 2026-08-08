@@ -46,7 +46,17 @@ else:
     print("[INFO] WhatsApp Alerts Disabled (no Twilio credentials)")
 
 # Thread pool for async notifications
-notification_executor = ThreadPoolExecutor(max_workers=3)
+notification_executor = BoundedExecutor(
+    name='outbound_notification',
+    max_workers=int(os.environ.get('OUTBOUND_NOTIFICATION_WORKERS', 3)),
+    max_queue=int(os.environ.get('OUTBOUND_NOTIFICATION_QUEUE_SIZE', 2000)),
+    metrics=runtime_metrics,
+)
+
+
+@atexit.register
+def _shutdown_notification_executor():
+    notification_executor.shutdown(wait=False)
 
 
 # ============================================================
@@ -207,7 +217,17 @@ def send_parent_attendance_email(app_instance, mail_func, pref, student_name, co
 DEFAULT_ATTENDANCE_THRESHOLD = 75  # percent
 
 
-def check_attendance_threshold(student, course, db_session, Attendance_model, ClassSession_model):
+_PREFERENCE_UNSET = object()
+
+
+def check_attendance_threshold(
+    student,
+    course,
+    db_session,
+    Attendance_model,
+    ClassSession_model,
+    preference=_PREFERENCE_UNSET,
+):
     """
     Check if a student's attendance for a given course has dropped
     below the configurable threshold.
@@ -231,14 +251,26 @@ def check_attendance_threshold(student, course, db_session, Attendance_model, Cl
     attendance_pct = (attended / total_sessions) * 100
 
     # Check custom threshold
-    pref = NotificationPreference.query.filter_by(user_id=student.id).first()
+    pref = (
+        NotificationPreference.query.filter_by(user_id=student.id).first()
+        if preference is _PREFERENCE_UNSET else preference
+    )
     threshold = pref.warning_threshold if pref else DEFAULT_ATTENDANCE_THRESHOLD
 
     is_below = attendance_pct < threshold
     return is_below, attendance_pct, threshold
 
 
-def process_early_warning(student, course, app_instance, mail_func, Attendance_model, ClassSession_model, db_session):
+def process_early_warning(
+    student,
+    course,
+    app_instance,
+    mail_func,
+    Attendance_model,
+    ClassSession_model,
+    db_session,
+    preference=_PREFERENCE_UNSET,
+):
     """
     Full early-warning pipeline: check threshold → send alerts if needed.
     Called after each attendance mark.  Notifies student AND parent/guardian.
@@ -246,13 +278,17 @@ def process_early_warning(student, course, app_instance, mail_func, Attendance_m
     from models import NotificationPreference
 
     is_below, pct, threshold = check_attendance_threshold(
-        student, course, db_session, Attendance_model, ClassSession_model
+        student, course, db_session, Attendance_model, ClassSession_model,
+        preference=preference,
     )
 
     if not is_below:
         return  # All good
 
-    pref = NotificationPreference.query.filter_by(user_id=student.id).first()
+    pref = (
+        NotificationPreference.query.filter_by(user_id=student.id).first()
+        if preference is _PREFERENCE_UNSET else preference
+    )
 
     # ── Student alerts ──
     if not pref or pref.email_alerts:

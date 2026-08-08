@@ -23,5 +23,12 @@
             {% endfor %}
         </tbody>
     </table>
+    {% if pagination.pages > 1 %}
+    <nav aria-label="Course pages"><ul class="pagination justify-content-center">
+        <li class="page-item {{ 'disabled' if not pagination.has_prev }}"><a class="page-link" href="{{ url_for('hod_dashboard', page=pagination.prev_num) if pagination.has_prev else '#' }}">Previous</a></li>
+        <li class="page-item disabled"><span class="page-link">Page {{ pagination.page }} of {{ pagination.pages }}</span></li>
+        <li class="page-item {{ 'disabled' if not pagination.has_next }}"><a class="page-link" href="{{ url_for('hod_dashboard', page=pagination.next_num) if pagination.has_next else '#' }}">Next</a></li>
+    </ul></nav>
+    {% endif %}
 </div>
 {% endblock %}
