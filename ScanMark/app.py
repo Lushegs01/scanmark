@@ -3181,6 +3181,7 @@ def run_early_warnings():
         today = _utcnow().date()
         cooldown_start = today - timedelta(days=EARLY_WARNING_COOLDOWN_DAYS)
         sent = 0
+        deferred = False
 
         # ── Batched aggregates, once, up front ──
         sessions_per_course = dict(
@@ -3262,11 +3263,11 @@ def run_early_warnings():
             if not student or not course:
                 continue
 
-            # Only record the cooldown when delivery was actually accepted.
-            # The outbound pool is bounded, and an institution-wide sweep can
-            # submit more jobs than it holds — writing "sent" for a job the
-            # queue dropped would suppress the retry for the whole cooldown.
-            if not notify_early_warning(
+            # Only record the cooldown when EVERY configured channel was
+            # queued. Settling on the first acceptance would drop the refused
+            # channels — a student's guardian never hearing about it — for the
+            # whole cooldown.
+            attempted_channels, accepted_channels = notify_early_warning(
                 student=student,
                 course=course,
                 percentage=percentage,
@@ -3274,9 +3275,23 @@ def run_early_warnings():
                 preference=pref,
                 app_instance=app,
                 mail_func=send_email,
-            ):
+            )
+
+            if accepted_channels < attempted_channels:
+                # The outbound pool is full. Stop here rather than grinding
+                # through the rest of the cohort collecting refusals: one
+                # student can submit four jobs and this sweep submits far
+                # more than the pool holds, so continuing would refuse nearly
+                # everyone. No cooldown is written for this student or any
+                # after them, so the next sweep picks up where this stopped.
+                #
+                # The cost is bounded and deliberate: this one student may
+                # get a duplicate on whichever channel did go through. That
+                # is one duplicate per sweep, against every later student
+                # otherwise being silently skipped for a week.
                 runtime_metrics.increment('early_warning.delivery_rejected')
-                continue
+                deferred = True
+                break
 
             if previous:
                 previous.last_sent_on = today
@@ -3291,6 +3306,15 @@ def run_early_warnings():
         db.session.commit()
         if sent:
             app.logger.info('Early-warning sweep sent %d warning(s)', sent)
+        if deferred:
+            # Not an error: the pool is doing its job. Raise
+            # OUTBOUND_NOTIFICATION_WORKERS if this recurs — a backlog
+            # drains one sweep at a time, so a big first run can take
+            # several days to work through at the default of 3.
+            app.logger.warning(
+                'Early-warning sweep stopped early: outbound queue full after '
+                '%d warning(s). The rest carry no cooldown and are retried '
+                'on the next sweep.', sent)
         return sent
 
 

@@ -307,13 +307,15 @@ def notify_early_warning(student, course, percentage, threshold, preference,
     percentage in a batch — run_early_warnings() — can send without running
     the two COUNT queries again per student.
 
-    Returns True when the warning is accounted for: at least one channel
-    accepted the job, or the student has no channel configured so there was
-    nothing to deliver. Returns False when every attempted channel was
-    refused by a full queue, which tells a batch caller not to record a
-    cooldown it has not earned — an institution-wide sweep submits more jobs
-    than the bounded pool holds, so this is a real outcome at scale, not a
-    theoretical one.
+    Returns (attempted, accepted): how many channels this student has
+    configured, and how many the bounded outbound pool actually took.
+
+    Callers need both numbers, not a verdict. A batch caller must not record
+    a cooldown unless every attempted channel was queued — settling on the
+    first acceptance would drop the refused channels for the whole cooldown
+    — and `attempted == 0` means nothing was configured, which is settled
+    rather than dropped. Refusal is a real outcome here: one student can
+    generate four jobs and a full sweep submits far more than the pool holds.
     """
     pref = preference
     attempted = 0
@@ -380,9 +382,7 @@ def notify_early_warning(student, course, percentage, threshold, preference,
                 threshold
             ))
 
-    # Nothing configured is settled, not dropped: retrying it every sweep
-    # would just re-run the same no-op forever.
-    return accepted > 0 or attempted == 0
+    return attempted, accepted
 
 
 def _send_warning_email_task(app_instance, mail_func, email, name, code, title, pct, threshold):
