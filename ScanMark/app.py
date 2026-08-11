@@ -3130,8 +3130,12 @@ def discover_course_ref_tables():
     500 on course deletion in production only, because SQLite never enforced
     the constraint that fails.
     """
+    # Tables this release clears itself, in the right order, in delete_course.
+    # `audit_log` is deliberately absent from BOTH this set and the search
+    # below: it carries a course_id but no foreign key, precisely so that the
+    # record of a deletion is not deleted along with what it describes.
     known = {'attendance', 'class_session', 'session_roster',
-             'enrollments', 'course_instructors', 'course'}
+             'enrollments', 'course_instructors', 'course', 'audit_log'}
     try:
         inspector = inspect(db.engine)
         found = []

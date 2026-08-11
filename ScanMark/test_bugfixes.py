@@ -1411,3 +1411,33 @@ class TestTheTrailIsFindableAfterTheFact:
         body = ada.get(f"/course/{seed['course_id']}/audit").get_data(as_text=True)
         assert 'session.start' in body
         assert 'session.end' in body
+
+
+class TestTheAuditLogIsNotCollateral:
+
+    def test_clearing_a_courses_references_never_touches_the_audit_log(
+            self, appmod, seed):
+        """
+        Course deletion clears every table that references the course. The
+        audit log carries a course_id and must not be one of them — deleting
+        the record of a deletion along with it defeats the whole point.
+        """
+        with appmod.app.app_context():
+            assert 'audit_log' not in appmod.discover_course_ref_tables()
+
+    def test_the_trail_outlives_every_row_it_names(self, appmod, seed, login):
+        from models import db, AuditLog, ClassSession, Course
+
+        ada = login(seed['coordinator_email'])
+        ada.post(f"/course/{seed['course_id']}/start_session",
+                 data={'new_session': '1'})
+        ada.post(f"/delete_course/{seed['course_id']}")
+
+        with appmod.app.app_context():
+            assert db.session.get(Course, seed['course_id']) is None
+            assert ClassSession.query.filter_by(
+                course_id=seed['course_id']).count() == 0
+            surviving = AuditLog.query.filter_by(
+                course_id=seed['course_id']).all()
+            assert {entry.action for entry in surviving} >= {
+                'session.start', 'course.delete'}
