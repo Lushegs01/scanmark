@@ -241,6 +241,10 @@ class AuditLog(db.Model):
     action = db.Column(db.String(50), nullable=False)
     target_type = db.Column(db.String(50), nullable=True)
     target_id = db.Column(db.Integer, nullable=True)
+    # Which course the action concerned, so the per-course trail is an indexed
+    # lookup rather than a LIKE over the JSON blob below. A plain integer, not
+    # a foreign key: the entry has to outlive the course it names.
+    course_id = db.Column(db.Integer, nullable=True)
     # A readable name for something that no longer exists to be looked up.
     target_label = db.Column(db.String(200), nullable=True)
     # JSON blob of whatever context the action needs (row counts, term, etc).
@@ -253,4 +257,5 @@ class AuditLog(db.Model):
         db.Index('ix_audit_log_created_at', 'created_at'),
         db.Index('ix_audit_log_target', 'target_type', 'target_id'),
         db.Index('ix_audit_log_actor', 'actor_id'),
+        db.Index('ix_audit_log_course', 'course_id', 'created_at'),
     )

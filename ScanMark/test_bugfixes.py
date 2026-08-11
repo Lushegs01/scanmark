@@ -1375,3 +1375,39 @@ class TestUpgradingAnExistingDatabase:
         assert second.returncode == 0, second.stdout + second.stderr
         assert 'Rebuilding `course`' not in second.stdout
         assert '[MIGRATION] Added' not in second.stdout
+
+
+class TestTheTrailIsFindableAfterTheFact:
+
+    def test_every_action_on_a_course_appears_in_its_trail(
+            self, appmod, seed, login):
+        """
+        Entries were matched with a LIKE over the JSON details, which only hit
+        when `course_id` happened not to be the last key — and course creation
+        recorded no id at all, because the row had none until it was flushed.
+        """
+        from models import AuditLog
+
+        ada = login(seed['coordinator_email'])
+        ada.post('/add_course', data={'code': 'CSC777', 'title': 'Findable'})
+        ada.post(f"/course/{seed['course_id']}/start_session",
+                 data={'new_session': '1'})
+        ada.post(f"/course/{seed['course_id']}/archive")
+
+        with appmod.app.app_context():
+            from models import Course
+            created = Course.query.filter_by(code='CSC777').one()
+            assert AuditLog.query.filter_by(course_id=created.id,
+                                            action='course.create').count() == 1
+
+            actions = {row.action for row in
+                       AuditLog.query.filter_by(course_id=seed['course_id']).all()}
+        assert {'session.start', 'session.end', 'course.archive'} <= actions
+
+    def test_the_trail_page_lists_them(self, appmod, seed, login):
+        ada = login(seed['coordinator_email'])
+        ada.post(f"/course/{seed['course_id']}/start_session",
+                 data={'new_session': '1'})
+        body = ada.get(f"/course/{seed['course_id']}/audit").get_data(as_text=True)
+        assert 'session.start' in body
+        assert 'session.end' in body

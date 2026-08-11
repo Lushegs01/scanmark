@@ -1605,7 +1605,7 @@ def account_pending():
 # ============================================================
 
 def record_audit(action, target_type=None, target_id=None, target_label=None,
-                 **details):
+                 course_id=None, **details):
     """
     Write one append-only line about a destructive or privileged action.
 
@@ -1625,6 +1625,7 @@ def record_audit(action, target_type=None, target_id=None, target_label=None,
             action=action,
             target_type=target_type,
             target_id=target_id,
+            course_id=course_id,
             target_label=(str(target_label)[:200] if target_label else None),
             details=json.dumps(details, default=str) if details else None,
             ip_address=(request.headers.get('X-Forwarded-For', '').split(',')[0].strip()
@@ -3010,7 +3011,11 @@ def add_course():
     )
     db.session.add(new_course)
     try:
-        record_audit('course.create', 'course', None, f'{code} {title}',
+        # Flush first: the row has no id until it reaches the database, and an
+        # audit entry naming no course cannot be found again.
+        db.session.flush()
+        record_audit('course.create', 'course', new_course.id,
+                     f'{code} {title}', course_id=new_course.id,
                      academic_year=academic_year, semester=semester,
                      section=section)
         db.session.commit()
@@ -3044,6 +3049,7 @@ def archive_course(course_id):
     course.archived_at = None if unarchive else _utcnow()
     record_audit('course.unarchive' if unarchive else 'course.archive',
                  'course', course.id, f'{course.code} {course.title}',
+                 course_id=course.id,
                  academic_year=course.academic_year, semester=course.semester)
     db.session.commit()
     flash(f"{course.code} was "
@@ -3209,6 +3215,7 @@ def delete_course(course_id):
     # Written BEFORE the delete, so the record of the deletion is part of the
     # same transaction as the deletion itself: either both happen or neither.
     record_audit('course.delete', 'course', course_id, label,
+                 course_id=course_id,
                  academic_year=course.academic_year, semester=course.semester,
                  section=course.section, sessions_deleted=session_count,
                  attendance_deleted=scan_count, legacy_rows_deleted=legacy_rows)
@@ -4565,17 +4572,8 @@ def course_audit(course_id):
         return redirect(url_for('dashboard'))
 
     page = max(1, request.args.get('page', default=1, type=int) or 1)
-    session_ids = [row[0] for row in db.session.query(ClassSession.id)
-                   .filter(ClassSession.course_id == course_id).all()]
-
     pagination = (AuditLog.query
-                  .filter(db.or_(
-                      db.and_(AuditLog.target_type == 'course',
-                              AuditLog.target_id == course_id),
-                      db.and_(AuditLog.target_type == 'class_session',
-                              AuditLog.target_id.in_(session_ids or [-1])),
-                      AuditLog.details.like(f'%"course_id": {course_id},%'),
-                  ))
+                  .filter(AuditLog.course_id == course_id)
                   .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
                   .paginate(page=page, per_page=50, error_out=False))
 
