@@ -24,7 +24,7 @@ def isolated_database(monkeypatch):
     )
     monkeypatch.setattr(scanmark, 'redis_client', None)
     monkeypatch.setattr(scanmark, 'campos_executor', _RecordingExecutor())
-    monkeypatch.setattr(scanmark, 'notification_work_executor', _RecordingExecutor())
+    monkeypatch.setattr(scanmark, 'account_email_executor', _RecordingExecutor())
     scanmark._local_locations.clear()
     with scanmark.app.app_context():
         # Start from an empty schema as well as ending on one. Cleaning up

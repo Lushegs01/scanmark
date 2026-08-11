@@ -42,8 +42,8 @@ jobs:
       - name: Static check for undefined names
         run: |
           python -m pyflakes app.py models.py campos_integration.py \
-                             notifications.py performance.py \
-                             conftest.py test_app.py test_performance.py
+                             performance.py conftest.py \
+                             test_app.py test_performance.py
 
       - name: Check the browser JavaScript parses
         run: |

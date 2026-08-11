@@ -9,7 +9,7 @@ Capacity is accepted only from the staging matrix below.
 |---|---|
 | **PostgreSQL** (`DATABASE_URL`) | SQLite is single-writer and sits on ephemeral disk on Heroku/Render — concurrent scans lock up and **attendance data is wiped on every restart**. The app prints a loud warning if production boots without this. |
 | **Redis** (`REDIS_URL`) | Sessions, rate limits, class locations, QR token + attendee-feed + QR-image caches. Provision enough memory and prefer eviction policy `volatile-lru` (or `noeviction`) — arbitrary eviction of session keys logs people out mid-class. |
-| **SMTP** (`MAIL_*`) | Confirmation/warning/report emails. Mind provider quotas: Gmail allows ~500/day (free) or ~2,000/day (Workspace) — one big class can exceed that, see `SCAN_CONFIRMATION_EMAILS` below. |
+| **SMTP** (`MAIL_*`) | Signup confirmation links and password resets. That is all ScanMark sends — nothing goes out during a class, so provider quotas are no longer a capacity concern. |
 
 ## Environment variables
 
@@ -22,18 +22,13 @@ Capacity is accepted only from the staging matrix below.
 | `GUNICORN_THREADS` | 8 | Threads per worker. workers × threads = concurrent requests. |
 | `GUNICORN_TIMEOUT` | 60 | Above the 30s platform router timeout on purpose. |
 | `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` | 5 / 5 | **Per worker.** Postgres sees up to `workers × (pool + overflow)` connections — 40 with defaults. Keep below your plan's connection cap, or put PgBouncer in front when scaling out. |
-| `POST_SCAN_NOTIFICATIONS` | true | **The lever for a very large event.** `false` queues no post-scan work at all. Attendance is still recorded, still appears on the lecturer's live feed and in every export; students just don't get the courtesy notification for that class. Prefer this over `SCAN_CONFIRMATION_EMAILS` under load — measured on one vCPU, that flag alone bought only ~4%, because it skipped composing the email but not the lookups behind it. |
-| `SCAN_CONFIRMATION_EMAILS` | true | `false` stops the per-scan confirmation email but still runs the user/course/preference lookups, and still sends WhatsApp and parent alerts. Use it to stay inside an SMTP quota, not to shed load. |
-| `EARLY_WARNING_MODE` | daily | When the "your attendance is low" check runs. `daily` is a scheduled sweep over the whole institution in a handful of GROUP BY queries. `scan` is the legacy inline behaviour — two COUNT queries on every scan, **and it re-sends the warning on every scan**, so a student below the line gets one email per class attended and their parent gets a copy of each. `off` disables it. |
-| `EARLY_WARNING_COOLDOWN_DAYS` | 7 | Minimum days between two warnings for the same student and course. |
-| `EARLY_WARNING_RETRIGGER_DROP` | 10 | Percentage points a student must slip *below* their last warned figure to be told again inside the cooldown, so a genuine decline is never sat on for a week. |
-| `EARLY_WARNING_HOUR` | 18 | Hour (UTC, 0–23) the daily sweep runs. |
 | `GEOFENCE_RADIUS_M` | 100 | Max metres between the pinned class location and a scanning student. Phone GPS inside buildings is often 20–50m off — don't set this too tight. |
 | `GEOFENCE_REQUIRED` | false | What happens when a lecturer never pins a classroom (they dismissed the browser's GPS prompt). Default **false**: the distance check is skipped and the class is marked with no proximity requirement at all. Set **true** when attendance is graded and you would rather refuse a scan than record an unverifiable one — but note it locks out every class whose lecturer has not granted location, so announce it before switching it on. The QR screen tells the lecturer which of the two applies. |
 | `REQUIRE_EMAIL_VERIFICATION` | on in production | Self-service signups must click an emailed link before their password works. **Do not turn this off in production** — the signup form accepts any address, including a `@staff` one the registrant does not own. CampOS SSO and Google sign-ins are pre-verified and unaffected. |
 | `MIN_PASSWORD_LENGTH` | 10 | Enforced identically at signup and at password reset. |
 | `ANON_RATE_LIMIT_PER_MINUTE` / `ANON_RATE_LIMIT_PER_DAY` | 20000 / 500000 | Default budget for *anonymous* requests, which are keyed by IP — one campus NAT is a single key for thousands of phones. Sensitive unauthenticated endpoints carry their own tight per-address limits on top of this. |
-| `BACKGROUND_QUEUE_MAXSIZE` / `BACKGROUND_WORKERS` | 2000 / per-pool | Fleet-wide defaults for every bounded background pool. The per-pool variables below override them. Pending background notifications before new ones are shed — scans are never dropped, only the courtesy email/WhatsApp, and a saturated queue logs a warning naming the attendance id that went unnotified. |
+| `BACKGROUND_QUEUE_MAXSIZE` / `BACKGROUND_WORKERS` | 500 / 4 | Sizes the account-email pool (signup links, password resets). `ACCOUNT_EMAIL_WORKERS` overrides the worker count. Nothing is queued during a class, so this pool is idle under scan load. |
+| `ATTENDANCE_TARGET_PERCENT` | 75 | Percentage shown as the target on student dashboards. Display only — nothing is sent when a student falls below it. |
 | `HSTS_MAX_AGE` | 31536000 | `Strict-Transport-Security` max-age, sent in production only. |
 | `CAMPOS_SSO_SECRET` | — | Shared secret for CampOS SSO; must match CampOS Core's `SSO_JWT_SECRET_SCANMARK`. SSO fails closed until it is set, and production additionally requires at least 32 bytes. `SSO_JWT_SECRET` is still read as a rollout fallback, but new deployments should set `CAMPOS_SSO_SECRET`. |
 | `REMEMBER_COOKIE_DAYS` | 30 | How long "remember me" keeps students signed in. Longer = fewer morning login stampedes. |
@@ -41,11 +36,8 @@ Capacity is accepted only from the staging matrix below.
 | `SENTRY_DSN` | — | Optional error monitoring. |
 | `SENTRY_TRACES_SAMPLE_RATE` / `SENTRY_PROFILES_SAMPLE_RATE` | 0.1 | Raise temporarily for deep-dives; 1.0 during a burst burns quota and adds latency. |
 | `METRICS_TOKEN` | — | Required to expose `/internal/metrics` in production. Use as `Authorization: Bearer ...`. |
-| `NOTIFICATION_WORKERS` / `NOTIFICATION_QUEUE_SIZE` | 6 / 2000 | Bounded post-scan work. Alert on rejection or oldest-job age. |
 | `CAMPOS_WORKERS` / `CAMPOS_QUEUE_SIZE` | 4 / 2000 | Separate bounded CampOS delivery path. |
-| `OUTBOUND_NOTIFICATION_WORKERS` / `OUTBOUND_NOTIFICATION_QUEUE_SIZE` | 3 / 2000 | Provider delivery pool. |
 | `SCAN_LOG_SAMPLE_RATE` | 0.02 | Fraction of *successful* scans that get a timing line. Every non-success outcome is always logged. Keeps a 2,000-scan class to ~40 lines rather than 2,000. |
-| `SCANMARK_DISABLE_SCHEDULER` | false | Set only in tests or a deployment where scheduling is owned externally. |
 | `QR_TOKEN_TTL` | 12 | Seconds a token is cached and displayed before the projector rotates to a new one. The countdown on the QR screen reads this value. |
 | `QR_CODE_WINDOW` | 45 | How stale a scanned token may be when the request is **processed**, not when it was scanned. It must stay comfortably above your p99 scan latency or legitimate queued scans bounce as "expired" and their phones retry, amplifying the burst. It is also the replay window: for this long, a photograph of the projected code will mark somebody present, so keep the geofence on as the real presence check. The service worker reads this value from the server so the offline queue can never promise to redeem a token the server will refuse. |
 
@@ -81,9 +73,9 @@ placement has to be explicit.
 3. **Static/bandwidth**: WhiteNoise already serves /static compressed with
    cache headers. A CDN (e.g. Cloudflare free tier) in front additionally
    absorbs static traffic and TLS handshakes close to campus.
-4. **Email at scale**: switch to a transactional provider (SES — `boto3` is
-   already a dependency) or flip `SCAN_CONFIRMATION_EMAILS=false` and rely
-   on the in-app record.
+4. **Email at scale**: not a factor. ScanMark sends one confirmation link per
+   signup and a password reset on request; nothing goes out during a class,
+   so a free-tier SMTP quota is ample.
 
 ## Load-testing before the semester
 
