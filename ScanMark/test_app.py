@@ -1115,3 +1115,60 @@ class TestEmailIsSignupOnly:
         assert 'notification_preference' not in table_names
         assert 'weekly_report' not in table_names
         assert 'early_warning' not in table_names
+
+
+class TestLegacyNotificationTables:
+    """
+    Removing a model does not remove its table: db.create_all() only ever
+    creates. On a database upgraded from a release that still had the
+    notification stack, `early_warning` survives with its FOREIGN KEY to
+    course.id intact — and Postgres enforces it, so historical rows block
+    DELETE on any course they reference. SQLite does not enforce it, so this
+    class of bug is invisible to the rest of this suite.
+    """
+
+    def test_a_fresh_database_detects_no_legacy_tables(self, appmod):
+        assert appmod.LEGACY_COURSE_REF_TABLES == ()
+
+    def test_course_deletion_clears_a_surviving_early_warning_table(
+            self, appmod, seed, login, monkeypatch):
+        """
+        Simulate the upgraded shape: create the legacy table by hand, point a
+        row at the course, and delete the course through the route.
+        """
+        import datetime
+        from models import db, Course
+
+        with appmod.app.app_context():
+            db.session.execute(db.text('''
+                CREATE TABLE IF NOT EXISTS early_warning (
+                    id INTEGER PRIMARY KEY,
+                    student_id INTEGER NOT NULL REFERENCES "user"(id),
+                    course_id INTEGER NOT NULL REFERENCES course(id),
+                    last_sent_on DATE NOT NULL,
+                    last_percentage FLOAT
+                )'''))
+            db.session.execute(
+                db.text('INSERT INTO early_warning '
+                        '(student_id, course_id, last_sent_on, last_percentage) '
+                        'VALUES (:s, :c, :d, 0.0)'),
+                {'s': seed['student_id'], 'c': seed['course_id'],
+                 'd': datetime.date.today()})
+            db.session.commit()
+
+        # The detection runs at boot; point it at the table we just made.
+        monkeypatch.setattr(appmod, 'LEGACY_COURSE_REF_TABLES', ('early_warning',))
+
+        coordinator = login(seed['coordinator_email'])
+        response = coordinator.post(f"/delete_course/{seed['course_id']}",
+                                    follow_redirects=True)
+        assert response.status_code == 200
+
+        with appmod.app.app_context():
+            assert Course.query.get(seed['course_id']) is None
+            left = db.session.execute(db.text(
+                'SELECT count(*) FROM early_warning WHERE course_id = :c'),
+                {'c': seed['course_id']}).scalar()
+            assert left == 0, 'legacy rows must be cleared with the course'
+            db.session.execute(db.text('DROP TABLE early_warning'))
+            db.session.commit()
