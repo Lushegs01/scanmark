@@ -18,9 +18,8 @@ worker_class = "gthread"
 
 # Import the app once in the master, then fork. This makes the startup
 # db.create_all()/migration block run exactly once instead of once per
-# worker, and keeps the APScheduler weekly-report thread in the master so
-# reports fire once. app.py calls db.engine.dispose() after init, so each
-# forked worker opens fresh DB connections.
+# worker. app.py calls db.engine.dispose() after init, so each forked
+# worker opens fresh DB connections.
 preload_app = True
 
 # Slightly above the typical platform router timeout (30s) so gunicorn

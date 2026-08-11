@@ -114,71 +114,9 @@ class Attendance(db.Model):
         # are distinct for unique-index purposes on SQLite and Postgres).
         db.Index('uq_attendance_student_session', 'student_id', 'session_id',
                  unique=True),
-        # The live attendee feed filters on session_id; the duplicate check
-        # and early-warning counts filter on (course_id, student_id).
+        # The live attendee feed filters on session_id; the per-student
+        # course totals on the dashboard filter on (course_id, student_id).
         db.Index('ix_attendance_session_id', 'session_id'),
         db.Index('ix_attendance_session_cursor', 'session_id', 'id'),
         db.Index('ix_attendance_course_student', 'course_id', 'student_id'),
     )
-
-
-class NotificationPreference(db.Model):
-    """Per-user notification settings for alerts and reports."""
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), unique=True, nullable=False)
-
-    # WhatsApp
-    phone_number = db.Column(db.String(20), nullable=True)  # e.g. +2348012345678
-    whatsapp_alerts = db.Column(db.Boolean, default=False)
-
-    # Email
-    email_alerts = db.Column(db.Boolean, default=True)
-
-    # Weekly PDF reports
-    weekly_report = db.Column(db.Boolean, default=True)
-
-    # Early-warning threshold (percentage)
-    warning_threshold = db.Column(db.Integer, default=75)
-
-    # ── Parent / Guardian ──
-    parent_name = db.Column(db.String(100), nullable=True)
-    parent_email = db.Column(db.String(120), nullable=True)
-    parent_phone = db.Column(db.String(20), nullable=True)   # e.g. +2348098765432
-    notify_parent = db.Column(db.Boolean, default=False)      # master toggle
-
-    # Relationship back to user
-    user = db.relationship('User', backref=db.backref('notification_pref', uselist=False))
-
-
-class EarlyWarning(db.Model):
-    """
-    Last time a student was warned that their attendance in one course had
-    fallen below their threshold.
-
-    One row per (student, course), updated in place. Without it the warning
-    fired on every single scan: a student sitting below the line got one
-    email per class attended for the rest of the semester, and their parent
-    got a copy of each.
-    """
-    id = db.Column(db.Integer, primary_key=True)
-    student_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
-    course_id = db.Column(db.Integer, db.ForeignKey('course.id'), nullable=False)
-    last_sent_on = db.Column(db.Date, nullable=False)
-    # The percentage that triggered the most recent warning, so a student who
-    # keeps slipping can be told again even inside the cooldown.
-    last_percentage = db.Column(db.Float, nullable=True)
-
-    __table_args__ = (
-        db.Index('uq_early_warning_student_course', 'student_id', 'course_id',
-                 unique=True),
-    )
-
-
-class WeeklyReport(db.Model):
-    """Tracks sent weekly reports to avoid duplicates."""
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
-    week_start = db.Column(db.Date, nullable=False)
-    week_end = db.Column(db.Date, nullable=False)
-    sent_at = db.Column(db.DateTime, default=utcnow_naive)
-    report_type = db.Column(db.String(20), nullable=False)  # 'student' or 'lecturer'

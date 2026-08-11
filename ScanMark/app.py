@@ -38,8 +38,7 @@ import sentry_sdk
 from sentry_sdk.integrations.flask import FlaskIntegration
 
 from models import (
-    db, User, Course, Attendance, ClassSession, NotificationPreference,
-    WeeklyReport, EarlyWarning, enrollments,
+    db, User, Course, Attendance, ClassSession, enrollments,
 )
 from performance import BoundedExecutor, InstrumentedQueuePool, runtime_metrics
 from campos_integration import (
@@ -53,17 +52,6 @@ from campos_integration import (
     sanitize_next_path,
     validate_account_binding,
     verify_campos_sso_token,
-)
-from notifications import (
-    send_attendance_whatsapp,
-    process_early_warning,
-    notify_early_warning,
-    generate_student_weekly_pdf,
-    generate_lecturer_weekly_pdf,
-    send_weekly_report_email,
-    send_parent_attendance_whatsapp,
-    send_parent_attendance_email,
-    DEFAULT_ATTENDANCE_THRESHOLD,
 )
 
 # Windows' legacy console encoding cannot represent some existing log text.
@@ -306,81 +294,44 @@ mail = Mail(app)
 # 🚨 THE FIX: Create a bounded pool of workers to handle all emails safely.
 # 10 workers: this pool also runs the post-scan notification tasks, and a
 # full class marking attendance queues one task per student.
-# BACKGROUND_WORKERS / BACKGROUND_QUEUE_MAXSIZE are the fleet-wide defaults
-# documented in DEPLOYMENT.md; the per-pool variables override them. They used
-# to be documented but read nowhere, so an operator sizing the background queue
-# before a big event changed nothing.
-_BACKGROUND_WORKERS_DEFAULT = os.environ.get('BACKGROUND_WORKERS')
-_BACKGROUND_QUEUE_DEFAULT = int(os.environ.get('BACKGROUND_QUEUE_MAXSIZE', 2000))
+# ScanMark sends exactly two kinds of email: the signup confirmation link and
+# a password reset. Both are account access, both are one per person per
+# lifetime, and neither happens during a class. Everything else that used to
+# send — a confirmation per scan, WhatsApp copies, guardian copies, an
+# attendance-threshold warning — is gone, so this pool is small on purpose.
+BACKGROUND_QUEUE_MAXSIZE = int(os.environ.get('BACKGROUND_QUEUE_MAXSIZE', 500))
 
-
-def _pool_workers(specific_var, fallback):
-    """Per-pool setting, else the fleet-wide default, else the built-in."""
-    value = os.environ.get(specific_var) or _BACKGROUND_WORKERS_DEFAULT
-    return int(value) if value else fallback
-
-
-notification_work_executor = BoundedExecutor(
-    name='notification_work',
-    max_workers=_pool_workers('NOTIFICATION_WORKERS', 6),
-    max_queue=int(os.environ.get('NOTIFICATION_QUEUE_SIZE',
-                                 _BACKGROUND_QUEUE_DEFAULT)),
+account_email_executor = BoundedExecutor(
+    name='account_email',
+    max_workers=int(os.environ.get('ACCOUNT_EMAIL_WORKERS')
+                    or os.environ.get('BACKGROUND_WORKERS') or 4),
+    max_queue=BACKGROUND_QUEUE_MAXSIZE,
     metrics=runtime_metrics,
 )
+
+# CampOS attendance delivery is an integration, not a courtesy message: it
+# carries the scan into the student's CampOS record. It stays off the request
+# path but it is not email, so it is unaffected by the above.
 campos_executor = BoundedExecutor(
     name='campos_delivery',
-    max_workers=_pool_workers('CAMPOS_WORKERS', 4),
-    max_queue=int(os.environ.get('CAMPOS_QUEUE_SIZE',
-                                 _BACKGROUND_QUEUE_DEFAULT)),
+    max_workers=int(os.environ.get('CAMPOS_WORKERS')
+                    or os.environ.get('BACKGROUND_WORKERS') or 4),
+    max_queue=int(os.environ.get('CAMPOS_QUEUE_SIZE', 2000)),
     metrics=runtime_metrics,
 )
 
 
 @atexit.register
 def _shutdown_background_executors():
-    # Do not hold process shutdown open for optional outbound notifications.
-    notification_work_executor.shutdown(wait=False)
+    # Do not hold process shutdown open for optional outbound work.
+    account_email_executor.shutdown(wait=False)
     campos_executor.shutdown(wait=False)
 
-# Escape hatch for very large events: one confirmation email per scan can
-# exceed the SMTP provider's quota (Gmail allows ~500-2000 sends/day), so
-# ops can switch confirmations off with SCAN_CONFIRMATION_EMAILS=false
-# without redeploying code.
-SCAN_CONFIRMATION_EMAILS = os.environ.get(
-    'SCAN_CONFIRMATION_EMAILS', 'true'
-).strip().lower() not in ('false', '0', 'no', 'off')
 
-# The real big-event lever. SCAN_CONFIRMATION_EMAILS only skips composing the
-# email — the user, course and preference lookups still ran on every scan, so
-# turning it off bought about 4% on a single vCPU. Setting this to off queues
-# no post-scan work at all: attendance is still recorded and still appears on
-# the lecturer's live feed and in every export; students simply do not get the
-# courtesy notification for that class.
-POST_SCAN_NOTIFICATIONS = os.environ.get(
-    'POST_SCAN_NOTIFICATIONS', 'true'
-).strip().lower() not in ('false', '0', 'no', 'off')
+# Percentage a student is expected to reach. Used only to colour the figure
+# on their dashboard — nothing is sent when they fall below it.
+ATTENDANCE_TARGET_PERCENT = int(os.environ.get('ATTENDANCE_TARGET_PERCENT', 75))
 
-# When the early-warning check runs.
-#   daily  (default) a scheduled sweep, one warning per student per course
-#          per EARLY_WARNING_COOLDOWN_DAYS
-#   scan   legacy: inline on every scan. Costs two COUNT queries per scan and
-#          re-warns on every single one — kept only for parity with old
-#          deployments that depend on the immediate alert.
-#   off    never
-# The check compares a semester-long average against a threshold, so a nightly
-# cadence loses nothing: the number it looks at cannot meaningfully move
-# between two scans by the same student.
-EARLY_WARNING_MODE = os.environ.get('EARLY_WARNING_MODE', 'daily').strip().lower()
-if EARLY_WARNING_MODE not in ('daily', 'scan', 'off'):
-    print(f"⚠️  Unknown EARLY_WARNING_MODE={EARLY_WARNING_MODE!r}; falling back to 'daily'")
-    EARLY_WARNING_MODE = 'daily'
-
-# Minimum days between two warnings for the same student and course. A student
-# who slips FURTHER than this many percentage points is told again regardless,
-# so a genuine decline is never sat on for a week.
-EARLY_WARNING_COOLDOWN_DAYS = int(os.environ.get('EARLY_WARNING_COOLDOWN_DAYS', 7))
-EARLY_WARNING_RETRIGGER_DROP = float(os.environ.get('EARLY_WARNING_RETRIGGER_DROP', 10))
-EARLY_WARNING_HOUR = int(os.environ.get('EARLY_WARNING_HOUR', 18))
 
 def send_async_email(app_instance, msg):
     """Send email asynchronously to avoid blocking"""
@@ -403,7 +354,7 @@ def send_email(subject, recipients, text_body, html_body, sender=None):
     msg.html = html_body
     
     # 🚨 THE FIX: Hand the email to the bouncer instead of spawning an infinite thread
-    if notification_work_executor.submit(send_async_email, app, msg) is None:
+    if account_email_executor.submit(send_async_email, app, msg) is None:
         app.logger.warning('notification queue full; email dropped')
 
 def send_welcome_email(user_email, user_name, user_role='student'):
@@ -572,127 +523,6 @@ Federal University of Agriculture, Abeokuta (FUNAAB)
 </body>
 </html>
     """.strip()
-    
-    send_email(subject, user_email, text_body, html_body)
-
-
-def send_attendance_confirmation(user_email, user_name, course_code, course_title, timestamp):
-    """Send email when attendance is marked"""
-    subject = f"Attendance Confirmed - {course_code}"
-    
-    text_body = f"""
-Hello {user_name},
-
-Your attendance has been successfully recorded:
-
-Course: {course_code} - {course_title}
-Time: {timestamp}
-
-Best regards,
-FUNAAB Attendance System Team
-    """
-    
-    html_body = f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <style>
-        body {{
-            font-family: Arial, sans-serif;
-            line-height: 1.6;
-            color: #333;
-            max-width: 600px;
-            margin: 0 auto;
-            padding: 20px;
-        }}
-        .header {{
-            background: linear-gradient(135deg, #198754 0%, #20c997 100%);
-            color: white;
-            padding: 30px;
-            text-align: center;
-            border-radius: 10px 10px 0 0;
-        }}
-        .content {{
-            background: #f8f9fa;
-            padding: 30px;
-            border-radius: 0 0 10px 10px;
-        }}
-        .confirmation-box {{
-            background: white;
-            padding: 25px;
-            border-radius: 8px;
-            border-left: 5px solid #198754;
-            margin: 20px 0;
-        }}
-        .detail-row {{
-            display: flex;
-            padding: 10px 0;
-            border-bottom: 1px solid #e9ecef;
-        }}
-        .detail-label {{
-            font-weight: bold;
-            width: 120px;
-            color: #6c757d;
-        }}
-        .detail-value {{
-            flex: 1;
-            color: #333;
-        }}
-        .success-icon {{
-            font-size: 48px;
-            text-align: center;
-            margin: 20px 0;
-        }}
-        .footer {{
-            text-align: center;
-            padding: 20px;
-            color: #6c757d;
-            font-size: 12px;
-        }}
-    </style>
-</head>
-<body>
-    <div class="header">
-        <h1>✅ Attendance Confirmed</h1>
-    </div>
-    
-    <div class="content">
-        <div class="success-icon">✓</div>
-        
-        <div class="confirmation-box">
-            <h2>Hello {user_name}!</h2>
-            <p>Your attendance has been successfully recorded.</p>
-            
-            <div class="detail-row">
-                <div class="detail-label">Course:</div>
-                <div class="detail-value">{course_code} - {course_title}</div>
-            </div>
-            
-            <div class="detail-row">
-                <div class="detail-label">Date & Time:</div>
-                <div class="detail-value">{timestamp}</div>
-            </div>
-            
-            <div class="detail-row">
-                <div class="detail-label">Status:</div>
-                <div class="detail-value" style="color: #198754; font-weight: bold;">Present</div>
-            </div>
-        </div>
-        
-        <p style="text-align: center; color: #6c757d;">
-            Keep up the great attendance! 🎯
-        </p>
-    </div>
-    
-    <div class="footer">
-        <p><strong>Federal University of Agriculture, Abeokuta (FUNAAB)</strong></p>
-        <p>© 2024 FUNAAB Attendance Management System. All rights reserved.</p>
-        <p>This is an automated message, please do not reply to this email.</p>
-    </div>
-</body>
-</html>
-    """
     
     send_email(subject, user_email, text_body, html_body)
 
@@ -1209,7 +1039,7 @@ def send_verification_email(user):
         "If you did not create a ScanMark account, ignore this email — "
         "no account can be used until this link is opened.\n"
     )
-    if notification_work_executor.submit(send_async_email, app, msg) is None:
+    if account_email_executor.submit(send_async_email, app, msg) is None:
         app.logger.warning('notification queue full; verification email dropped')
 
 
@@ -1306,7 +1136,7 @@ def forgot_password():
                 "If you did not make this request, ignore this email.\n"
             )
             # Use the bounded notification executor instead of a per-request thread.
-            if notification_work_executor.submit(send_async_email, app, msg) is None:
+            if account_email_executor.submit(send_async_email, app, msg) is None:
                 app.logger.warning('notification queue full; reset email dropped')
 
         # Always show the same message to prevent email enumeration
@@ -1858,16 +1688,12 @@ def student_dashboard():
         flash("Please complete your profile to access your dashboard.", "info")
         return redirect(url_for('complete_profile'))
 
-    # FIX #10: Only iterate over the student's own enrolled courses
-    pref = NotificationPreference.query.filter_by(user_id=current_user.id).first()
-    threshold = pref.warning_threshold if pref and pref.warning_threshold else 75
-
     enrolled_courses, attendance_data = _student_attendance_summary()
 
     return render_template('student_dashboard.html',
                            attendance_data=attendance_data,
                            enrolled_courses=enrolled_courses,
-                           threshold=threshold)
+                           threshold=ATTENDANCE_TARGET_PERCENT)
 
 
 @app.route('/lecturer_dashboard')
@@ -2108,7 +1934,6 @@ def delete_course(course_id):
     # missing one here means the delete fails in production and nowhere else.
     Attendance.query.filter_by(course_id=course_id).delete()
     ClassSession.query.filter_by(course_id=course_id).delete()
-    EarlyWarning.query.filter_by(course_id=course_id).delete()
     db.session.delete(course)
     db.session.commit()
     flash(f'Course "{course.code}" has been deleted.', 'success')
@@ -2461,93 +2286,6 @@ def report_attendance_to_campos(
         app.logger.warning('CampOS attendance report failed: %s', e)
 
 
-def _post_scan_notifications(app_instance, student_id, course_id, timestamp_str):
-    """
-    Everything that used to run inside /mark_attendance after the row was
-    committed: confirmation email, WhatsApp + parent alerts, and the
-    early-warning check. Runs on the executor so the scan response returns
-    immediately — at 2000 scans per class these extra queries and template
-    renders would otherwise hold the request workers hostage.
-    """
-    with app_instance.app_context():
-        try:
-            student = db.session.get(User, student_id)
-            course = db.session.get(Course, course_id)
-            if not student or not course:
-                return
-
-            pref = NotificationPreference.query.filter_by(user_id=student_id).first()
-
-            # Send attendance confirmation email (honours the user's
-            # email_alerts preference and the global kill switch).
-            if SCAN_CONFIRMATION_EMAILS and (not pref or pref.email_alerts):
-                send_attendance_confirmation(
-                    user_email=student.email,
-                    user_name=student.full_name,
-                    course_code=course.code,
-                    course_title=course.title,
-                    timestamp=timestamp_str
-                )
-
-            # ── Real-time WhatsApp alert ──
-            if pref and pref.whatsapp_alerts and pref.phone_number:
-                send_attendance_whatsapp(
-                    phone=pref.phone_number,
-                    student_name=student.full_name,
-                    course_code=course.code,
-                    course_title=course.title,
-                    timestamp_str=timestamp_str
-                )
-
-            # ── Parent/Guardian real-time alerts ──
-            if pref and pref.notify_parent:
-                parent_name = pref.parent_name or 'Parent/Guardian'
-                # WhatsApp to parent
-                if pref.parent_phone:
-                    send_parent_attendance_whatsapp(
-                        phone=pref.parent_phone,
-                        parent_name=parent_name,
-                        student_name=student.full_name,
-                        course_code=course.code,
-                        course_title=course.title,
-                        timestamp_str=timestamp_str
-                    )
-                # Email to parent
-                if pref.parent_email:
-                    send_parent_attendance_email(
-                        app_instance=app_instance,
-                        mail_func=send_email,
-                        pref=pref,
-                        student_name=student.full_name,
-                        course_code=course.code,
-                        course_title=course.title,
-                        timestamp_str=timestamp_str
-                    )
-
-            # ── Early-warning check ──
-            # Off the scan path by default: it compares a semester-long
-            # average against a threshold, so running it per scan cost two
-            # COUNT queries every time AND re-sent the warning on every
-            # single scan. run_early_warnings() does it once a day instead.
-            if EARLY_WARNING_MODE == 'scan':
-                # Hand over the preference row we already loaded, or the
-                # pipeline re-queries it twice more.
-                process_early_warning(
-                    student=student,
-                    course=course,
-                    app_instance=app_instance,
-                    mail_func=send_email,
-                    Attendance_model=Attendance,
-                    ClassSession_model=ClassSession,
-                    db_session=db.session,
-                    preference=pref,
-                )
-        except Exception:
-            app_instance.logger.exception(
-                'Post-scan notification failed for user id=%s', student_id
-            )
-
-
 def _insert_attendance_once(student_id, course_id, session_id, device_id, scanned_at):
     """
     Insert exactly one attendance row and return its id, or None if this
@@ -2799,22 +2537,11 @@ def mark_attendance():
             app.logger.warning(
                 'CampOS delivery queue full; attendance id %s not reported', record_id)
 
-        # Confirmation email, WhatsApp and parent alerts run AFTER the
-        # response, on the executor. POST_SCAN_NOTIFICATIONS=false skips
-        # queuing them entirely — the lever to pull for a very large event,
-        # since the lookups cost more than composing the mail does.
-        if POST_SCAN_NOTIFICATIONS:
-            timestamp_str = datetime.now().strftime('%B %d, %Y at %I:%M %p')
-            if notification_work_executor.submit(
-                _post_scan_notifications,
-                app,
-                current_user.id,
-                target['course_id'],
-                timestamp_str,
-            ) is None:
-                app.logger.warning(
-                    'Notification queue full; no confirmation sent for attendance id %s',
-                    record_id)
+        # Nothing else happens on a scan. A scan used to queue a confirmation
+        # email, a WhatsApp, parent copies of both and an attendance-threshold
+        # check — five extra queries and up to four outbound jobs per student,
+        # all of it courtesy traffic nobody asked for. The register is the
+        # record; students read it on their dashboard.
         checkpoint('enqueue')
 
         return respond('success', 'Attendance marked successfully!', 200, 'success')
@@ -3109,398 +2836,6 @@ def delete_session(session_id):
     return redirect(url_for('view_attendance', course_id=course.id))
 
 # ============================================================
-# NOTIFICATION SETTINGS ROUTES
-# ============================================================
-
-@app.route('/notification_settings', methods=['GET', 'POST'])
-@login_required
-def notification_settings():
-    pref = NotificationPreference.query.filter_by(user_id=current_user.id).first()
-
-    if request.method == 'POST':
-        if not pref:
-            pref = NotificationPreference(user_id=current_user.id)
-            db.session.add(pref)
-
-        # Update student preferences
-        phone = request.form.get('phone_number', '').strip()
-        if phone and not phone.startswith('+'):
-            phone = '+234' + phone.lstrip('0')
-        pref.phone_number = phone or None
-
-        pref.whatsapp_alerts = bool(request.form.get('whatsapp_alerts'))
-        pref.email_alerts = bool(request.form.get('email_alerts'))
-        pref.weekly_report = bool(request.form.get('weekly_report'))
-
-        threshold = request.form.get('warning_threshold', '75')
-        try:
-            pref.warning_threshold = max(10, min(100, int(threshold)))
-        except ValueError:
-            pref.warning_threshold = 75
-
-        # Update parent/guardian preferences
-        pref.parent_name = request.form.get('parent_name', '').strip() or None
-        pref.parent_email = request.form.get('parent_email', '').strip() or None
-
-        parent_phone = request.form.get('parent_phone', '').strip()
-        if parent_phone and not parent_phone.startswith('+'):
-            parent_phone = '+234' + parent_phone.lstrip('0')
-        pref.parent_phone = parent_phone or None
-
-        pref.notify_parent = bool(request.form.get('notify_parent'))
-
-        db.session.commit()
-        flash('Notification settings updated! ✅', 'success')
-        return redirect(url_for('notification_settings'))
-
-    return render_template('notification_settings.html', pref=pref)
-
-
-# ============================================================
-# WEEKLY REPORT SCHEDULER
-# ============================================================
-
-def run_early_warnings():
-    """
-    Warn every opted-in student whose attendance in a course has fallen below
-    their threshold — once, not once per scan.
-
-    This used to run inline on every single scan. That cost two COUNT queries
-    per scan (4,000 across a 2,000-student class) and, worse, re-sent the
-    warning every time: a student sitting below the line got one email per
-    class attended for the rest of the semester, and their parent got a copy
-    of each. The number being checked is a semester-long average, so it
-    cannot meaningfully move between two scans by the same student — a daily
-    sweep loses nothing and is a handful of GROUP BY queries for the whole
-    institution.
-    """
-    if EARLY_WARNING_MODE == 'off':
-        return 0
-
-    with app.app_context():
-        today = _utcnow().date()
-        cooldown_start = today - timedelta(days=EARLY_WARNING_COOLDOWN_DAYS)
-        sent = 0
-        deferred = False
-
-        # ── Batched aggregates, once, up front ──
-        sessions_per_course = dict(
-            db.session.query(ClassSession.course_id, func.count(ClassSession.id))
-            .group_by(ClassSession.course_id).all())
-        if not sessions_per_course:
-            return 0
-
-        # Every (student, course) pair on a course that has actually held a
-        # session. Candidates are NOT drawn from NotificationPreference: that
-        # row only exists once someone has opened the settings page, and both
-        # the model default and the inline check treat a missing row as
-        # "email alerts on". Selecting on the table would have silently
-        # dropped every student who never touched their settings — which is
-        # most of them, and disproportionately the ones a warning is for.
-        enrolled_pairs = db.session.query(
-            enrollments.c.user_id, enrollments.c.course_id
-        ).filter(enrollments.c.course_id.in_(list(sessions_per_course))).all()
-        if not enrolled_pairs:
-            return 0
-        candidate_ids = sorted({student_id for student_id, _course_id in enrolled_pairs})
-
-        prefs = {
-            pref.user_id: pref
-            for pref in NotificationPreference.query.filter(
-                NotificationPreference.user_id.in_(candidate_ids)).all()
-        }
-
-        attended = {
-            (student_id, course_id): total
-            for student_id, course_id, total in db.session.query(
-                Attendance.student_id, Attendance.course_id, func.count(Attendance.id)
-            ).filter(Attendance.student_id.in_(candidate_ids),
-                     Attendance.session_id.isnot(None))
-            .group_by(Attendance.student_id, Attendance.course_id).all()
-        }
-
-        already = {
-            (row.student_id, row.course_id): row
-            for row in EarlyWarning.query.filter(
-                EarlyWarning.student_id.in_(candidate_ids)).all()
-        }
-
-        students = {u.id: u for u in User.query.filter(User.id.in_(candidate_ids)).all()}
-        course_ids = {course_id for _student_id, course_id in enrolled_pairs}
-        courses = {c.id: c for c in Course.query.filter(Course.id.in_(course_ids)).all()}
-
-        for student_id, course_id in enrolled_pairs:
-            total_sessions = sessions_per_course.get(course_id, 0)
-            if not total_sessions:
-                continue        # nothing has been held yet; nothing to be below
-
-            pref = prefs.get(student_id)
-            # A row that silences every channel is the one real opt-out.
-            if pref and not (pref.email_alerts or pref.whatsapp_alerts
-                             or pref.notify_parent):
-                continue
-
-            threshold = (pref.warning_threshold if pref and pref.warning_threshold
-                         else DEFAULT_ATTENDANCE_THRESHOLD)
-            percentage = attended.get((student_id, course_id), 0) / total_sessions * 100
-            if percentage >= threshold:
-                continue
-
-            # Already told them recently? Stay quiet, unless they have slipped
-            # materially further since — a real decline still gets through.
-            previous = already.get((student_id, course_id))
-            if previous and previous.last_sent_on > cooldown_start:
-                # `or 100` here would read 0.0 as "no record" and make the drop
-                # 100 points every day, so the students on nought percent — the
-                # ones this whole guard exists for — would be warned daily.
-                last = (previous.last_percentage
-                        if previous.last_percentage is not None else 100)
-                if last - percentage < EARLY_WARNING_RETRIGGER_DROP:
-                    continue
-
-            student = students.get(student_id)
-            course = courses.get(course_id)
-            if not student or not course:
-                continue
-
-            # Only record the cooldown when EVERY configured channel was
-            # queued. Settling on the first acceptance would drop the refused
-            # channels — a student's guardian never hearing about it — for the
-            # whole cooldown.
-            attempted_channels, accepted_channels = notify_early_warning(
-                student=student,
-                course=course,
-                percentage=percentage,
-                threshold=threshold,
-                preference=pref,
-                app_instance=app,
-                mail_func=send_email,
-            )
-
-            if accepted_channels < attempted_channels:
-                # The outbound pool is full. Stop here rather than grinding
-                # through the rest of the cohort collecting refusals: one
-                # student can submit four jobs and this sweep submits far
-                # more than the pool holds, so continuing would refuse nearly
-                # everyone. No cooldown is written for this student or any
-                # after them, so the next sweep picks up where this stopped.
-                #
-                # The cost is bounded and deliberate: this one student may
-                # get a duplicate on whichever channel did go through. That
-                # is one duplicate per sweep, against every later student
-                # otherwise being silently skipped for a week.
-                runtime_metrics.increment('early_warning.delivery_rejected')
-                deferred = True
-                break
-
-            if previous:
-                previous.last_sent_on = today
-                previous.last_percentage = percentage
-            else:
-                db.session.add(EarlyWarning(
-                    student_id=student_id, course_id=course_id,
-                    last_sent_on=today, last_percentage=percentage,
-                ))
-            sent += 1
-
-        db.session.commit()
-        if sent:
-            app.logger.info('Early-warning sweep sent %d warning(s)', sent)
-        if deferred:
-            # Not an error: the pool is doing its job. Raise
-            # OUTBOUND_NOTIFICATION_WORKERS if this recurs — a backlog
-            # drains one sweep at a time, so a big first run can take
-            # several days to work through at the default of 3.
-            app.logger.warning(
-                'Early-warning sweep stopped early: outbound queue full after '
-                '%d warning(s). The rest carry no cooldown and are retried '
-                'on the next sweep.', sent)
-        return sent
-
-
-def run_weekly_reports():
-    """Generate and email weekly PDF reports for all opted-in users."""
-    with app.app_context():
-        today = _utcnow().date()
-        week_end = today
-        week_start = today - timedelta(days=7)
-        week_range = f"{week_start.strftime('%d %b')} — {week_end.strftime('%d %b %Y')}"
-
-        print(f"\n📊 Running weekly reports for {week_range}...")
-
-        # ── Batched aggregates (once, up front) ──
-        # The old version ran two COUNT queries per (student, course) plus a
-        # WeeklyReport lookup per user: with 2000 opted-in students that was
-        # tens of thousands of queries every Monday. These few GROUP BY
-        # queries replace all of them.
-        sessions_per_course = dict(
-            db.session.query(ClassSession.course_id, func.count(ClassSession.id))
-            .group_by(ClassSession.course_id).all())
-        attendance_per_course = dict(
-            db.session.query(Attendance.course_id, func.count(Attendance.id))
-            .group_by(Attendance.course_id).all())
-        enrolled_per_course = dict(
-            db.session.query(enrollments.c.course_id, func.count(enrollments.c.user_id))
-            .group_by(enrollments.c.course_id).all())
-        week_start_dt = datetime.combine(week_start, datetime.min.time())
-        week_end_dt = datetime.combine(week_end, datetime.max.time())
-        sessions_this_week_per_course = dict(
-            db.session.query(ClassSession.course_id, func.count(ClassSession.id))
-            .filter(ClassSession.date_created >= week_start_dt,
-                    ClassSession.date_created <= week_end_dt)
-            .group_by(ClassSession.course_id).all())
-        # (student_id, course_id) -> classes attended, for opted-in students
-        attended_map = {
-            (sid, cid): n for sid, cid, n in (
-                db.session.query(Attendance.student_id, Attendance.course_id,
-                                 func.count(Attendance.id))
-                .join(NotificationPreference,
-                      NotificationPreference.user_id == Attendance.student_id)
-                .filter(NotificationPreference.weekly_report == True)
-                .group_by(Attendance.student_id, Attendance.course_id).all())
-        }
-        # Reports already sent this week, both types, in one query
-        already_sent = {
-            (r.user_id, r.report_type)
-            for r in WeeklyReport.query.filter_by(week_start=week_start).all()
-        }
-
-        # ── Student Reports ──
-        students_with_pref = (
-            db.session.query(User, NotificationPreference)
-            .join(NotificationPreference, NotificationPreference.user_id == User.id)
-            # Roles are stored in mixed case ('Student'/'student' both exist —
-            # see the lecturer filter below); the old exact match silently
-            # skipped every 'Student'-cased user.
-            .filter(func.lower(User.role) == 'student')
-            .filter(NotificationPreference.weekly_report == True)
-            .options(selectinload(User.enrolled_courses))
-            .all()
-        )
-
-        for student, pref in students_with_pref:
-            if (student.id, 'student') in already_sent:
-                continue
-
-            # Build course data from the precomputed aggregates
-            courses_data = []
-            for course in getattr(student, 'enrolled_courses', []):
-                total_sessions = sessions_per_course.get(course.id, 0)
-                attended = attended_map.get((student.id, course.id), 0)
-                pct = (attended / total_sessions * 100) if total_sessions > 0 else 0
-                courses_data.append({
-                    'code': course.code,
-                    'title': course.title,
-                    'total_sessions': total_sessions,
-                    'attended': attended,
-                    'percentage': pct,
-                })
-
-            if not courses_data:
-                continue
-
-            pdf_buf = generate_student_weekly_pdf(
-                student, courses_data,
-                datetime.combine(week_start, datetime.min.time()),
-                datetime.combine(week_end, datetime.min.time())
-            )
-            send_weekly_report_email(
-                app, send_email, student.email, student.full_name,
-                pdf_buf, 'student', week_range
-            )
-
-            # Also send a copy to parent/guardian if enabled
-            if pref.notify_parent and pref.parent_email:
-                parent_name = pref.parent_name or 'Parent/Guardian'
-                pdf_buf.seek(0)  # reset buffer for re-read
-                send_weekly_report_email(
-                    app, send_email, pref.parent_email,
-                    f"{parent_name} (re: {student.full_name})",
-                    pdf_buf, 'parent', week_range
-                )
-
-            # Record
-            db.session.add(WeeklyReport(
-                user_id=student.id,
-                week_start=week_start,
-                week_end=week_end,
-                report_type='student'
-            ))
-
-        # ── Lecturer Reports ──
-        lecturers = (User.query
-                     .filter(User.role.in_(['lecturer', 'Lecturer',
-                                            'Course Coordinator', 'course coordinator']))
-                     .options(selectinload(User.coordinated_courses),
-                              selectinload(User.teaching_courses))
-                     .all())
-
-        lec_prefs = {
-            p.user_id: p
-            for p in NotificationPreference.query.filter(
-                NotificationPreference.user_id.in_([l.id for l in lecturers])
-            ).all()
-        } if lecturers else {}
-
-        for lecturer in lecturers:
-            lec_pref = lec_prefs.get(lecturer.id)
-            if lec_pref and not lec_pref.weekly_report:
-                continue
-
-            if (lecturer.id, 'lecturer') in already_sent:
-                continue
-
-            # Get courses this lecturer manages (eager-loaded above)
-            coordinated = getattr(lecturer, 'coordinated_courses', [])
-            teaching = getattr(lecturer, 'teaching_courses', [])
-            all_courses = list(set(list(coordinated) + list(teaching)))
-
-            if not all_courses:
-                continue
-
-            courses_data = []
-            for course in all_courses:
-                total_enrolled = enrolled_per_course.get(course.id, 0)
-                sessions_week = sessions_this_week_per_course.get(course.id, 0)
-                total_sessions = sessions_per_course.get(course.id, 0)
-
-                # Average attendance
-                if total_sessions > 0 and total_enrolled > 0:
-                    total_att = attendance_per_course.get(course.id, 0)
-                    avg_pct = (total_att / (total_sessions * total_enrolled)) * 100
-                else:
-                    avg_pct = 0
-
-                courses_data.append({
-                    'code': course.code,
-                    'title': course.title,
-                    'total_enrolled': total_enrolled,
-                    'sessions_this_week': sessions_week,
-                    'avg_attendance_pct': avg_pct,
-                })
-
-            pdf_buf = generate_lecturer_weekly_pdf(
-                lecturer, courses_data,
-                datetime.combine(week_start, datetime.min.time()),
-                datetime.combine(week_end, datetime.min.time())
-            )
-            send_weekly_report_email(
-                app, send_email, lecturer.email, lecturer.full_name,
-                pdf_buf, 'lecturer', week_range
-            )
-
-            db.session.add(WeeklyReport(
-                user_id=lecturer.id,
-                week_start=week_start,
-                week_end=week_end,
-                report_type='lecturer'
-            ))
-
-        db.session.commit()
-        print("✅ Weekly reports sent!")
-
-
-# ============================================================
 # ERROR HANDLERS
 # ============================================================
 
@@ -3547,11 +2882,6 @@ with app.app_context():
     # db.create_all() only creates NEW tables; it never alters existing ones.
     # This block safely adds any missing columns to production.
     _migrations = [
-        # Parent/guardian notification columns
-        ("notification_preference", "parent_name",   "VARCHAR(100)"),
-        ("notification_preference", "parent_email",  "VARCHAR(120)"),
-        ("notification_preference", "parent_phone",  "VARCHAR(20)"),
-        ("notification_preference", "notify_parent", "BOOLEAN DEFAULT FALSE"),
         # Attendance.course_id (was previously commented out)
         ("attendance", "course_id", "INTEGER REFERENCES course(id)"),
         # Attendance.session_id — model declares it but older tables lack the
@@ -3709,42 +3039,6 @@ with app.app_context():
     db.engine.dispose()  # Forces Gunicorn workers to create fresh connections
     print("[OK] Database initialized successfully!")
 
-# APScheduler: Weekly reports every Monday at 7 AM
-try:
-    from apscheduler.schedulers.background import BackgroundScheduler
-    scheduler = None
-    if os.environ.get('SCANMARK_DISABLE_SCHEDULER', '').lower() not in {'1', 'true', 'yes'}:
-        scheduler = BackgroundScheduler()
-        scheduler.add_job(
-            func=run_weekly_reports,
-            trigger='cron',
-            day_of_week='mon',
-            hour=7,
-            minute=0,
-            id='weekly_reports',
-            replace_existing=True
-        )
-        if EARLY_WARNING_MODE == 'daily':
-            scheduler.add_job(
-                func=run_early_warnings,
-                trigger='cron',
-                hour=EARLY_WARNING_HOUR,
-                minute=0,
-                id='early_warnings',
-                replace_existing=True
-            )
-        scheduler.start()
-        print("[OK] Weekly report scheduler active (Monday 07:00)")
-        if EARLY_WARNING_MODE == 'daily':
-            print(f"[OK] Early-warning sweep active (daily {EARLY_WARNING_HOUR:02d}:00, "
-                  f"{EARLY_WARNING_COOLDOWN_DAYS}-day cooldown)")
-        elif EARLY_WARNING_MODE == 'scan':
-            print("⚠️  EARLY_WARNING_MODE=scan: the threshold check runs on every "
-                  "scan and re-warns each time. 'daily' is the supported setting.")
-except ImportError:
-    print("⚠️  APScheduler not installed. Weekly reports won't run automatically.")
-    print("   Install with: pip install APScheduler")
-
 if __name__ == '__main__':
     # Local development entry point only — production runs the Procfile's
     # `gunicorn --config gunicorn.conf.py app:app`.
@@ -3760,10 +3054,9 @@ if __name__ == '__main__':
     print(f"📧 Mail Server: {app.config['MAIL_SERVER']}")
     print("🔐 CSRF Protection: Enabled")
     print("🛡️  Rate Limiting: Enabled")
-    print(f"📱 WhatsApp Alerts: {'Enabled' if os.environ.get('TWILIO_ACCOUNT_SID') else 'Disabled'}")
     print(f"📧 Email Verification: {'Required' if REQUIRE_EMAIL_VERIFICATION else 'Not required'}")
-    print("📊 Weekly PDF Reports: Scheduled (Monday 7 AM)")
-    print(f"⚠️  Early-Warning Threshold: {DEFAULT_ATTENDANCE_THRESHOLD}%")
+    print("📭 Email is sent at signup and password reset only")
+    print(f"🎯 Attendance target shown on dashboards: {ATTENDANCE_TARGET_PERCENT}%")
     print("=" * 60 + "\n")
 
     # The reloader/debugger is opt-in rather than always-on: `debug=True` here

@@ -87,23 +87,6 @@ class TestNoRouteExplodes:
         assert sheet.status_code == 200
         assert b'Present' in sheet.data
 
-    def test_weekly_reports_run_and_dedupe(self, appmod, seed):
-        """run_weekly_reports() died on its first aggregate query."""
-        from models import db, NotificationPreference, WeeklyReport
-
-        with appmod.app.app_context():
-            db.session.add(NotificationPreference(
-                user_id=seed['student_id'], weekly_report=True, email_alerts=True))
-            db.session.commit()
-
-            appmod.run_weekly_reports()
-            first = WeeklyReport.query.count()
-            assert first >= 1
-
-            # Second run in the same week must not re-send.
-            appmod.run_weekly_reports()
-            assert WeeklyReport.query.count() == first
-
 
 # ============================================================
 # SIGNUP: ROLE ESCALATION, CSRF, VERIFICATION
@@ -1047,393 +1030,88 @@ class TestGeofenceRequiredMode:
         assert response.status_code == 200
 
 
-class TestEarlyWarningCadence:
+
+
+class TestEmailIsSignupOnly:
     """
-    The threshold check used to run inline on every scan. That cost two COUNT
-    queries per scan AND re-sent the warning every time — a student below the
-    line got one email per class attended for the rest of the semester, with
-    a copy to their parent each time.
+    ScanMark sends account email and nothing else. A scan used to queue a
+    confirmation, a WhatsApp, guardian copies of both and a threshold check —
+    five extra queries and up to four outbound jobs per student, per scan.
     """
 
-    def _struggling(self, appmod, seed, held=10, attended=2):
-        from models import db, ClassSession, Attendance, NotificationPreference
-
-        with appmod.app.app_context():
-            db.session.add(NotificationPreference(
-                user_id=seed['student_id'], email_alerts=True,
-                warning_threshold=75, notify_parent=True,
-                parent_email='guardian@example.test'))
-            sessions = [ClassSession(course_id=seed['course_id'], title=f'W{n}')
-                        for n in range(held)]
-            db.session.add_all(sessions)
-            db.session.commit()
-            for row in sessions[:attended]:
-                db.session.add(Attendance(student_id=seed['student_id'],
-                                          course_id=seed['course_id'],
-                                          session_id=row.id))
-            db.session.commit()
-
-    def test_the_sweep_warns_once_not_once_per_run(self, appmod, seed, monkeypatch):
-        from models import EarlyWarning
-
-        self._struggling(appmod, seed)
+    def _captured_sends(self, appmod, monkeypatch):
         sent = []
-        monkeypatch.setattr(appmod, 'notify_early_warning',
-                            lambda **kwargs: sent.append(kwargs['student'].id) or (1, 1))
-        monkeypatch.setattr(appmod, 'EARLY_WARNING_MODE', 'daily')
+        monkeypatch.setattr(appmod.account_email_executor, 'submit',
+                            lambda *a, **k: sent.append(a[0]) or object())
+        return sent
 
-        assert appmod.run_early_warnings() == 1
-        assert len(sent) == 1
-        # Same day, same week: silence.
-        assert appmod.run_early_warnings() == 0
-        assert appmod.run_early_warnings() == 0
-        assert len(sent) == 1
-
-        with appmod.app.app_context():
-            assert EarlyWarning.query.count() == 1
-
-    def test_a_student_who_slips_further_is_told_again_inside_the_cooldown(
-            self, appmod, seed, monkeypatch):
-        from models import db, ClassSession
-
-        # The seed fixture already opened one session, so derive the expected
-        # percentages from the database rather than assuming a round number.
-        self._struggling(appmod, seed, held=10, attended=5)
-        sent = []
-        monkeypatch.setattr(appmod, 'notify_early_warning',
-                            lambda **kwargs: sent.append(round(kwargs['percentage'])) or (1, 1))
-        monkeypatch.setattr(appmod, 'EARLY_WARNING_MODE', 'daily')
-
-        with appmod.app.app_context():
-            held = ClassSession.query.filter_by(course_id=seed['course_id']).count()
-        first_expected = round(5 / held * 100)
-
-        assert appmod.run_early_warnings() == 1
-        assert sent == [first_expected]
-
-        # Ten more classes held, none of them attended — a material slip, so
-        # the student hears about it again despite the cooldown.
-        with appmod.app.app_context():
-            db.session.add_all([ClassSession(course_id=seed['course_id'], title=f'X{n}')
-                                for n in range(10)])
-            db.session.commit()
-        second_expected = round(5 / (held + 10) * 100)
-        assert first_expected - second_expected >= appmod.EARLY_WARNING_RETRIGGER_DROP
-
-        assert appmod.run_early_warnings() == 1
-        assert sent == [first_expected, second_expected]
-
-    def test_a_student_above_the_threshold_is_never_warned(
-            self, appmod, seed, monkeypatch):
-        self._struggling(appmod, seed, held=10, attended=9)   # 90%
-        sent = []
-        monkeypatch.setattr(appmod, 'notify_early_warning',
-                            lambda **kwargs: sent.append(1) or (1, 1))
-        monkeypatch.setattr(appmod, 'EARLY_WARNING_MODE', 'daily')
-
-        assert appmod.run_early_warnings() == 0
-        assert sent == []
-
-    def test_off_mode_sends_nothing(self, appmod, seed, monkeypatch):
-        self._struggling(appmod, seed)
-        monkeypatch.setattr(appmod, 'EARLY_WARNING_MODE', 'off')
-        assert appmod.run_early_warnings() == 0
-
-    def test_the_scan_path_no_longer_runs_the_threshold_check(
+    def test_marking_attendance_sends_nothing_at_all(
             self, appmod, seed, login, monkeypatch):
-        """The two COUNT queries are off the hot path in the default mode."""
-        called = []
-        monkeypatch.setattr(appmod, 'process_early_warning',
-                            lambda **kwargs: called.append(1))
-        monkeypatch.setattr(appmod, 'EARLY_WARNING_MODE', 'daily')
-
-        appmod._post_scan_notifications(appmod.app, seed['student_id'],
-                                        seed['course_id'], 'now')
-        assert called == []
-
-        monkeypatch.setattr(appmod, 'EARLY_WARNING_MODE', 'scan')
-        appmod._post_scan_notifications(appmod.app, seed['student_id'],
-                                        seed['course_id'], 'now')
-        assert called == [1]
-
-
-class TestPostScanNotificationSwitch:
-
-    def test_turning_post_scan_work_off_queues_nothing_but_still_records(
-            self, appmod, seed, login, monkeypatch):
-        """
-        SCAN_CONFIRMATION_EMAILS only skipped composing the mail; the lookups
-        still ran, so it bought ~4% under load. This is the lever that
-        actually sheds the work.
-        """
         from models import Attendance
 
-        queued = []
-        monkeypatch.setattr(appmod.notification_work_executor, 'submit',
-                            lambda *a, **k: queued.append(a[0]) or object())
-        monkeypatch.setattr(appmod, 'POST_SCAN_NOTIFICATIONS', False)
-
+        sent = self._captured_sends(appmod, monkeypatch)
         kemi = login(seed['student_email'])
         response = kemi.post('/mark_attendance',
                              json={'qr_data': qr_token(appmod, seed['session_id'])})
+
         assert response.status_code == 200
-        assert queued == []
+        assert sent == [], f'a scan queued outbound work: {sent}'
         with appmod.app.app_context():
-            assert Attendance.query.count() == 1   # the scan itself is untouched
+            assert Attendance.query.count() == 1   # the register is untouched
 
-    def test_the_default_still_queues_the_courtesy_notification(
-            self, appmod, seed, login, monkeypatch):
-        queued = []
-        monkeypatch.setattr(appmod.notification_work_executor, 'submit',
-                            lambda *a, **k: queued.append(a[0]) or object())
-        monkeypatch.setattr(appmod, 'POST_SCAN_NOTIFICATIONS', True)
+    def test_signing_up_still_sends_the_confirmation_link(
+            self, appmod, monkeypatch):
+        from models import User
 
-        kemi = login(seed['student_email'])
-        kemi.post('/mark_attendance',
-                  json={'qr_data': qr_token(appmod, seed['session_id'])})
-        assert len(queued) == 1
+        sent = self._captured_sends(appmod, monkeypatch)
+        appmod.REQUIRE_EMAIL_VERIFICATION = True
+        try:
+            client = appmod.app.test_client()
+            response = client.post('/signup', data={
+                'full_name': 'New Person', 'email': 'newperson@gmail.com',
+                'password': VALID_PASSWORD, 'matric_no': '20201234', 'level': '300',
+            })
+            assert response.status_code in (200, 302)
+            assert len(sent) >= 1, 'signup must still send the verification link'
+            with appmod.app.app_context():
+                assert User.query.filter_by(email='newperson@gmail.com').first() is not None
+        finally:
+            appmod.REQUIRE_EMAIL_VERIFICATION = False
 
-
-class TestEarlyWarningSweepEdges:
-    """
-    Four defects caught in review of the sweep. Each one only shows up in a
-    situation the happy-path tests never reach.
-    """
-
-    def _course_with_sessions(self, appmod, seed, held=10):
-        from models import db, ClassSession
-        with appmod.app.app_context():
-            db.session.add_all([ClassSession(course_id=seed['course_id'], title=f'W{n}')
-                                for n in range(held)])
-            db.session.commit()
-
-    def test_a_student_who_never_opened_settings_is_still_warned(
+    def test_a_forgotten_password_can_still_be_recovered(
             self, appmod, seed, monkeypatch):
         """
-        Candidates were drawn from NotificationPreference, but that row only
-        exists once someone has saved their settings. The model default and
-        the inline check both treat a missing row as email-alerts-on, so
-        selecting on the table silently excluded most of the cohort.
+        Password reset is account access, not a notification — without it a
+        forgotten password is a permanent lockout with no admin screen to
+        undo it. Deliberately kept.
         """
-        from models import NotificationPreference
+        sent = self._captured_sends(appmod, monkeypatch)
+        client = appmod.app.test_client()
+        response = client.post('/forgot_password',
+                               data={'email': seed['student_email']})
+        assert response.status_code in (200, 302)
+        assert len(sent) == 1
 
-        self._course_with_sessions(appmod, seed)
-        with appmod.app.app_context():
-            assert NotificationPreference.query.filter_by(
-                user_id=seed['student_id']).first() is None, 'fixture must have no pref row'
+    def test_the_notification_stack_is_gone(self, appmod):
+        """No settings page, no scheduler, no notifications module."""
+        import importlib
 
-        warned = []
-        monkeypatch.setattr(appmod, 'notify_early_warning',
-                            lambda **kw: warned.append(kw['student'].id) or (1, 1))
-        monkeypatch.setattr(appmod, 'EARLY_WARNING_MODE', 'daily')
+        endpoints = {rule.endpoint for rule in appmod.app.url_map.iter_rules()}
+        assert 'notification_settings' not in endpoints
 
-        assert appmod.run_early_warnings() == 1
-        assert warned == [seed['student_id']]
+        for gone in ('run_weekly_reports', 'run_early_warnings',
+                     '_post_scan_notifications', 'send_attendance_confirmation',
+                     'notification_work_executor', 'scheduler'):
+            assert not hasattr(appmod, gone), f'{gone} survived the cut'
 
-    def test_a_student_who_silenced_every_channel_is_not_warned(
-            self, appmod, seed, monkeypatch):
-        from models import db, NotificationPreference
+        with pytest.raises(ImportError):
+            importlib.import_module('notifications')
 
-        self._course_with_sessions(appmod, seed)
-        with appmod.app.app_context():
-            db.session.add(NotificationPreference(
-                user_id=seed['student_id'], email_alerts=False,
-                whatsapp_alerts=False, notify_parent=False))
-            db.session.commit()
+    def test_no_scan_ever_touches_a_notification_table(self, appmod):
+        """The three notification models are gone from the schema."""
+        from models import db
 
-        warned = []
-        monkeypatch.setattr(appmod, 'notify_early_warning',
-                            lambda **kw: warned.append(1) or (1, 1))
-        monkeypatch.setattr(appmod, 'EARLY_WARNING_MODE', 'daily')
-
-        assert appmod.run_early_warnings() == 0
-        assert warned == []
-
-    def test_a_student_on_zero_percent_is_not_warned_every_single_day(
-            self, appmod, seed, monkeypatch):
-        """
-        `previous.last_percentage or 100` read a stored 0.0 as "no record",
-        making the drop 100 points on every sweep — so the students on nought
-        percent, the ones the guard exists for, were warned daily.
-        """
-        self._course_with_sessions(appmod, seed)   # zero attendance -> 0%
-
-        warned = []
-        monkeypatch.setattr(appmod, 'notify_early_warning',
-                            lambda **kw: warned.append(kw['percentage']) or (1, 1))
-        monkeypatch.setattr(appmod, 'EARLY_WARNING_MODE', 'daily')
-
-        assert appmod.run_early_warnings() == 1
-        assert warned == [0.0]
-
-        # Every later sweep inside the cooldown must stay silent.
-        for _ in range(5):
-            assert appmod.run_early_warnings() == 0
-        assert warned == [0.0]
-
-    def test_a_dropped_delivery_does_not_earn_a_cooldown(
-            self, appmod, seed, monkeypatch):
-        """
-        The sweep submits more jobs than the bounded pool holds, so refusals
-        are a real outcome. Recording "sent" for a refused job would suppress
-        the retry for the whole cooldown.
-        """
-        from models import EarlyWarning
-
-        self._course_with_sessions(appmod, seed)
-        monkeypatch.setattr(appmod, 'EARLY_WARNING_MODE', 'daily')
-
-        # Every channel refuses.
-        monkeypatch.setattr(appmod, 'notify_early_warning', lambda **kw: (1, 0))
-        assert appmod.run_early_warnings() == 0
-        with appmod.app.app_context():
-            assert EarlyWarning.query.count() == 0, 'no cooldown for an undelivered warning'
-
-        # The queue drains; the next sweep gets through.
-        monkeypatch.setattr(appmod, 'notify_early_warning', lambda **kw: (1, 1))
-        assert appmod.run_early_warnings() == 1
-        with appmod.app.app_context():
-            assert EarlyWarning.query.count() == 1
-
-    def test_notify_early_warning_reports_what_the_queue_did(self, appmod, seed):
-        """The return value is what the sweep trusts, so pin it down."""
-        import notifications
-        from models import User, Course
-
-        class Full:
-            def submit(self, *a, **k): return None          # queue refuses
-        class Open:
-            def submit(self, *a, **k): return object()      # queue accepts
-
-        with appmod.app.app_context():
-            student = User.query.get(seed['student_id'])
-            course = Course.query.get(seed['course_id'])
-            original = notifications.notification_executor
-            try:
-                notifications.notification_executor = Full()
-                assert notifications.notify_early_warning(
-                    student=student, course=course, percentage=10, threshold=75,
-                    preference=None, app_instance=appmod.app,
-                    mail_func=appmod.send_email) == (1, 0)
-
-                notifications.notification_executor = Open()
-                assert notifications.notify_early_warning(
-                    student=student, course=course, percentage=10, threshold=75,
-                    preference=None, app_instance=appmod.app,
-                    mail_func=appmod.send_email) == (1, 1)
-            finally:
-                notifications.notification_executor = original
-
-    def test_a_course_with_warnings_can_still_be_deleted(
-            self, appmod, seed, login, monkeypatch):
-        """
-        EarlyWarning references course.id. Postgres enforces that key, so
-        forgetting it in delete_course() breaks deletion in production and
-        nowhere else.
-        """
-        from models import db, Course, EarlyWarning
-        import datetime
-
-        self._course_with_sessions(appmod, seed)
-        with appmod.app.app_context():
-            db.session.add(EarlyWarning(student_id=seed['student_id'],
-                                        course_id=seed['course_id'],
-                                        last_sent_on=datetime.date.today(),
-                                        last_percentage=0.0))
-            db.session.commit()
-
-        coordinator = login(seed['coordinator_email'])
-        response = coordinator.post(f"/delete_course/{seed['course_id']}",
-                                    follow_redirects=True)
-        assert response.status_code == 200
-        with appmod.app.app_context():
-            assert Course.query.get(seed['course_id']) is None
-            assert EarlyWarning.query.filter_by(course_id=seed['course_id']).count() == 0
-
-
-class TestEarlyWarningPartialDelivery:
-    """
-    One student can generate four jobs (own email + WhatsApp, guardian email
-    + WhatsApp) and a full sweep submits far more than the bounded pool
-    holds, so partial acceptance is a real outcome — not an edge case.
-    """
-
-    def _struggling(self, appmod, seed, held=10):
-        from models import db, ClassSession
-        with appmod.app.app_context():
-            db.session.add_all([ClassSession(course_id=seed['course_id'], title=f'W{n}')
-                                for n in range(held)])
-            db.session.commit()
-
-    def test_a_partly_queued_warning_earns_no_cooldown(
-            self, appmod, seed, monkeypatch):
-        """
-        Settling on the first acceptance would drop the refused channels —
-        a guardian never hearing about it — for the whole cooldown.
-        """
-        from models import EarlyWarning
-
-        self._struggling(appmod, seed)
-        monkeypatch.setattr(appmod, 'EARLY_WARNING_MODE', 'daily')
-        # Two channels configured, only one taken by the queue.
-        monkeypatch.setattr(appmod, 'notify_early_warning', lambda **kw: (2, 1))
-
-        assert appmod.run_early_warnings() == 0
-        with appmod.app.app_context():
-            assert EarlyWarning.query.count() == 0
-
-        # Once the pool drains, the whole warning goes out and settles.
-        monkeypatch.setattr(appmod, 'notify_early_warning', lambda **kw: (2, 2))
-        assert appmod.run_early_warnings() == 1
-        with appmod.app.app_context():
-            assert EarlyWarning.query.count() == 1
-
-    def test_a_student_with_no_channels_configured_still_settles(
-            self, appmod, seed, monkeypatch):
-        """`attempted == 0` is nothing to deliver, not a dropped delivery."""
-        from models import EarlyWarning
-
-        self._struggling(appmod, seed)
-        monkeypatch.setattr(appmod, 'EARLY_WARNING_MODE', 'daily')
-        monkeypatch.setattr(appmod, 'notify_early_warning', lambda **kw: (0, 0))
-
-        assert appmod.run_early_warnings() == 1
-        with appmod.app.app_context():
-            assert EarlyWarning.query.count() == 1
-
-    def test_the_sweep_stops_at_the_first_refusal_instead_of_grinding_on(
-            self, appmod, seed, monkeypatch):
-        """
-        Continuing past a full queue would refuse nearly everyone. Stopping
-        leaves the remainder with no cooldown, so the next sweep resumes.
-        """
-        from models import db, User, Course, EarlyWarning
-
-        self._struggling(appmod, seed)
-        with appmod.app.app_context():
-            course = Course.query.get(seed['course_id'])
-            extra = [User(full_name=f'S{n}', email=f'extra{n}@student.funaab.edu.ng',
-                          password='x', role='student', matric_no=f'E{n:04}', level='300')
-                     for n in range(5)]
-            db.session.add_all(extra)
-            db.session.commit()
-            for student in extra:
-                student.enrolled_courses.append(course)
-            db.session.commit()
-
-        monkeypatch.setattr(appmod, 'EARLY_WARNING_MODE', 'daily')
-        calls = []
-
-        def flaky(**kw):
-            calls.append(kw['student'].id)
-            # The pool has room for two, then refuses.
-            return (1, 1) if len(calls) <= 2 else (1, 0)
-
-        monkeypatch.setattr(appmod, 'notify_early_warning', flaky)
-
-        assert appmod.run_early_warnings() == 2
-        # Two delivered, the third refused and ended the sweep — the
-        # remaining students were never even attempted.
-        assert len(calls) == 3
-        with appmod.app.app_context():
-            assert EarlyWarning.query.count() == 2
+        table_names = set(db.metadata.tables)
+        assert 'notification_preference' not in table_names
+        assert 'weekly_report' not in table_names
+        assert 'early_warning' not in table_names
