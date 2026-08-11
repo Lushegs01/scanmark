@@ -39,7 +39,7 @@ from sentry_sdk.integrations.flask import FlaskIntegration
 
 from models import (
     db, User, Course, Attendance, ClassSession, NotificationPreference,
-    WeeklyReport, enrollments,
+    WeeklyReport, EarlyWarning, enrollments,
 )
 from performance import BoundedExecutor, InstrumentedQueuePool, runtime_metrics
 from campos_integration import (
@@ -57,6 +57,7 @@ from campos_integration import (
 from notifications import (
     send_attendance_whatsapp,
     process_early_warning,
+    notify_early_warning,
     generate_student_weekly_pdf,
     generate_lecturer_weekly_pdf,
     send_weekly_report_email,
@@ -348,6 +349,38 @@ def _shutdown_background_executors():
 SCAN_CONFIRMATION_EMAILS = os.environ.get(
     'SCAN_CONFIRMATION_EMAILS', 'true'
 ).strip().lower() not in ('false', '0', 'no', 'off')
+
+# The real big-event lever. SCAN_CONFIRMATION_EMAILS only skips composing the
+# email — the user, course and preference lookups still ran on every scan, so
+# turning it off bought about 4% on a single vCPU. Setting this to off queues
+# no post-scan work at all: attendance is still recorded and still appears on
+# the lecturer's live feed and in every export; students simply do not get the
+# courtesy notification for that class.
+POST_SCAN_NOTIFICATIONS = os.environ.get(
+    'POST_SCAN_NOTIFICATIONS', 'true'
+).strip().lower() not in ('false', '0', 'no', 'off')
+
+# When the early-warning check runs.
+#   daily  (default) a scheduled sweep, one warning per student per course
+#          per EARLY_WARNING_COOLDOWN_DAYS
+#   scan   legacy: inline on every scan. Costs two COUNT queries per scan and
+#          re-warns on every single one — kept only for parity with old
+#          deployments that depend on the immediate alert.
+#   off    never
+# The check compares a semester-long average against a threshold, so a nightly
+# cadence loses nothing: the number it looks at cannot meaningfully move
+# between two scans by the same student.
+EARLY_WARNING_MODE = os.environ.get('EARLY_WARNING_MODE', 'daily').strip().lower()
+if EARLY_WARNING_MODE not in ('daily', 'scan', 'off'):
+    print(f"⚠️  Unknown EARLY_WARNING_MODE={EARLY_WARNING_MODE!r}; falling back to 'daily'")
+    EARLY_WARNING_MODE = 'daily'
+
+# Minimum days between two warnings for the same student and course. A student
+# who slips FURTHER than this many percentage points is told again regardless,
+# so a genuine decline is never sat on for a week.
+EARLY_WARNING_COOLDOWN_DAYS = int(os.environ.get('EARLY_WARNING_COOLDOWN_DAYS', 7))
+EARLY_WARNING_RETRIGGER_DROP = float(os.environ.get('EARLY_WARNING_RETRIGGER_DROP', 10))
+EARLY_WARNING_HOUR = int(os.environ.get('EARLY_WARNING_HOUR', 18))
 
 def send_async_email(app_instance, msg):
     """Send email asynchronously to avoid blocking"""
@@ -2487,20 +2520,24 @@ def _post_scan_notifications(app_instance, student_id, course_id, timestamp_str)
                         timestamp_str=timestamp_str
                     )
 
-            # ── Early-warning check (alerts student + parent if below threshold) ──
-            # Hand over the preference row we already loaded: without it the
-            # pipeline re-queries NotificationPreference twice more per scan,
-            # which is 2000-4000 wasted queries across a full class.
-            process_early_warning(
-                student=student,
-                course=course,
-                app_instance=app_instance,
-                mail_func=send_email,
-                Attendance_model=Attendance,
-                ClassSession_model=ClassSession,
-                db_session=db.session,
-                preference=pref,
-            )
+            # ── Early-warning check ──
+            # Off the scan path by default: it compares a semester-long
+            # average against a threshold, so running it per scan cost two
+            # COUNT queries every time AND re-sent the warning on every
+            # single scan. run_early_warnings() does it once a day instead.
+            if EARLY_WARNING_MODE == 'scan':
+                # Hand over the preference row we already loaded, or the
+                # pipeline re-queries it twice more.
+                process_early_warning(
+                    student=student,
+                    course=course,
+                    app_instance=app_instance,
+                    mail_func=send_email,
+                    Attendance_model=Attendance,
+                    ClassSession_model=ClassSession,
+                    db_session=db.session,
+                    preference=pref,
+                )
         except Exception:
             app_instance.logger.exception(
                 'Post-scan notification failed for user id=%s', student_id
@@ -2758,19 +2795,22 @@ def mark_attendance():
             app.logger.warning(
                 'CampOS delivery queue full; attendance id %s not reported', record_id)
 
-        # Confirmation email, WhatsApp, parent alerts and the early-warning
-        # check all run AFTER the response, on the executor.
-        timestamp_str = datetime.now().strftime('%B %d, %Y at %I:%M %p')
-        if notification_work_executor.submit(
-            _post_scan_notifications,
-            app,
-            current_user.id,
-            target['course_id'],
-            timestamp_str,
-        ) is None:
-            app.logger.warning(
-                'Notification queue full; no confirmation sent for attendance id %s',
-                record_id)
+        # Confirmation email, WhatsApp and parent alerts run AFTER the
+        # response, on the executor. POST_SCAN_NOTIFICATIONS=false skips
+        # queuing them entirely — the lever to pull for a very large event,
+        # since the lookups cost more than composing the mail does.
+        if POST_SCAN_NOTIFICATIONS:
+            timestamp_str = datetime.now().strftime('%B %d, %Y at %I:%M %p')
+            if notification_work_executor.submit(
+                _post_scan_notifications,
+                app,
+                current_user.id,
+                target['course_id'],
+                timestamp_str,
+            ) is None:
+                app.logger.warning(
+                    'Notification queue full; no confirmation sent for attendance id %s',
+                    record_id)
         checkpoint('enqueue')
 
         return respond('success', 'Attendance marked successfully!', 200, 'success')
@@ -3115,6 +3155,124 @@ def notification_settings():
 # ============================================================
 # WEEKLY REPORT SCHEDULER
 # ============================================================
+
+def run_early_warnings():
+    """
+    Warn every opted-in student whose attendance in a course has fallen below
+    their threshold — once, not once per scan.
+
+    This used to run inline on every single scan. That cost two COUNT queries
+    per scan (4,000 across a 2,000-student class) and, worse, re-sent the
+    warning every time: a student sitting below the line got one email per
+    class attended for the rest of the semester, and their parent got a copy
+    of each. The number being checked is a semester-long average, so it
+    cannot meaningfully move between two scans by the same student — a daily
+    sweep loses nothing and is a handful of GROUP BY queries for the whole
+    institution.
+    """
+    if EARLY_WARNING_MODE == 'off':
+        return 0
+
+    with app.app_context():
+        today = _utcnow().date()
+        cooldown_start = today - timedelta(days=EARLY_WARNING_COOLDOWN_DAYS)
+        sent = 0
+
+        # ── Batched aggregates, once, up front ──
+        sessions_per_course = dict(
+            db.session.query(ClassSession.course_id, func.count(ClassSession.id))
+            .group_by(ClassSession.course_id).all())
+        if not sessions_per_course:
+            return 0
+
+        # Only students who have opted in to alerts at all are candidates.
+        prefs = {
+            pref.user_id: pref
+            for pref in NotificationPreference.query.filter(
+                db.or_(NotificationPreference.email_alerts == True,
+                       NotificationPreference.whatsapp_alerts == True,
+                       NotificationPreference.notify_parent == True)
+            ).all()
+        }
+        if not prefs:
+            return 0
+        candidate_ids = list(prefs)
+
+        # Every (student, course) they are enrolled on, and how many of that
+        # course's sessions they actually attended.
+        enrolled_pairs = db.session.query(
+            enrollments.c.user_id, enrollments.c.course_id
+        ).filter(enrollments.c.user_id.in_(candidate_ids)).all()
+
+        attended = {
+            (student_id, course_id): total
+            for student_id, course_id, total in db.session.query(
+                Attendance.student_id, Attendance.course_id, func.count(Attendance.id)
+            ).filter(Attendance.student_id.in_(candidate_ids),
+                     Attendance.session_id.isnot(None))
+            .group_by(Attendance.student_id, Attendance.course_id).all()
+        }
+
+        already = {
+            (row.student_id, row.course_id): row
+            for row in EarlyWarning.query.filter(
+                EarlyWarning.student_id.in_(candidate_ids)).all()
+        }
+
+        students = {u.id: u for u in User.query.filter(User.id.in_(candidate_ids)).all()}
+        course_ids = {course_id for _student_id, course_id in enrolled_pairs}
+        courses = {c.id: c for c in Course.query.filter(Course.id.in_(course_ids)).all()}
+
+        for student_id, course_id in enrolled_pairs:
+            total_sessions = sessions_per_course.get(course_id, 0)
+            if not total_sessions:
+                continue        # nothing has been held yet; nothing to be below
+
+            pref = prefs.get(student_id)
+            threshold = (pref.warning_threshold if pref and pref.warning_threshold
+                         else DEFAULT_ATTENDANCE_THRESHOLD)
+            percentage = attended.get((student_id, course_id), 0) / total_sessions * 100
+            if percentage >= threshold:
+                continue
+
+            # Already told them recently? Stay quiet, unless they have slipped
+            # materially further since — a real decline still gets through.
+            previous = already.get((student_id, course_id))
+            if previous and previous.last_sent_on > cooldown_start:
+                dropped = (previous.last_percentage or 100) - percentage
+                if dropped < EARLY_WARNING_RETRIGGER_DROP:
+                    continue
+
+            student = students.get(student_id)
+            course = courses.get(course_id)
+            if not student or not course:
+                continue
+
+            notify_early_warning(
+                student=student,
+                course=course,
+                percentage=percentage,
+                threshold=threshold,
+                preference=pref,
+                app_instance=app,
+                mail_func=send_email,
+            )
+
+            if previous:
+                previous.last_sent_on = today
+                previous.last_percentage = percentage
+            else:
+                db.session.add(EarlyWarning(
+                    student_id=student_id, course_id=course_id,
+                    last_sent_on=today, last_percentage=percentage,
+                ))
+            sent += 1
+
+        db.session.commit()
+        if sent:
+            app.logger.info('Early-warning sweep sent %d warning(s)', sent)
+        return sent
+
 
 def run_weekly_reports():
     """Generate and email weekly PDF reports for all opted-in users."""
@@ -3522,8 +3680,23 @@ try:
             id='weekly_reports',
             replace_existing=True
         )
+        if EARLY_WARNING_MODE == 'daily':
+            scheduler.add_job(
+                func=run_early_warnings,
+                trigger='cron',
+                hour=EARLY_WARNING_HOUR,
+                minute=0,
+                id='early_warnings',
+                replace_existing=True
+            )
         scheduler.start()
         print("[OK] Weekly report scheduler active (Monday 07:00)")
+        if EARLY_WARNING_MODE == 'daily':
+            print(f"[OK] Early-warning sweep active (daily {EARLY_WARNING_HOUR:02d}:00, "
+                  f"{EARLY_WARNING_COOLDOWN_DAYS}-day cooldown)")
+        elif EARLY_WARNING_MODE == 'scan':
+            print("⚠️  EARLY_WARNING_MODE=scan: the threshold check runs on every "
+                  "scan and re-warns each time. 'daily' is the supported setting.")
 except ImportError:
     print("⚠️  APScheduler not installed. Weekly reports won't run automatically.")
     print("   Install with: pip install APScheduler")

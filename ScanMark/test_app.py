@@ -1045,3 +1045,150 @@ class TestGeofenceRequiredMode:
         response = kemi.post('/mark_attendance',
                              json={'qr_data': qr_token(appmod, seed['session_id'])})
         assert response.status_code == 200
+
+
+class TestEarlyWarningCadence:
+    """
+    The threshold check used to run inline on every scan. That cost two COUNT
+    queries per scan AND re-sent the warning every time — a student below the
+    line got one email per class attended for the rest of the semester, with
+    a copy to their parent each time.
+    """
+
+    def _struggling(self, appmod, seed, held=10, attended=2):
+        from models import db, ClassSession, Attendance, NotificationPreference
+
+        with appmod.app.app_context():
+            db.session.add(NotificationPreference(
+                user_id=seed['student_id'], email_alerts=True,
+                warning_threshold=75, notify_parent=True,
+                parent_email='guardian@example.test'))
+            sessions = [ClassSession(course_id=seed['course_id'], title=f'W{n}')
+                        for n in range(held)]
+            db.session.add_all(sessions)
+            db.session.commit()
+            for row in sessions[:attended]:
+                db.session.add(Attendance(student_id=seed['student_id'],
+                                          course_id=seed['course_id'],
+                                          session_id=row.id))
+            db.session.commit()
+
+    def test_the_sweep_warns_once_not_once_per_run(self, appmod, seed, monkeypatch):
+        from models import EarlyWarning
+
+        self._struggling(appmod, seed)
+        sent = []
+        monkeypatch.setattr(appmod, 'notify_early_warning',
+                            lambda **kwargs: sent.append(kwargs['student'].id))
+        monkeypatch.setattr(appmod, 'EARLY_WARNING_MODE', 'daily')
+
+        assert appmod.run_early_warnings() == 1
+        assert len(sent) == 1
+        # Same day, same week: silence.
+        assert appmod.run_early_warnings() == 0
+        assert appmod.run_early_warnings() == 0
+        assert len(sent) == 1
+
+        with appmod.app.app_context():
+            assert EarlyWarning.query.count() == 1
+
+    def test_a_student_who_slips_further_is_told_again_inside_the_cooldown(
+            self, appmod, seed, monkeypatch):
+        from models import db, ClassSession
+
+        # The seed fixture already opened one session, so derive the expected
+        # percentages from the database rather than assuming a round number.
+        self._struggling(appmod, seed, held=10, attended=5)
+        sent = []
+        monkeypatch.setattr(appmod, 'notify_early_warning',
+                            lambda **kwargs: sent.append(round(kwargs['percentage'])))
+        monkeypatch.setattr(appmod, 'EARLY_WARNING_MODE', 'daily')
+
+        with appmod.app.app_context():
+            held = ClassSession.query.filter_by(course_id=seed['course_id']).count()
+        first_expected = round(5 / held * 100)
+
+        assert appmod.run_early_warnings() == 1
+        assert sent == [first_expected]
+
+        # Ten more classes held, none of them attended — a material slip, so
+        # the student hears about it again despite the cooldown.
+        with appmod.app.app_context():
+            db.session.add_all([ClassSession(course_id=seed['course_id'], title=f'X{n}')
+                                for n in range(10)])
+            db.session.commit()
+        second_expected = round(5 / (held + 10) * 100)
+        assert first_expected - second_expected >= appmod.EARLY_WARNING_RETRIGGER_DROP
+
+        assert appmod.run_early_warnings() == 1
+        assert sent == [first_expected, second_expected]
+
+    def test_a_student_above_the_threshold_is_never_warned(
+            self, appmod, seed, monkeypatch):
+        self._struggling(appmod, seed, held=10, attended=9)   # 90%
+        sent = []
+        monkeypatch.setattr(appmod, 'notify_early_warning',
+                            lambda **kwargs: sent.append(1))
+        monkeypatch.setattr(appmod, 'EARLY_WARNING_MODE', 'daily')
+
+        assert appmod.run_early_warnings() == 0
+        assert sent == []
+
+    def test_off_mode_sends_nothing(self, appmod, seed, monkeypatch):
+        self._struggling(appmod, seed)
+        monkeypatch.setattr(appmod, 'EARLY_WARNING_MODE', 'off')
+        assert appmod.run_early_warnings() == 0
+
+    def test_the_scan_path_no_longer_runs_the_threshold_check(
+            self, appmod, seed, login, monkeypatch):
+        """The two COUNT queries are off the hot path in the default mode."""
+        called = []
+        monkeypatch.setattr(appmod, 'process_early_warning',
+                            lambda **kwargs: called.append(1))
+        monkeypatch.setattr(appmod, 'EARLY_WARNING_MODE', 'daily')
+
+        appmod._post_scan_notifications(appmod.app, seed['student_id'],
+                                        seed['course_id'], 'now')
+        assert called == []
+
+        monkeypatch.setattr(appmod, 'EARLY_WARNING_MODE', 'scan')
+        appmod._post_scan_notifications(appmod.app, seed['student_id'],
+                                        seed['course_id'], 'now')
+        assert called == [1]
+
+
+class TestPostScanNotificationSwitch:
+
+    def test_turning_post_scan_work_off_queues_nothing_but_still_records(
+            self, appmod, seed, login, monkeypatch):
+        """
+        SCAN_CONFIRMATION_EMAILS only skipped composing the mail; the lookups
+        still ran, so it bought ~4% under load. This is the lever that
+        actually sheds the work.
+        """
+        from models import Attendance
+
+        queued = []
+        monkeypatch.setattr(appmod.notification_work_executor, 'submit',
+                            lambda *a, **k: queued.append(a[0]) or object())
+        monkeypatch.setattr(appmod, 'POST_SCAN_NOTIFICATIONS', False)
+
+        kemi = login(seed['student_email'])
+        response = kemi.post('/mark_attendance',
+                             json={'qr_data': qr_token(appmod, seed['session_id'])})
+        assert response.status_code == 200
+        assert queued == []
+        with appmod.app.app_context():
+            assert Attendance.query.count() == 1   # the scan itself is untouched
+
+    def test_the_default_still_queues_the_courtesy_notification(
+            self, appmod, seed, login, monkeypatch):
+        queued = []
+        monkeypatch.setattr(appmod.notification_work_executor, 'submit',
+                            lambda *a, **k: queued.append(a[0]) or object())
+        monkeypatch.setattr(appmod, 'POST_SCAN_NOTIFICATIONS', True)
+
+        kemi = login(seed['student_email'])
+        kemi.post('/mark_attendance',
+                  json={'qr_data': qr_token(appmod, seed['session_id'])})
+        assert len(queued) == 1

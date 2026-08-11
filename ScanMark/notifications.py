@@ -292,6 +292,20 @@ def process_early_warning(
         NotificationPreference.query.filter_by(user_id=student.id).first()
         if preference is _PREFERENCE_UNSET else preference
     )
+    notify_early_warning(student, course, pct, threshold, pref,
+                         app_instance, mail_func)
+
+
+def notify_early_warning(student, course, percentage, threshold, preference,
+                         app_instance, mail_func):
+    """
+    Send the warning for an already-decided (student, course, percentage).
+
+    Split out from process_early_warning so a caller that computed the
+    percentage in a batch — run_early_warnings() — can send without running
+    the two COUNT queries again per student.
+    """
+    pref = preference
 
     # ── Student alerts ──
     if not pref or pref.email_alerts:
@@ -303,7 +317,7 @@ def process_early_warning(
             student.full_name,
             course.code,
             course.title,
-            pct,
+            percentage,
             threshold
         )
 
@@ -312,7 +326,7 @@ def process_early_warning(
             pref.phone_number,
             student.full_name,
             course.code,
-            pct,
+            percentage,
             threshold
         )
 
@@ -331,7 +345,7 @@ def process_early_warning(
                 student.full_name,
                 course.code,
                 course.title,
-                pct,
+                percentage,
                 threshold
             )
 
@@ -342,7 +356,7 @@ def process_early_warning(
                 parent_name,
                 student.full_name,
                 course.code,
-                pct,
+                percentage,
                 threshold
             )
 
