@@ -64,6 +64,11 @@ def appmod(flask_app):
     flask_app.limiter.enabled = False
     flask_app.app.config['WTF_CSRF_ENABLED'] = False
     flask_app.REQUIRE_EMAIL_VERIFICATION = False
+    # ScanMark ships with GEOFENCE_REQUIRED on, so an unpinned class refuses
+    # every scan. Most tests here are about something else entirely and would
+    # all have to pin a classroom first; they opt out, and the shipped default
+    # has its own tests in TestGeofenceRequiredMode.
+    flask_app.GEOFENCE_REQUIRED = False
     if flask_app.redis_client is None:
         flask_app._local_locations.clear()
 
@@ -120,8 +125,14 @@ def seed(appmod):
         db.session.commit()
 
         student.enrolled_courses.append(course)
+        db.session.commit()
+
+        # Opened the way the application opens one, so it carries the roster
+        # snapshot every percentage is computed against.
         class_session = ClassSession(course_id=course.id, title='Week 1')
         db.session.add(class_session)
+        db.session.flush()
+        appmod._snapshot_roster(class_session)
         db.session.commit()
 
         return {

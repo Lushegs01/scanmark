@@ -94,6 +94,7 @@ def test_authoritative_geofence_boundary(distance_m, expected_status):
         'lat': latitude,
         'lon': longitude,
         'location_age_ms': 100,
+        'accuracy_m': 5,
         'user_marker': str(student.id),
     })
 
@@ -116,9 +117,10 @@ def test_atomic_duplicate_guard_keeps_exactly_one_row():
     ).count() == 1
 
 
-def test_daily_session_creation_reuses_one_session():
+def test_repeated_starts_resume_the_one_open_session():
+    """A refresh of the projector page must land back on the same meeting."""
     _coordinator, _student, course, _sessions = _seed(session_count=0)
-    ids = [scanmark._get_or_create_todays_session(course).id for _ in range(20)]
+    ids = [scanmark.resume_or_start_session(course).id for _ in range(20)]
     assert len(set(ids)) == 1
     assert ClassSession.query.filter_by(course_id=course.id).count() == 1
 
@@ -225,7 +227,12 @@ def test_student_dashboard_query_budget_is_constant():
     assert len(statements) <= 6
 
 
-def test_healthz_bypasses_flask_and_database():
+def test_livez_bypasses_flask_and_database():
+    """
+    The liveness probe answers from the WSGI layer, before Flask opens a
+    session or an extension — that is what lets a cold start overlap with a
+    CampOS SSO round trip.
+    """
     statements = []
 
     def count_query(*_args):
@@ -233,12 +240,34 @@ def test_healthz_bypasses_flask_and_database():
 
     event.listen(db.engine, 'before_cursor_execute', count_query)
     try:
-        response = scanmark.app.test_client().get('/healthz')
+        response = scanmark.app.test_client().get('/livez')
     finally:
         event.remove(db.engine, 'before_cursor_execute', count_query)
     assert response.status_code == 204
     assert response.data == b''
     assert statements == []
+
+
+def test_healthz_actually_checks_the_database():
+    """
+    Readiness has to touch what a real request touches. Answering 204 from the
+    WSGI layer without reaching anything is how a deployment stays 'healthy'
+    while every request 500s on a dead database.
+    """
+    statements = []
+
+    def count_query(*_args):
+        statements.append(1)
+
+    # The result is cached for a few seconds; clear it so this probe is real.
+    scanmark._readiness_cache['report'] = None
+    event.listen(db.engine, 'before_cursor_execute', count_query)
+    try:
+        response = scanmark.app.test_client().get('/healthz')
+    finally:
+        event.remove(db.engine, 'before_cursor_execute', count_query)
+    assert response.status_code == 204
+    assert statements, 'readiness answered without querying the database'
 
 
 def test_scanner_page_uses_optimized_self_hosted_bundle():

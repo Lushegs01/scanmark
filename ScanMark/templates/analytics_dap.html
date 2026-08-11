@@ -2,31 +2,77 @@
 {% block head_extra %}<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>{% endblock %}
 {% block content %}
 <div class="container mt-4">
-    <h3 class="text-danger">🏛️ University Attendance Distribution</h3>
+    <div class="d-flex flex-column flex-md-row justify-content-between align-items-md-center gap-2 mb-3">
+        <div>
+            <h3 class="text-danger mb-1">🏛️ University Attendance Distribution</h3>
+            <p class="text-muted mb-0">{{ term_label }}</p>
+        </div>
+        <a href="{{ url_for('dap_dashboard', academic_year=academic_year, semester=semester) }}"
+            class="btn btn-secondary">← Back to Dashboard</a>
+    </div>
 
-    <div class="row justify-content-center">
-        <div class="col-md-6">
-            <div class="card p-3">
+    {% if not labels %}
+    <div class="alert alert-info">No attendance recorded for this term yet.</div>
+    {% else %}
+    <div class="row g-3">
+        <div class="col-lg-6">
+            <div class="card p-3 h-100">
+                <h6 class="text-muted">Share of recorded scans, by faculty</h6>
                 <canvas id="uniChart"></canvas>
             </div>
         </div>
+        <div class="col-lg-6">
+            <div class="card p-3 h-100">
+                <h6 class="text-muted">Attendance rate achieved, by faculty</h6>
+                <p class="small text-muted">
+                    Scans as a share of roster places. A faculty can hold the
+                    largest slice of the doughnut and still have the worst rate
+                    — the two charts answer different questions, which is why
+                    a single count labelled "Average Attendance %" answered
+                    neither.
+                </p>
+                <canvas id="rateChart"></canvas>
+            </div>
+        </div>
     </div>
+
+    <script>
+        const facultyLabels = {{ labels | tojson }};
+
+        new Chart(document.getElementById('uniChart'), {
+            type: 'doughnut',
+            data: {
+                labels: facultyLabels,
+                datasets: [{
+                    label: 'Scans recorded',
+                    data: {{ data | tojson }},
+                    backgroundColor: ['#FF6384', '#36A2EB', '#FFCE56', '#4BC0C0', '#9966FF',
+                                      '#FF9F40', '#8AC926', '#1982C4'],
+                    hoverOffset: 4
+                }]
+            },
+            options: { responsive: true }
+        });
+
+        new Chart(document.getElementById('rateChart'), {
+            type: 'bar',
+            data: {
+                labels: facultyLabels,
+                datasets: [{
+                    label: 'Attendance rate (%)',
+                    data: {{ rates | tojson }},
+                    backgroundColor: 'rgba(220, 53, 69, 0.6)'
+                }]
+            },
+            options: {
+                responsive: true,
+                plugins: { legend: { display: false } },
+                scales: {
+                    y: { beginAtZero: true, max: 100, ticks: { callback: v => v + '%' } }
+                }
+            }
+        });
+    </script>
+    {% endif %}
 </div>
-
-<script>
-    const ctx = document.getElementById('uniChart');
-
-    new Chart(ctx, {
-        type: 'doughnut',  // Donut chart looks very modern/minimalist
-        data: {
-            labels: {{ labels | tojson }},
-        datasets: [{
-            label: 'Total Scans',
-            data: {{ data | tojson }},
-        backgroundColor: ['#FF6384', '#36A2EB', '#FFCE56', '#4BC0C0', '#9966FF'],
-        hoverOffset: 4
-            }]
-        }
-    });
-</script>
 {% endblock %}

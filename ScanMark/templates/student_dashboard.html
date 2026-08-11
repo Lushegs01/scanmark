@@ -115,9 +115,14 @@
                             <td class="ps-4">
                                 <span class="fw-bold" style="color: var(--green); font-size: 0.9rem;">{{ item.code }}</span>
                                 <span class="d-block d-sm-none small" style="color: var(--text-muted);">{{ item.title }}</span>
+                                <span class="d-block small" style="color: var(--text-muted); font-size:0.7rem;">{{ item.term }}</span>
                             </td>
                             <td class="d-none d-sm-table-cell" style="color: var(--text-secondary); font-size: 0.85rem;">{{ item.title }}</td>
                             <td class="text-center">
+                                {# The denominator is the number of classes held
+                                   WHILE THIS STUDENT WAS ENROLLED, so joining
+                                   late does not start you at 0% of a term you
+                                   were not there for. #}
                                 <span class="badge bg-primary" style="font-size: 0.85rem; min-width: 32px;">
                                     {{ item.count }}{% if item.total_sessions %} / {{ item.total_sessions }}{% endif %}
                                 </span>

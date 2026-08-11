@@ -2,39 +2,89 @@
 {% block head_extra %}<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>{% endblock %}
 {% block content %}
 <div class="container mt-4">
-    <h3>👨‍💼 Department Overview: {{ dept }}</h3>
-
-    <div class="card p-3 mt-4">
-        <h5>Course Performance (Avg. Attendance %)</h5>
-        <canvas id="deptChart"></canvas>
+    <div class="d-flex flex-column flex-md-row justify-content-between align-items-md-center gap-2 mb-3">
+        <div>
+            <h3 class="mb-1">👨‍💼 Department Overview: {{ dept or '—' }}</h3>
+            <p class="text-muted mb-0">{{ term_label }}</p>
+        </div>
+        <a href="{{ url_for('hod_dashboard', academic_year=academic_year, semester=semester) }}"
+            class="btn btn-secondary">← Back to Dashboard</a>
     </div>
+
+    {% if not data.labels %}
+    <div class="alert alert-info">
+        Nothing to chart yet{{ ' — your account is not linked to a department.' if not dept else ' for this term.' }}
+    </div>
+    {% else %}
+    <div class="card p-3">
+        <h5 class="mb-1">Attendance rate by course</h5>
+        <p class="text-muted small">
+            Scans recorded as a share of the places on each class roster. The
+            chart previously plotted a raw count of scans against an axis
+            labelled "%" and capped at 100, so every course above a hundred
+            scans drew an identical full-width bar.
+        </p>
+        <canvas id="deptChart" height="120"></canvas>
+    </div>
+
+    <div class="table-responsive mt-3">
+        <table class="table table-sm table-striped align-middle">
+            <thead>
+                <tr>
+                    <th>Code</th>
+                    <th>Title</th>
+                    <th class="text-end">Classes held</th>
+                    <th class="text-end">Scans</th>
+                    <th class="text-end">Roster places</th>
+                    <th class="text-end">Attendance</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in data.meta %}
+                <tr>
+                    <td>{{ row.code }}</td>
+                    <td>{{ row.title }}</td>
+                    <td class="text-end">{{ row.sessions }}</td>
+                    <td class="text-end">{{ row.present }}</td>
+                    <td class="text-end">{{ row.expected }}</td>
+                    <td class="text-end fw-bold">{{ data.data[loop.index0] }}%</td>
+                    <td class="text-end">
+                        <a href="{{ url_for('view_attendance', course_id=row.course_id) }}"
+                            class="btn btn-sm btn-outline-primary">Open</a>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
+    <script>
+        new Chart(document.getElementById('deptChart'), {
+            type: 'bar',
+            data: {
+                labels: {{ data.labels | tojson }},
+                datasets: [{
+                    label: 'Attendance rate (%)',
+                    data: {{ data.data | tojson }},
+                    backgroundColor: 'rgba(25, 135, 84, 0.6)',
+                    borderColor: 'rgba(25, 135, 84, 1)',
+                    borderWidth: 1
+                }]
+            },
+            options: {
+                responsive: true,
+                plugins: { legend: { display: false } },
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        max: 100,
+                        ticks: { callback: value => value + '%' }
+                    }
+                }
+            }
+        });
+    </script>
+    {% endif %}
 </div>
-
-<script>
-    const ctx = document.getElementById('deptChart');
-
-    new Chart(ctx, {
-        type: 'bar',
-        data: {
-            labels: {{ data.labels | tojson }},
-        datasets: [{
-            label: 'Average Attendance %',
-            data: {{ data.data | tojson }},
-        backgroundColor: [
-            'rgba(75, 192, 192, 0.6)', // Green
-            'rgba(54, 162, 235, 0.6)', // Blue
-            'rgba(255, 99, 132, 0.6)', // Red
-            'rgba(255, 206, 86, 0.6)'  // Yellow
-        ],
-        borderWidth: 1
-            }]
-        },
-        options: {
-        responsive: true,
-        scales: {
-            y: { beginAtZero: true, max: 100 }
-        }
-    }
-    });
-</script>
 {% endblock %}

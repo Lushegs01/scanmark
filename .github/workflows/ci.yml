@@ -42,8 +42,9 @@ jobs:
       - name: Static check for undefined names
         run: |
           python -m pyflakes app.py models.py campos_integration.py \
+                             localtime.py academic.py \
                              performance.py conftest.py \
-                             test_app.py test_performance.py
+                             test_app.py test_performance.py test_bugfixes.py
 
       - name: Check the browser JavaScript parses
         run: |
@@ -127,10 +128,15 @@ jobs:
       # Production runs Postgres + Redis, and some code paths (the migration
       # DDL, the Redis-backed QR/session/limiter stores) only exist there.
       - name: Boot the real Procfile command and probe it
+        # Deliberately no SCANMARK_ENV/FLASK_ENV: an undeclared environment
+        # is production, so this step is also the check that the production
+        # startup path — real secret, Postgres, Redis, canonical origin — can
+        # actually boot.
         env:
           SECRET_KEY: ci-secret-key
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/scanmark
           REDIS_URL: redis://localhost:6379/0
+          PUBLIC_ORIGIN: http://127.0.0.1:8100
           MAIL_SERVER: 127.0.0.1
           MAIL_PORT: 2525
           WEB_CONCURRENCY: "2"
@@ -138,8 +144,11 @@ jobs:
         run: |
           gunicorn --config gunicorn.conf.py app:app &
           for _ in $(seq 1 30); do
+            # /livez is the process probe; /healthz reaches Postgres and Redis
+            # and is what proves this instance can actually serve.
             if curl -sf http://127.0.0.1:8100/healthz -o /dev/null; then
-              echo "healthz ok"
+              echo "healthz ok (database and redis reachable)"
+              curl -sf http://127.0.0.1:8100/livez -o /dev/null && echo "livez ok"
               curl -sf http://127.0.0.1:8100/login -o /dev/null && echo "login ok"
               pkill -x gunicorn
               exit 0
@@ -149,3 +158,16 @@ jobs:
           echo "server never became healthy"
           pkill -x gunicorn || true
           exit 1
+
+      - name: Refuse to boot production without its dependencies
+        env:
+          SECRET_KEY: ci-secret-key
+          PUBLIC_ORIGIN: http://127.0.0.1:8100
+        run: |
+          cd "$GITHUB_WORKSPACE/ScanMark"
+          # No DATABASE_URL and no REDIS_URL, environment undeclared: the
+          # process must refuse rather than fall back to SQLite and cookies.
+          if python -c "import app" 2>/tmp/boot.log; then
+            echo "production booted without Postgres or Redis"; exit 1
+          fi
+          grep -q CRITICAL /tmp/boot.log && echo "refused to boot, as intended"

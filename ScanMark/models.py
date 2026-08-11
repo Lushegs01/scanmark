@@ -1,17 +1,19 @@
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import UserMixin
-from datetime import datetime, timezone
 
-
-def utcnow_naive():
-    """UTC compatible with the existing timezone-naive database columns."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+from academic import current_academic_year, current_semester
+from localtime import utcnow_naive
 
 db = SQLAlchemy()
 
 enrollments = db.Table('enrollments',
     db.Column('user_id', db.Integer, db.ForeignKey('user.id'), primary_key=True),
     db.Column('course_id', db.Integer, db.ForeignKey('course.id'), primary_key=True),
+    # When this student joined the course. Sessions held before they enrolled
+    # are not theirs to miss, so the register needs the date, not just the
+    # membership. Nullable because rows written before this column existed
+    # cannot be dated after the fact.
+    db.Column('enrolled_at', db.DateTime, nullable=True, default=utcnow_naive),
     # The composite PK starts with user_id, so course-side lookups (enrolled
     # counts, class rosters) need their own index.
     db.Index('ix_enrollments_course_id', 'course_id')
@@ -41,61 +43,157 @@ class User(UserMixin, db.Model):
     # Google) set it True outright — the provider already proved the address.
     email_verified = db.Column(db.Boolean, default=False)
 
+    # Rotating this invalidates every issued credential that names this user:
+    # server-side session records, the signed session cookie and the 30-day
+    # remember-me cookie all carry it (see User.get_id), so a password change
+    # or a recovered account signs the other party out instead of leaving
+    # their existing logins working. NULL means "never rotated" and matches
+    # the empty stamp legacy cookies carry.
+    security_stamp = db.Column(db.String(32), nullable=True)
+
     enrolled_courses = db.relationship('Course', secondary=enrollments, backref='students')
-    
+
     # Roles: 'Student', 'Lecturer', 'Course Coordinator'
-    role = db.Column(db.String(20), nullable=False) 
-    
+    role = db.Column(db.String(20), nullable=False)
+
 # NEW: Links HODs/Lecturers to a Department (e.g., "Computer Science")
     department = db.Column(db.String(50), nullable=True)
 
     # Student Specifics (Nullable for Staff)
     matric_no = db.Column(db.String(20), unique=True, nullable=True)
     level = db.Column(db.String(10), nullable=True)
-    
+
     # Relationships
     attendance_records = db.relationship('Attendance', backref='student', lazy=True)
-    
+
     # HIERARCHY:
     # 1. Courses I created (as Coordinator)
     coordinated_courses = db.relationship('Course', backref='coordinator', lazy=True)
-    
+
     # 2. Courses I teach (as Invited Lecturer)
     teaching_courses = db.relationship('Course', secondary=course_instructors, backref=db.backref('instructors', lazy='dynamic'))
 
 # NEW: Links HODs/Lecturers to a Faculty (e.g., "Physical Sciences")
     faculty = db.Column(db.String(50), nullable=True)
 
+    def get_id(self):
+        """
+        Identify the session by user AND security stamp.
+
+        Flask-Login writes this string into the session record and into the
+        remember-me cookie, and hands it back to the user loader on every
+        request. Carrying the stamp is what lets a password reset revoke
+        credentials that were issued before it.
+        """
+        return f"{self.id}|{self.security_stamp or ''}"
+
 class Course(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    code = db.Column(db.String(10), unique=True, nullable=False) # e.g. CSC201
+    # NOT globally unique: the same code runs again every term. What must be
+    # unique is one OFFERING — this code, in this year, in this semester, for
+    # this section (see __table_args__).
+    code = db.Column(db.String(10), nullable=False, index=True) # e.g. CSC201
     title = db.Column(db.String(100), nullable=False)
-    
+
+    # --- The offering this course row IS ---
+    academic_year = db.Column(db.String(9), nullable=False,
+                              default=lambda: current_academic_year())
+    semester = db.Column(db.String(20), nullable=False,
+                         default=lambda: current_semester())
+    # Parallel streams of the same course. Empty string rather than NULL so the
+    # uniqueness rule below actually bites (SQL treats NULLs as distinct, so a
+    # nullable column would let the same offering be created twice).
+    section = db.Column(db.String(20), nullable=False, default='')
+    # A finished term is kept for the record but drops out of the working
+    # dashboards, reports and code-reuse checks.
+    archived = db.Column(db.Boolean, nullable=False, default=False)
+    archived_at = db.Column(db.DateTime, nullable=True)
+
 # NEW: Links a course to a department so the HOD can see it
     department = db.Column(db.String(50), nullable=True)
 
     # The Boss (Coordinator)
     coordinator_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
-    
+
     # The link to 'instructors' is handled by the backref in User
     attendance = db.relationship('Attendance', backref='course', lazy=True)
 
     # NEW: Links a course to a faculty so the Dean can see it
     faculty = db.Column(db.String(50), nullable=True)
 
+    __table_args__ = (
+        db.UniqueConstraint('code', 'academic_year', 'semester', 'section',
+                            name='uq_course_offering'),
+        db.Index('ix_course_term', 'academic_year', 'semester'),
+    )
+
+    @property
+    def term_label(self):
+        base = f"{self.academic_year} {self.semester} Semester"
+        return f"{base} · Section {self.section}" if self.section else base
+
 class ClassSession(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     course_id = db.Column(db.Integer, db.ForeignKey('course.id'), nullable=False)
     title = db.Column(db.String(100), nullable=False)  # e.g., "Week 1", "Makeup Class"
+    # When the meeting was opened. Naive UTC, like every other timestamp here.
     date_created = db.Column(db.DateTime, default=utcnow_naive)
+
+    # --- Lifecycle ---
+    # A meeting is open until somebody ends it. While `active` is False no
+    # token for this session is redeemable, whatever its age, which is what
+    # makes "End Class" mean something on the server rather than in the
+    # browser's address bar.
+    active = db.Column(db.Boolean, nullable=False, default=True)
+    ended_at = db.Column(db.DateTime, nullable=True)
+    ended_by_id = db.Column(db.Integer, nullable=True)
+
+    # Two lectures, a tutorial and a makeup class can all happen on one day.
+    # `sequence` numbers them within their local calendar day so their titles
+    # stay distinguishable.
+    kind = db.Column(db.String(20), nullable=False, default='Lecture')
+    sequence = db.Column(db.Integer, nullable=False, default=1)
 
     # This relationship links the session to all the students who scanned it
     attendances = db.relationship('Attendance', backref='session', lazy=True, cascade="all, delete-orphan")
+    roster = db.relationship('SessionRoster', backref='session', lazy=True,
+                             cascade="all, delete-orphan")
 
     # Session counts/lookups are always per course
     __table_args__ = (
         db.Index('ix_class_session_course_id', 'course_id'),
+        db.Index('ix_class_session_course_active', 'course_id', 'active'),
     )
+
+    @property
+    def is_open(self):
+        return bool(self.active) and self.ended_at is None
+
+
+class SessionRoster(db.Model):
+    """
+    Who was expected at one class meeting, frozen when the meeting opened.
+
+    Percentages have to be computed against the roster as it stood at the
+    time. Counting today's enrolment against a session held last month means a
+    student who enrolled yesterday is marked absent for classes that happened
+    before they joined, and a student who left makes everyone else's history
+    read above 100%. The snapshot is the denominator; it never moves again.
+    """
+    __tablename__ = 'session_roster'
+
+    session_id = db.Column(db.Integer, db.ForeignKey('class_session.id'),
+                           primary_key=True)
+    student_id = db.Column(db.Integer, db.ForeignKey('user.id'), primary_key=True)
+    # Denormalised so "classes this student was expected at, in this course"
+    # is one indexed single-table count instead of a join per dashboard row.
+    course_id = db.Column(db.Integer, db.ForeignKey('course.id'), nullable=False)
+
+    __table_args__ = (
+        db.Index('ix_session_roster_student_course', 'student_id', 'course_id'),
+        db.Index('ix_session_roster_course', 'course_id'),
+    )
+
 
 class Attendance(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -119,4 +217,40 @@ class Attendance(db.Model):
         db.Index('ix_attendance_session_id', 'session_id'),
         db.Index('ix_attendance_session_cursor', 'session_id', 'id'),
         db.Index('ix_attendance_course_student', 'course_id', 'student_id'),
+    )
+
+
+class AuditLog(db.Model):
+    """
+    Append-only record of who destroyed what.
+
+    Deliberately carries NO foreign keys: the whole point is to outlive the
+    rows it describes, and a FK to course.id would either block the delete it
+    is recording or be cascaded away with it. Nothing in the application ever
+    updates or deletes a row here.
+    """
+    __tablename__ = 'audit_log'
+
+    id = db.Column(db.Integer, primary_key=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=utcnow_naive)
+
+    actor_id = db.Column(db.Integer, nullable=True)
+    actor_email = db.Column(db.String(120), nullable=True)
+    actor_role = db.Column(db.String(20), nullable=True)
+
+    action = db.Column(db.String(50), nullable=False)
+    target_type = db.Column(db.String(50), nullable=True)
+    target_id = db.Column(db.Integer, nullable=True)
+    # A readable name for something that no longer exists to be looked up.
+    target_label = db.Column(db.String(200), nullable=True)
+    # JSON blob of whatever context the action needs (row counts, term, etc).
+    details = db.Column(db.Text, nullable=True)
+
+    ip_address = db.Column(db.String(45), nullable=True)
+    user_agent = db.Column(db.String(200), nullable=True)
+
+    __table_args__ = (
+        db.Index('ix_audit_log_created_at', 'created_at'),
+        db.Index('ix_audit_log_target', 'target_type', 'target_id'),
+        db.Index('ix_audit_log_actor', 'actor_id'),
     )

@@ -6,9 +6,12 @@
 
         <h2 class="mb-1">Scan to Mark Attendance</h2>
         <h4 class="text-success mb-1">{{ course.code }} — {{ course.title }}</h4>
-        <p class="text-muted mb-4">
+        <p class="text-muted mb-1">
             <span class="badge bg-success">{{ session.title }}</span>
-            <span class="ms-1">{{ session.date_created.strftime('%A, %d %B %Y') }}</span>
+            <span class="ms-1">{{ session.date_created | local_dt('%A, %d %B %Y, %I:%M %p') }}</span>
+        </p>
+        <p class="text-muted small mb-4">
+            {{ course.term_label }} · {{ expected_total }} student{{ '' if expected_total == 1 else 's' }} on today's roster
         </p>
 
         <!-- QR Code Image -->
@@ -31,12 +34,19 @@
             </span>
         </div>
 
-        <!-- FIX #3 & #4: Single clean stop button that goes to the correct URL -->
-        <form action="{{ url_for('lecturer_dashboard') }}" method="GET">
+        <!-- Ending the class is a server-side action, not a navigation. This
+             used to be a GET form pointing at the dashboard, so the class
+             stayed open and its code stayed valid after the lecturer left. -->
+        <form action="{{ url_for('end_session', session_id=session.id) }}" method="POST"
+            onsubmit="return confirm('End “{{ session.title }}”? Its QR code stops working immediately and no further student can scan in.')">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <button type="submit" class="btn btn-danger btn-lg mt-3 w-100">
-                🛑 End Class & Stop Tracking
+                🛑 End Class &amp; Close Attendance
             </button>
         </form>
+        <a href="{{ url_for('lecturer_dashboard') }}" class="btn btn-link mt-2">
+            Leave this screen without ending the class
+        </a>
 
     </div>
 </div>
@@ -173,8 +183,23 @@
     let timeLeft = QR_TOKEN_TTL;
     const timerEl = document.getElementById('timer');
     const qrImage = document.getElementById('qrImage');
+    let qrTimer = null;
 
-    setInterval(() => {
+    // The class can be ended from another device — the projector laptop and
+    // the lecturer's phone are both signed in. When that happens the image
+    // endpoint answers 409 and this screen has to stop claiming to be live.
+    qrImage.addEventListener('error', () => {
+        if (qrTimer) clearInterval(qrTimer);
+        timerEl.innerText = '—';
+        qrImage.alt = 'This class has ended.';
+        const alertEl = document.getElementById('locationAlert');
+        alertEl.classList.remove('alert-success', 'alert-warning');
+        alertEl.classList.add('alert-danger');
+        document.getElementById('locationStatus').innerText =
+            'This class has ended. No further scans will be accepted.';
+    });
+
+    qrTimer = setInterval(() => {
         timeLeft--;
         timerEl.innerText = Math.max(0, timeLeft);
 

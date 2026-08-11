@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container mt-4">
+    <div class="d-flex flex-column flex-md-row justify-content-between align-items-md-center gap-2 mb-3">
+        <div>
+            <h2 class="mb-1">🧾 Audit Trail — {{ course.code }}</h2>
+            <p class="text-muted mb-0">
+                {{ course.title }} &nbsp;·&nbsp; {{ course.term_label }}
+                &nbsp;·&nbsp; times in {{ local_timezone_name }}
+            </p>
+        </div>
+        <a href="{{ url_for('view_attendance', course_id=course.id) }}" class="btn btn-secondary">
+            ← Back to attendance
+        </a>
+    </div>
+
+    <p class="text-muted small">
+        Append-only. Nothing in ScanMark edits or removes an entry, and the
+        table holds no foreign keys, so a record survives the course, session
+        or attendance row it describes.
+    </p>
+
+    <div class="table-responsive">
+        <table class="table table-sm table-striped align-middle">
+            <thead>
+                <tr>
+                    <th>When</th>
+                    <th>Who</th>
+                    <th>Action</th>
+                    <th>Target</th>
+                    <th>Details</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for entry in entries %}
+                <tr>
+                    <td class="text-nowrap small">{{ entry.created_at | local_dt }}</td>
+                    <td class="small">
+                        {{ entry.actor_email or 'unknown' }}
+                        <span class="text-muted">({{ entry.actor_role or '—' }})</span>
+                    </td>
+                    <td><code>{{ entry.action }}</code></td>
+                    <td class="small">{{ entry.target_label or (entry.target_type ~ ' #' ~ entry.target_id) }}</td>
+                    <td class="small text-muted" style="max-width: 26rem; overflow-wrap: anywhere;">
+                        {{ entry.details or '' }}
+                    </td>
+                </tr>
+                {% else %}
+                <tr>
+                    <td colspan="5" class="text-center text-muted py-4">
+                        Nothing recorded for this course yet.
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
+    {% if pagination.pages > 1 %}
+    <nav aria-label="Audit pages">
+        <ul class="pagination justify-content-center">
+            <li class="page-item {{ 'disabled' if not pagination.has_prev }}">
+                <a class="page-link" href="{{ url_for('course_audit', course_id=course.id, page=pagination.prev_num) if pagination.has_prev else '#' }}">Previous</a>
+            </li>
+            <li class="page-item disabled"><span class="page-link">Page {{ pagination.page }} of {{ pagination.pages }}</span></li>
+            <li class="page-item {{ 'disabled' if not pagination.has_next }}">
+                <a class="page-link" href="{{ url_for('course_audit', course_id=course.id, page=pagination.next_num) if pagination.has_next else '#' }}">Next</a>
+            </li>
+        </ul>
+    </nav>
+    {% endif %}
+</div>
+{% endblock %}

@@ -2,30 +2,83 @@
 
 {% block content %}
 <div class="container mt-4">
-    <div class="d-flex justify-content-between align-items-center mb-4">
+    <div class="d-flex flex-column flex-md-row justify-content-between align-items-md-center gap-2 mb-4">
         <div>
-            <h2 class="text-success fw-bold">🎓 Dean's Dashboard</h2>
-            <p class="text-muted">Faculty: <strong>{{ faculty }}</strong></p>
+            <h2 class="text-success fw-bold mb-1">🎓 Dean's Dashboard</h2>
+            <p class="text-muted mb-0">
+                Faculty: <strong>{{ faculty or '—' }}</strong> &nbsp;·&nbsp; {{ term_label }}
+            </p>
         </div>
     </div>
 
-    <div class="row text-center mb-5">
-        <div class="col-md-6">
+    {% if not faculty %}
+    <div class="alert alert-warning">
+        Your account is not linked to a faculty, so there is nothing to report on.
+    </div>
+    {% endif %}
+
+    <div class="row text-center mb-4">
+        <div class="col-md-4">
             <div class="card text-white bg-success mb-3 shadow-sm">
                 <div class="card-body">
                     <h1 class="display-4 fw-bold">{{ course_count }}</h1>
-                    <p class="card-text">Total Faculty Courses</p>
+                    <p class="card-text">Courses this term</p>
                 </div>
             </div>
         </div>
-        <div class="col-md-6">
+        <div class="col-md-4">
             <div class="card text-white bg-secondary mb-3 shadow-sm">
                 <div class="card-body">
+                    {# Counted on the normalised role. `role == 'lecturer'`
+                       matched only CampOS-created accounts and silently
+                       ignored every self-signup, which stores 'Lecturer'. #}
                     <h1 class="display-4 fw-bold">{{ lecturer_count }}</h1>
-                    <p class="card-text">Total Lecturers</p>
+                    <p class="card-text">Teaching staff</p>
                 </div>
             </div>
         </div>
+        <div class="col-md-4">
+            <div class="card text-white bg-dark mb-3 shadow-sm">
+                <div class="card-body">
+                    <h1 class="display-4 fw-bold">{{ department_rows | length }}</h1>
+                    <p class="card-text">Departments</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <h4>Attendance by department</h4>
+    <div class="table-responsive">
+        <table class="table table-striped align-middle">
+            <thead>
+                <tr>
+                    <th>Department</th>
+                    <th class="text-end">Courses</th>
+                    <th class="text-end">Scans</th>
+                    <th class="text-end">Roster places</th>
+                    <th class="text-end">Attendance</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in department_rows %}
+                <tr>
+                    <td>{{ row.department }}</td>
+                    <td class="text-end">{{ row.courses }}</td>
+                    <td class="text-end">{{ row.present }}</td>
+                    <td class="text-end">{{ row.expected }}</td>
+                    <td class="text-end fw-bold">
+                        {{ row.pct ~ '%' if row.pct is not none else '—' }}
+                    </td>
+                </tr>
+                {% else %}
+                <tr>
+                    <td colspan="5" class="text-center text-muted py-4">
+                        No courses recorded for this faculty in {{ term_label }}.
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
     </div>
 </div>
 {% endblock %}

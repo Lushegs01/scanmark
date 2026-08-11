@@ -726,12 +726,18 @@ class TestGeofence:
         with appmod.app.app_context():
             appmod.set_class_location(course_id, lat, lon)
 
-    def _scan_at_metres(self, appmod, seed, client, metres):
+    def _scan_at_metres(self, appmod, seed, client, metres, **overrides):
         lat = 7.22 + (metres / 111320.0)
-        return client.post('/mark_attendance', json={
+        payload = {
             'qr_data': qr_token(appmod, seed['session_id']),
             'lat': lat, 'lon': 3.44,
-        }).get_json()
+            # Both are required now. They used to be accepted-if-present and
+            # ignored otherwise, so omitting them was the way past the check.
+            'accuracy_m': 10,
+            'location_age_ms': 1000,
+        }
+        payload.update(overrides)
+        return client.post('/mark_attendance', json=payload).get_json()
 
     def test_the_configured_radius_is_what_is_enforced(self, appmod, seed, login):
         """
@@ -766,8 +772,50 @@ class TestGeofence:
         self._pin(appmod, seed['course_id'], lat=0.0, lon=0.0)
         kemi = login(seed['student_email'])
         response = kemi.post('/mark_attendance', json={
-            'qr_data': qr_token(appmod, seed['session_id']), 'lat': 0.0, 'lon': 0.0})
+            'qr_data': qr_token(appmod, seed['session_id']), 'lat': 0.0, 'lon': 0.0,
+            'accuracy_m': 10, 'location_age_ms': 500})
         assert response.get_json()['status'] == 'success'
+
+    @pytest.mark.parametrize('missing', ['accuracy_m', 'location_age_ms'])
+    def test_the_fields_that_prove_a_reading_cannot_be_left_out(
+            self, appmod, seed, login, missing):
+        """
+        Both were read only `if isinstance(...)`, so a payload that simply
+        omitted them sailed through every freshness and precision check. A
+        scan submitted by hand is not obliged to be honest, but it is obliged
+        to be complete.
+        """
+        self._pin(appmod, seed['course_id'])
+        kemi = login(seed['student_email'])
+        payload = {
+            'qr_data': qr_token(appmod, seed['session_id']),
+            'lat': 7.22, 'lon': 3.44, 'accuracy_m': 10, 'location_age_ms': 500,
+        }
+        payload.pop(missing)
+        response = kemi.post('/mark_attendance', json=payload)
+        assert response.status_code == 422
+        with appmod.app.app_context():
+            from models import Attendance
+            assert Attendance.query.count() == 0
+
+    def test_a_fix_too_imprecise_to_mean_anything_is_refused(
+            self, appmod, seed, login):
+        """A 5km error radius 'inside' a 100m geofence proves nothing."""
+        self._pin(appmod, seed['course_id'])
+        kemi = login(seed['student_email'])
+        result = self._scan_at_metres(appmod, seed, kemi, 5,
+                                      accuracy_m=appmod.GEOFENCE_MAX_ACCURACY_M + 1)
+        assert result['status'] == 'error'
+        assert 'too imprecise' in result['message']
+
+    def test_a_stale_fix_is_refused(self, appmod, seed, login):
+        self._pin(appmod, seed['course_id'])
+        kemi = login(seed['student_email'])
+        result = self._scan_at_metres(
+            appmod, seed, kemi, 5,
+            location_age_ms=appmod.GEOFENCE_MAX_LOCATION_AGE_MS + 1)
+        assert result['status'] == 'error'
+        assert 'stale' in result['message'].lower()
 
     def test_no_pin_means_no_geofence(self, appmod, seed, login):
         kemi = login(seed['student_email'])
@@ -1021,9 +1069,22 @@ class TestGeofenceRequiredMode:
         with appmod.app.app_context():
             assert Attendance.query.count() == 0
 
-    def test_the_default_stays_permissive_so_a_class_is_never_locked_out(
-            self, appmod, seed, login):
-        assert appmod.GEOFENCE_REQUIRED is False
+    def test_the_shipped_default_is_to_require_a_pinned_classroom(self, appmod):
+        """
+        This used to default OFF, and the failure mode was silent and total:
+        a lecturer who dismissed one browser location prompt recorded a whole
+        term of attendance that anyone could have submitted from anywhere,
+        with nothing on the register saying so. Refusing is loud and fixable
+        in ten seconds.
+
+        (The suite's own fixture turns it back off — see conftest — because
+        almost every other test here is about something else.)
+        """
+        assert appmod._env_flag('GEOFENCE_REQUIRED', True) is True
+
+    def test_turning_it_off_is_still_possible_and_deliberate(
+            self, appmod, seed, login, monkeypatch):
+        monkeypatch.setattr(appmod, 'GEOFENCE_REQUIRED', False)
         kemi = login(seed['student_email'])
         response = kemi.post('/mark_attendance',
                              json={'qr_data': qr_token(appmod, seed['session_id'])})
