@@ -21,7 +21,7 @@ from markupsafe import escape
 from flask_login import LoginManager, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
 from sqlalchemy import event, func, inspect, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import joinedload, selectinload
 from sqlalchemy.pool import Pool
@@ -1920,6 +1920,22 @@ def get_enrolled_students(course_id):
     })
 
 # FIX #9: DELETE only via POST (removed GET)
+def _forget_legacy_table(name):
+    """
+    Drop a legacy table from the per-worker list once it no longer exists.
+
+    Each gunicorn worker detects the list at boot and heals its own copy the
+    first time a table turns out to be gone, so dropping the tables never
+    needs a restart.
+    """
+    global LEGACY_COURSE_REF_TABLES
+    LEGACY_COURSE_REF_TABLES = tuple(
+        table for table in LEGACY_COURSE_REF_TABLES if table != name
+    )
+    app.logger.info(
+        'Legacy table %s no longer exists; it will not be cleared again.', name)
+
+
 @app.route('/delete_course/<int:course_id>', methods=['POST'])
 @login_required
 def delete_course(course_id):
@@ -1938,12 +1954,23 @@ def delete_course(course_id):
     # Tables left behind by an upgrade from a release that still had the
     # notification stack. The model is gone but the FOREIGN KEY is not, so
     # historical rows would otherwise block this delete.
-    for legacy_table in LEGACY_COURSE_REF_TABLES:
-        db.session.execute(
-            db.text(f'DELETE FROM {db.engine.dialect.identifier_preparer.quote(legacy_table)} '
-                    f'WHERE course_id = :course_id'),
-            {'course_id': course_id},
-        )
+    for legacy_table in tuple(LEGACY_COURSE_REF_TABLES):
+        quoted = db.engine.dialect.identifier_preparer.quote(legacy_table)
+        try:
+            # SAVEPOINT, because the startup message invites an operator to
+            # drop these tables whenever they like — including while this is
+            # serving. Without it, the first DELETE against a table that has
+            # since gone aborts the whole transaction on Postgres, and every
+            # course deletion 500s until all workers restart.
+            with db.session.begin_nested():
+                db.session.execute(
+                    db.text(f'DELETE FROM {quoted} WHERE course_id = :course_id'),
+                    {'course_id': course_id},
+                )
+        except (ProgrammingError, OperationalError):
+            # It has been dropped since boot. Stop asking for it; the
+            # savepoint means the rest of this deletion is still good.
+            _forget_legacy_table(legacy_table)
 
     db.session.delete(course)
     db.session.commit()
@@ -3063,7 +3090,7 @@ with app.app_context():
     if LEGACY_COURSE_REF_TABLES:
         print(f"[MIGRATION] Legacy notification table(s) still present: "
               f"{', '.join(LEGACY_COURSE_REF_TABLES)}. Course deletion clears "
-              f"them; drop them when convenient.")
+              f"them. Safe to DROP at any time, including while running.")
 
     # Release the scoped session before disposing preload connections.  This
     # also keeps in-memory SQLite smoke tests from tearing down a live session.
