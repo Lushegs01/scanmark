@@ -2103,8 +2103,12 @@ def delete_course(course_id):
         flash('Unauthorised: Only the course creator can delete it.', 'error')
         return redirect(url_for('dashboard'))
 
+    # Clear every table that references this course before removing it.
+    # Postgres enforces the foreign keys (SQLite does not, unless asked), so
+    # missing one here means the delete fails in production and nowhere else.
     Attendance.query.filter_by(course_id=course_id).delete()
     ClassSession.query.filter_by(course_id=course_id).delete()
+    EarlyWarning.query.filter_by(course_id=course_id).delete()
     db.session.delete(course)
     db.session.commit()
     flash(f'Course "{course.code}" has been deleted.', 'success')
@@ -3185,24 +3189,25 @@ def run_early_warnings():
         if not sessions_per_course:
             return 0
 
-        # Only students who have opted in to alerts at all are candidates.
+        # Every (student, course) pair on a course that has actually held a
+        # session. Candidates are NOT drawn from NotificationPreference: that
+        # row only exists once someone has opened the settings page, and both
+        # the model default and the inline check treat a missing row as
+        # "email alerts on". Selecting on the table would have silently
+        # dropped every student who never touched their settings — which is
+        # most of them, and disproportionately the ones a warning is for.
+        enrolled_pairs = db.session.query(
+            enrollments.c.user_id, enrollments.c.course_id
+        ).filter(enrollments.c.course_id.in_(list(sessions_per_course))).all()
+        if not enrolled_pairs:
+            return 0
+        candidate_ids = sorted({student_id for student_id, _course_id in enrolled_pairs})
+
         prefs = {
             pref.user_id: pref
             for pref in NotificationPreference.query.filter(
-                db.or_(NotificationPreference.email_alerts == True,
-                       NotificationPreference.whatsapp_alerts == True,
-                       NotificationPreference.notify_parent == True)
-            ).all()
+                NotificationPreference.user_id.in_(candidate_ids)).all()
         }
-        if not prefs:
-            return 0
-        candidate_ids = list(prefs)
-
-        # Every (student, course) they are enrolled on, and how many of that
-        # course's sessions they actually attended.
-        enrolled_pairs = db.session.query(
-            enrollments.c.user_id, enrollments.c.course_id
-        ).filter(enrollments.c.user_id.in_(candidate_ids)).all()
 
         attended = {
             (student_id, course_id): total
@@ -3229,6 +3234,11 @@ def run_early_warnings():
                 continue        # nothing has been held yet; nothing to be below
 
             pref = prefs.get(student_id)
+            # A row that silences every channel is the one real opt-out.
+            if pref and not (pref.email_alerts or pref.whatsapp_alerts
+                             or pref.notify_parent):
+                continue
+
             threshold = (pref.warning_threshold if pref and pref.warning_threshold
                          else DEFAULT_ATTENDANCE_THRESHOLD)
             percentage = attended.get((student_id, course_id), 0) / total_sessions * 100
@@ -3239,8 +3249,12 @@ def run_early_warnings():
             # materially further since — a real decline still gets through.
             previous = already.get((student_id, course_id))
             if previous and previous.last_sent_on > cooldown_start:
-                dropped = (previous.last_percentage or 100) - percentage
-                if dropped < EARLY_WARNING_RETRIGGER_DROP:
+                # `or 100` here would read 0.0 as "no record" and make the drop
+                # 100 points every day, so the students on nought percent — the
+                # ones this whole guard exists for — would be warned daily.
+                last = (previous.last_percentage
+                        if previous.last_percentage is not None else 100)
+                if last - percentage < EARLY_WARNING_RETRIGGER_DROP:
                     continue
 
             student = students.get(student_id)
@@ -3248,7 +3262,11 @@ def run_early_warnings():
             if not student or not course:
                 continue
 
-            notify_early_warning(
+            # Only record the cooldown when delivery was actually accepted.
+            # The outbound pool is bounded, and an institution-wide sweep can
+            # submit more jobs than it holds — writing "sent" for a job the
+            # queue dropped would suppress the retry for the whole cooldown.
+            if not notify_early_warning(
                 student=student,
                 course=course,
                 percentage=percentage,
@@ -3256,7 +3274,9 @@ def run_early_warnings():
                 preference=pref,
                 app_instance=app,
                 mail_func=send_email,
-            )
+            ):
+                runtime_metrics.increment('early_warning.delivery_rejected')
+                continue
 
             if previous:
                 previous.last_sent_on = today
