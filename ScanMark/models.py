@@ -150,6 +150,30 @@ class NotificationPreference(db.Model):
     user = db.relationship('User', backref=db.backref('notification_pref', uselist=False))
 
 
+class EarlyWarning(db.Model):
+    """
+    Last time a student was warned that their attendance in one course had
+    fallen below their threshold.
+
+    One row per (student, course), updated in place. Without it the warning
+    fired on every single scan: a student sitting below the line got one
+    email per class attended for the rest of the semester, and their parent
+    got a copy of each.
+    """
+    id = db.Column(db.Integer, primary_key=True)
+    student_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    course_id = db.Column(db.Integer, db.ForeignKey('course.id'), nullable=False)
+    last_sent_on = db.Column(db.Date, nullable=False)
+    # The percentage that triggered the most recent warning, so a student who
+    # keeps slipping can be told again even inside the cooldown.
+    last_percentage = db.Column(db.Float, nullable=True)
+
+    __table_args__ = (
+        db.Index('uq_early_warning_student_course', 'student_id', 'course_id',
+                 unique=True),
+    )
+
+
 class WeeklyReport(db.Model):
     """Tracks sent weekly reports to avoid duplicates."""
     id = db.Column(db.Integer, primary_key=True)
