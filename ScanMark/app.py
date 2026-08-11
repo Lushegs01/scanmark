@@ -266,6 +266,14 @@ def external_url_for(endpoint, **values):
     return f"{PUBLIC_ORIGIN_SCHEME}://{PUBLIC_ORIGIN_HOST}{url_for(endpoint, **values)}"
 
 
+# Probes reach an instance by pod IP or private hostname, not by the public
+# name — a platform health check has no reason to know it. They return no user
+# data and build no URLs, so there is nothing here for a Host header to
+# poison, and refusing them would leave the instance permanently unhealthy in
+# exactly the deployments the readiness check exists for.
+HOST_CHECK_EXEMPT_PATHS = frozenset({'/healthz', '/livez'})
+
+
 @app.before_request
 def reject_untrusted_host():
     """
@@ -274,7 +282,7 @@ def reject_untrusted_host():
     Without this the header is attacker-controlled input that reaches password
     reset links, absolute redirects and cached responses.
     """
-    if not TRUSTED_HOSTS:
+    if not TRUSTED_HOSTS or request.path in HOST_CHECK_EXEMPT_PATHS:
         return None
     host = (request.host or '').lower()
     if host in TRUSTED_HOSTS:
@@ -3282,25 +3290,48 @@ def register_course():
         flash("Enter a course code, for example CSC201.", "error")
         return redirect(url_for('student_dashboard'))
 
-    # A code names several offerings now — one per term. Register for the one
-    # running this term, not the first row that happens to match.
+    # A code names several offerings now — one per term, and possibly several
+    # sections within a term.
     academic_year, semester = academic_term_of()
-    course = (Course.query
-              .filter(Course.code == course_code, Course.archived.is_(False))
-              .filter(*_term_filters(academic_year, semester))
-              .order_by(Course.section.asc())
-              .first())
-    if not course:
+    section = _clean_text(request.form.get('section'), 20).upper()
+
+    offerings = (Course.query
+                 .filter(Course.code == course_code, Course.archived.is_(False))
+                 .filter(*_term_filters(academic_year, semester))
+                 .order_by(Course.section.asc())
+                 .all())
+    if not offerings:
         # Still offer whatever current offering exists, so a course created
         # under a term label that differs from the calendar's is reachable.
-        course = (Course.query
-                  .filter(Course.code == course_code, Course.archived.is_(False))
-                  .order_by(Course.academic_year.desc(), Course.semester.desc())
-                  .first())
+        offerings = (Course.query
+                     .filter(Course.code == course_code,
+                             Course.archived.is_(False))
+                     .order_by(Course.academic_year.desc(),
+                               Course.semester.desc(),
+                               Course.section.asc())
+                     .all()[:1])
 
-    if not course:
+    if not offerings:
         flash("Course not found!", "error")
         return redirect(url_for('student_dashboard'))
+
+    if section:
+        offerings = [row for row in offerings if row.section.upper() == section]
+        if not offerings:
+            flash(f"{course_code} has no section {section} this term.", "error")
+            return redirect(url_for('student_dashboard'))
+
+    # Never guess. Picking the first section alphabetically puts the student on
+    # the wrong roster: they are missing from their real section's register and
+    # their scans there are refused as "not registered", with nothing on either
+    # screen explaining why.
+    if len(offerings) > 1:
+        available = ', '.join(row.section or '(unnamed)' for row in offerings)
+        flash(f"{course_code} runs in more than one section this term "
+              f"({available}). Enter your section to register.", "warning")
+        return redirect(url_for('student_dashboard'))
+
+    course = offerings[0]
 
     if course in current_user.enrolled_courses:
         flash(f"You are already registered for {course.code}.", "info")
@@ -3418,6 +3449,22 @@ def create_class_session(course, kind='Lecture', title=None):
     return session_row
 
 
+def _close_session_row(session_row, reason='ended'):
+    """
+    Mark a meeting closed WITHOUT committing, so the caller decides the
+    transaction boundary. Returns True when this call did the closing.
+    """
+    if session_row.ended_at is not None:
+        return False
+    session_row.active = False
+    session_row.ended_at = _utcnow()
+    session_row.ended_by_id = getattr(current_user, 'id', None)
+    record_audit('session.end', 'class_session', session_row.id,
+                 session_row.title, course_id=session_row.course_id,
+                 reason=reason)
+    return True
+
+
 def end_class_session(session_row, reason='ended'):
     """
     Close a meeting: no further scan can land on it, whatever token it holds.
@@ -3426,13 +3473,7 @@ def end_class_session(session_row, reason='ended'):
     The cached token is dropped too, so a projector screenshot taken a second
     ago stops working immediately rather than at the end of its window.
     """
-    if session_row.ended_at is None:
-        session_row.active = False
-        session_row.ended_at = _utcnow()
-        session_row.ended_by_id = getattr(current_user, 'id', None)
-        record_audit('session.end', 'class_session', session_row.id,
-                     session_row.title, course_id=session_row.course_id,
-                     reason=reason)
+    if _close_session_row(session_row, reason):
         db.session.commit()
 
     _invalidate_session_caches(session_row)
@@ -3480,11 +3521,22 @@ def resume_or_start_session(course, kind='Lecture', force_new=False, title=None)
         # Starting a new meeting closes whatever was left running, so a
         # lecturer who forgot to press End Class does not have two live
         # sessions competing for the same scans.
+        #
+        # Closing and creating happen in ONE transaction, because the
+        # advisory lock is held only until the transaction ends. Committing
+        # the close first would drop the lock in the gap before the new
+        # session exists, and a second worker arriving in that gap would see
+        # no open session and create one of its own — two live meetings, the
+        # exact outcome the lock is here to prevent.
         stale = open_session_for(course.id)
         if stale:
-            end_class_session(stale, reason='superseded')
+            _close_session_row(stale, reason='superseded')
 
-        return create_class_session(course, kind=kind, title=title)
+        session_row = create_class_session(course, kind=kind, title=title)
+        if stale:
+            # After the commit: this is Redis, not part of the transaction.
+            _invalidate_session_caches(stale)
+        return session_row
 
 
 @app.route('/generate_qr/<int:course_id>', methods=['POST'])
@@ -4723,6 +4775,34 @@ with app.app_context():
         except Exception as _error:
             conn.rollback()
             _fatal_migration('drop the global course.code unique constraint', _error)
+
+        # ...and put the replacement invariant in its place. create_all() never
+        # alters an existing table, so on an upgraded database dropping the old
+        # constraint without adding this one would leave offerings with NO
+        # uniqueness at all — two simultaneous /add_course posts would both
+        # pass the pre-insert lookup and split one course's enrolments and
+        # sessions across two rows. A fresh database already has the model's
+        # constraint; do not add a redundant second index over it.
+        _course_uniques = database_inspector.get_unique_constraints('course')
+        _course_indexes = database_inspector.get_indexes('course')
+        _offering_columns = ['code', 'academic_year', 'semester', 'section']
+        _has_offering_unique = any(
+            sorted(c.get('column_names') or []) == sorted(_offering_columns)
+            for c in _course_uniques
+        ) or any(
+            i.get('unique') and sorted(i.get('column_names') or []) == sorted(_offering_columns)
+            for i in _course_indexes
+        )
+        if not _has_offering_unique:
+            try:
+                conn.execute(db.text(
+                    'CREATE UNIQUE INDEX IF NOT EXISTS uq_course_offering '
+                    'ON course (code, academic_year, semester, section)'))
+                conn.commit()
+                print('[MIGRATION] Added the per-offering unique index on course')
+            except Exception as _error:
+                conn.rollback()
+                _fatal_migration('create the per-offering unique index', _error)
 
         # Nullable links keep standalone/local accounts valid while enforcing
         # one ScanMark account per CampOS subject. New databases may already

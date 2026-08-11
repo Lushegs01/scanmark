@@ -619,10 +619,14 @@ class TestForeignKeysAreEnforced:
                     last_sent_on DATE NOT NULL,
                     last_percentage FLOAT
                 )'''))
+            # An explicit id: `id INTEGER PRIMARY KEY` auto-increments on
+            # SQLite but is a plain NOT NULL column on Postgres, and this
+            # test exists for a Postgres-only failure mode — it has to be
+            # able to run there.
             db.session.execute(
                 db.text('INSERT INTO early_warning '
-                        '(student_id, course_id, last_sent_on, last_percentage) '
-                        'VALUES (:s, :c, :d, 0.0)'),
+                        '(id, student_id, course_id, last_sent_on, last_percentage) '
+                        'VALUES (1, :s, :c, :d, 0.0)'),
                 {'s': seed['student_id'], 'c': seed['course_id'],
                  'd': datetime.date.today()})
             db.session.commit()
@@ -1441,3 +1445,190 @@ class TestTheAuditLogIsNotCollateral:
                 course_id=seed['course_id']).all()
             assert {entry.action for entry in surviving} >= {
                 'session.start', 'course.delete'}
+
+
+# ============================================================
+# FOLLOW-UPS FROM REVIEW OF THIS BRANCH
+# ============================================================
+
+class TestHealthProbesReachTheApp:
+
+    def test_a_probe_connecting_by_ip_is_not_refused(self, appmod, monkeypatch):
+        """
+        Moving /healthz behind Flask put it behind the host filter too. A
+        platform or Kubernetes probe connects by pod IP and has no reason to
+        know the public hostname, so the instance would never become healthy
+        in exactly the deployments the readiness check exists for.
+        """
+        monkeypatch.setattr(appmod, 'TRUSTED_HOSTS', {'scanmark.funaab.edu.ng'})
+        appmod._readiness_cache['report'] = None
+        client = appmod.app.test_client()
+
+        assert client.get('/healthz', base_url='http://10.0.1.7:8000').status_code == 204
+        assert client.get('/livez', base_url='http://10.0.1.7:8000').status_code == 204
+        # Everything else still is refused.
+        assert client.get('/login', base_url='http://10.0.1.7:8000').status_code == 421
+
+
+class TestOfferingUniquenessSurvivesUpgrade:
+
+    def test_the_database_enforces_one_row_per_offering(self, appmod):
+        """
+        Dropping the old global UNIQUE on course.code without adding the
+        replacement leaves offerings with no uniqueness at all — two
+        simultaneous /add_course posts both pass the pre-insert lookup and
+        split one course's enrolments and sessions across two rows.
+        """
+        from models import db
+
+        with appmod.app.app_context():
+            inspector = db.inspect(db.engine)
+            wanted = sorted(['code', 'academic_year', 'semester', 'section'])
+            constrained = any(
+                sorted(c.get('column_names') or []) == wanted
+                for c in inspector.get_unique_constraints('course')
+            ) or any(
+                index.get('unique')
+                and sorted(index.get('column_names') or []) == wanted
+                for index in inspector.get_indexes('course')
+            )
+        assert constrained, 'no database-level uniqueness on a course offering'
+
+    def test_a_concurrent_duplicate_offering_is_refused_by_the_database(
+            self, appmod, seed):
+        from sqlalchemy.exc import IntegrityError
+        from models import db, Course
+
+        with appmod.app.app_context():
+            existing = db.session.get(Course, seed['course_id'])
+            # Bypasses the route's pre-insert lookup entirely, which is what a
+            # second worker effectively does when it interleaves.
+            db.session.add(Course(code=existing.code, title='Racing',
+                                  coordinator_id=existing.coordinator_id,
+                                  academic_year=existing.academic_year,
+                                  semester=existing.semester,
+                                  section=existing.section))
+            with pytest.raises(IntegrityError):
+                db.session.commit()
+            db.session.rollback()
+
+
+class TestSectionsAreNotGuessed:
+
+    def _second_section(self, appmod, seed, section='B'):
+        from models import db, Course
+        with appmod.app.app_context():
+            original = db.session.get(Course, seed['course_id'])
+            original.section = 'A'
+            twin = Course(code=original.code, title=original.title,
+                          coordinator_id=original.coordinator_id,
+                          department=original.department,
+                          faculty=original.faculty,
+                          academic_year=original.academic_year,
+                          semester=original.semester, section=section)
+            db.session.add(twin)
+            db.session.commit()
+            return twin.id
+
+    def test_an_ambiguous_code_asks_rather_than_picking_the_first(
+            self, appmod, seed, login):
+        """
+        Ordering by section and taking the first put every student in section
+        A: missing from their real section's register, and their scans there
+        refused as "not registered" with nothing explaining why.
+        """
+        from models import db, User
+
+        self._second_section(appmod, seed)
+        tayo = login(seed['other_student_email'])
+        response = tayo.post('/register_course', data={'course_code': 'CSC201'},
+                             follow_redirects=True)
+        assert b'more than one section' in response.data
+        with appmod.app.app_context():
+            assert db.session.get(User, seed['other_student_id']).enrolled_courses == []
+
+    def test_naming_the_section_registers_for_that_one(self, appmod, seed, login):
+        from models import db, User
+
+        twin_id = self._second_section(appmod, seed)
+        tayo = login(seed['other_student_email'])
+        tayo.post('/register_course',
+                  data={'course_code': 'CSC201', 'section': 'b'})
+        with appmod.app.app_context():
+            enrolled = db.session.get(User, seed['other_student_id']).enrolled_courses
+            assert [course.id for course in enrolled] == [twin_id]
+
+    def test_an_unknown_section_is_refused(self, appmod, seed, login):
+        from models import db, User
+
+        self._second_section(appmod, seed)
+        tayo = login(seed['other_student_email'])
+        response = tayo.post('/register_course',
+                             data={'course_code': 'CSC201', 'section': 'Z'},
+                             follow_redirects=True)
+        assert b'no section Z' in response.data
+        with appmod.app.app_context():
+            assert db.session.get(User, seed['other_student_id']).enrolled_courses == []
+
+    def test_a_single_section_course_still_needs_no_section(
+            self, appmod, seed, login):
+        from models import db, User
+
+        tayo = login(seed['other_student_email'])
+        tayo.post('/register_course', data={'course_code': 'CSC201'})
+        with appmod.app.app_context():
+            enrolled = db.session.get(User, seed['other_student_id']).enrolled_courses
+            assert [course.id for course in enrolled] == [seed['course_id']]
+
+
+class TestStartingAMeetingIsOneTransaction:
+
+    def test_closing_the_old_session_and_opening_the_new_one_are_atomic(
+            self, appmod, seed, login):
+        """
+        The advisory lock is held only until the transaction ends. Committing
+        the close first dropped it in the gap before the new session existed,
+        and a second worker arriving in that gap would see no open session and
+        create one of its own — two live meetings.
+        """
+        from models import db, ClassSession
+
+        commits = []
+        real_commit = db.session.commit
+
+        def counting_commit(*args, **kwargs):
+            commits.append(1)
+            return real_commit(*args, **kwargs)
+
+        # Signed in so the audit entry the close writes has an actor.
+        login(seed['coordinator_email'])
+        with appmod.app.app_context():
+            course = db.session.get(appmod.Course, seed['course_id'])
+            db.session.commit = counting_commit
+            try:
+                appmod.resume_or_start_session(course, force_new=True)
+            finally:
+                db.session.commit = real_commit
+
+        # One commit covers both the close and the create.
+        assert len(commits) == 1, f'{len(commits)} commits, so the lock was dropped'
+
+        with appmod.app.app_context():
+            open_rows = ClassSession.query.filter_by(
+                course_id=seed['course_id'], active=True).all()
+        assert len(open_rows) == 1
+
+    def test_only_one_session_stays_open_however_often_a_new_one_is_started(
+            self, appmod, seed, login):
+        from models import ClassSession
+
+        ada = login(seed['coordinator_email'])
+        for _ in range(5):
+            ada.post(f"/course/{seed['course_id']}/start_session",
+                     data={'new_session': '1'})
+
+        with appmod.app.app_context():
+            assert ClassSession.query.filter_by(
+                course_id=seed['course_id'], active=True).count() == 1
+            assert ClassSession.query.filter_by(
+                course_id=seed['course_id']).count() == 6

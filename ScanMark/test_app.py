@@ -1209,10 +1209,14 @@ class TestLegacyNotificationTables:
                     last_sent_on DATE NOT NULL,
                     last_percentage FLOAT
                 )'''))
+            # An explicit id: `id INTEGER PRIMARY KEY` auto-increments on
+            # SQLite but is a plain NOT NULL column on Postgres, and this
+            # test exists for a Postgres-only failure mode — it has to be
+            # able to run there.
             db.session.execute(
                 db.text('INSERT INTO early_warning '
-                        '(student_id, course_id, last_sent_on, last_percentage) '
-                        'VALUES (:s, :c, :d, 0.0)'),
+                        '(id, student_id, course_id, last_sent_on, last_percentage) '
+                        'VALUES (1, :s, :c, :d, 0.0)'),
                 {'s': seed['student_id'], 'c': seed['course_id'],
                  'd': datetime.date.today()})
             db.session.commit()

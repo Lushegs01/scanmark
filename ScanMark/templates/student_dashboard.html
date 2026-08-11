@@ -83,6 +83,13 @@
                 <div class="input-group">
                     <input type="text" name="course_code" class="form-control"
                         placeholder="Enter Course Code (e.g. CSC 301)" required>
+                    {# Only needed when a course runs several sections in one
+                       term; leaving it blank is fine otherwise. The server
+                       refuses to guess rather than putting a student on the
+                       wrong section's roster. #}
+                    <input type="text" name="section" class="form-control"
+                        style="max-width: 8rem;" placeholder="Section" maxlength="20"
+                        aria-label="Section (only if your course has several)">
                     <button type="submit" class="btn btn-primary d-flex align-items-center gap-1">
                         <i class="fas fa-plus fa-xs"></i> Join
                     </button>
