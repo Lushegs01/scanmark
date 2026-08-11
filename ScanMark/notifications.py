@@ -49,8 +49,10 @@ else:
 # Thread pool for async notifications
 notification_executor = BoundedExecutor(
     name='outbound_notification',
-    max_workers=int(os.environ.get('OUTBOUND_NOTIFICATION_WORKERS', 3)),
-    max_queue=int(os.environ.get('OUTBOUND_NOTIFICATION_QUEUE_SIZE', 2000)),
+    max_workers=int(os.environ.get('OUTBOUND_NOTIFICATION_WORKERS')
+                    or os.environ.get('BACKGROUND_WORKERS') or 3),
+    max_queue=int(os.environ.get('OUTBOUND_NOTIFICATION_QUEUE_SIZE',
+                                 os.environ.get('BACKGROUND_QUEUE_MAXSIZE', 2000))),
     metrics=runtime_metrics,
 )
 

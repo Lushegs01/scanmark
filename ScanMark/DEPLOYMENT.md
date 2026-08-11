@@ -24,12 +24,13 @@ Capacity is accepted only from the staging matrix below.
 | `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` | 5 / 5 | **Per worker.** Postgres sees up to `workers × (pool + overflow)` connections — 40 with defaults. Keep below your plan's connection cap, or put PgBouncer in front when scaling out. |
 | `SCAN_CONFIRMATION_EMAILS` | true | Set `false` during huge events to stop sending one email per scan. |
 | `GEOFENCE_RADIUS_M` | 100 | Max metres between the pinned class location and a scanning student. Phone GPS inside buildings is often 20–50m off — don't set this too tight. |
+| `GEOFENCE_REQUIRED` | false | What happens when a lecturer never pins a classroom (they dismissed the browser's GPS prompt). Default **false**: the distance check is skipped and the class is marked with no proximity requirement at all. Set **true** when attendance is graded and you would rather refuse a scan than record an unverifiable one — but note it locks out every class whose lecturer has not granted location, so announce it before switching it on. The QR screen tells the lecturer which of the two applies. |
 | `REQUIRE_EMAIL_VERIFICATION` | on in production | Self-service signups must click an emailed link before their password works. **Do not turn this off in production** — the signup form accepts any address, including a `@staff` one the registrant does not own. CampOS SSO and Google sign-ins are pre-verified and unaffected. |
 | `MIN_PASSWORD_LENGTH` | 10 | Enforced identically at signup and at password reset. |
 | `ANON_RATE_LIMIT_PER_MINUTE` / `ANON_RATE_LIMIT_PER_DAY` | 20000 / 500000 | Default budget for *anonymous* requests, which are keyed by IP — one campus NAT is a single key for thousands of phones. Sensitive unauthenticated endpoints carry their own tight per-address limits on top of this. |
-| `BACKGROUND_QUEUE_MAXSIZE` / `BACKGROUND_WORKERS` | 2000 / 10 | Pending background notifications before new ones are shed. Scans are never dropped — only the courtesy email/WhatsApp. A saturated queue logs a warning. |
+| `BACKGROUND_QUEUE_MAXSIZE` / `BACKGROUND_WORKERS` | 2000 / per-pool | Fleet-wide defaults for every bounded background pool. The per-pool variables below override them. Pending background notifications before new ones are shed — scans are never dropped, only the courtesy email/WhatsApp, and a saturated queue logs a warning naming the attendance id that went unnotified. |
 | `HSTS_MAX_AGE` | 31536000 | `Strict-Transport-Security` max-age, sent in production only. |
-| `SSO_JWT_SECRET` | — | Shared secret for CampOS SSO. **No fallback**: SSO token verification is disabled until this is set (must match CampOS Core). |
+| `CAMPOS_SSO_SECRET` | — | Shared secret for CampOS SSO; must match CampOS Core's `SSO_JWT_SECRET_SCANMARK`. SSO fails closed until it is set, and production additionally requires at least 32 bytes. `SSO_JWT_SECRET` is still read as a rollout fallback, but new deployments should set `CAMPOS_SSO_SECRET`. |
 | `REMEMBER_COOKIE_DAYS` | 30 | How long "remember me" keeps students signed in. Longer = fewer morning login stampedes. |
 | `STATIC_MAX_AGE` | 86400 | Cache-Control max-age (seconds) WhiteNoise puts on /static files. |
 | `SENTRY_DSN` | — | Optional error monitoring. |
@@ -38,9 +39,10 @@ Capacity is accepted only from the staging matrix below.
 | `NOTIFICATION_WORKERS` / `NOTIFICATION_QUEUE_SIZE` | 6 / 2000 | Bounded post-scan work. Alert on rejection or oldest-job age. |
 | `CAMPOS_WORKERS` / `CAMPOS_QUEUE_SIZE` | 4 / 2000 | Separate bounded CampOS delivery path. |
 | `OUTBOUND_NOTIFICATION_WORKERS` / `OUTBOUND_NOTIFICATION_QUEUE_SIZE` | 3 / 2000 | Provider delivery pool. |
-| `SCAN_LOG_SAMPLE_RATE` | 0.02 | Privacy-safe successful scan timing sample; all error outcomes log. |
+| `SCAN_LOG_SAMPLE_RATE` | 0.02 | Fraction of *successful* scans that get a timing line. Every non-success outcome is always logged. Keeps a 2,000-scan class to ~40 lines rather than 2,000. |
 | `SCANMARK_DISABLE_SCHEDULER` | false | Set only in tests or a deployment where scheduling is owned externally. |
-| `QR window` | 45s (code) | `QR_CODE_WINDOW` in app.py — how stale a scanned token may be when *processed*. Tied to router timeout; change in code, not env. |
+| `QR_TOKEN_TTL` | 12 | Seconds a token is cached and displayed before the projector rotates to a new one. The countdown on the QR screen reads this value. |
+| `QR_CODE_WINDOW` | 45 | How stale a scanned token may be when the request is **processed**, not when it was scanned. It must stay comfortably above your p99 scan latency or legitimate queued scans bounce as "expired" and their phones retry, amplifying the burst. It is also the replay window: for this long, a photograph of the projected code will mark somebody present, so keep the geofence on as the real presence check. The service worker reads this value from the server so the offline queue can never promise to redeem a token the server will refuse. |
 
 ## Roles
 

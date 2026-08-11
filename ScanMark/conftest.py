@@ -50,6 +50,10 @@ def appmod(flask_app):
 
     with flask_app.app.app_context():
         db.session.remove()
+        # Another test file may have dropped the schema on its way out, so
+        # make sure it exists before emptying it — the suite has to pass in
+        # any collection order.
+        db.create_all()
         # Delete rather than drop_all/create_all: the association tables are
         # plain Table objects and this keeps the schema (and its indexes,
         # including the duplicate-scan unique index) exactly as booted.

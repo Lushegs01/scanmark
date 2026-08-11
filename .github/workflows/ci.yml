@@ -35,10 +35,35 @@ jobs:
           pip install pyflakes
 
       # Every undefined name that reached main (selectinload, joinedload, json,
-      # enrollments, IntegrityError, event) would have been caught right here,
-      # in under a second, before anything else ran.
+      # enrollments, IntegrityError, event, email_executor) would have been
+      # caught right here, in under a second, before anything else ran.
+      # `email_executor` in particular reached production and 500'd signup:
+      # this job must be a REQUIRED check on the branch, or it just watches.
       - name: Static check for undefined names
-        run: python -m pyflakes app.py models.py campos_integration.py notifications.py
+        run: |
+          python -m pyflakes app.py models.py campos_integration.py \
+                             notifications.py performance.py \
+                             conftest.py test_app.py test_performance.py
+
+      - name: Check the browser JavaScript parses
+        run: |
+          node --check static/scanner.js
+          node --check static/service-worker.js
+
+      - name: Check every Jinja template compiles
+        env:
+          SECRET_KEY: ci-secret-key
+          DATABASE_URL: sqlite:///ci-templates.db
+          FLASK_ENV: ci
+          SCANMARK_DISABLE_SCHEDULER: "1"
+        run: |
+          python -c "
+          import os, app
+          env = app.app.jinja_env
+          for name in sorted(os.listdir('templates')):
+              env.get_template(name)
+          print(f'{len(os.listdir(\"templates\"))} templates compile')
+          "
 
       - name: Import the app (runs create_all + migrations + backfill)
         env:
