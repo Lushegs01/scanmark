@@ -1934,6 +1934,17 @@ def delete_course(course_id):
     # missing one here means the delete fails in production and nowhere else.
     Attendance.query.filter_by(course_id=course_id).delete()
     ClassSession.query.filter_by(course_id=course_id).delete()
+
+    # Tables left behind by an upgrade from a release that still had the
+    # notification stack. The model is gone but the FOREIGN KEY is not, so
+    # historical rows would otherwise block this delete.
+    for legacy_table in LEGACY_COURSE_REF_TABLES:
+        db.session.execute(
+            db.text(f'DELETE FROM {db.engine.dialect.identifier_preparer.quote(legacy_table)} '
+                    f'WHERE course_id = :course_id'),
+            {'course_id': course_id},
+        )
+
     db.session.delete(course)
     db.session.commit()
     flash(f'Course "{course.code}" has been deleted.', 'success')
@@ -3032,6 +3043,27 @@ with app.app_context():
             except Exception as e:
                 conn.rollback()
                 print(f"[MIGRATION] Index creation failed (will retry next boot): {e}")
+
+    # ── Legacy notification tables ──
+    # A database upgraded from a release that still had the notification
+    # stack keeps `early_warning`, and its FOREIGN KEY to course.id is still
+    # enforced by Postgres. Dropping the model does not drop the table:
+    # db.create_all() only ever creates. So the rows are not inert — they
+    # block DELETE on any course they reference, which surfaces as a 500 on
+    # /delete_course in production and nowhere else.
+    #
+    # Detected once at boot rather than dropped: `notification_preference`
+    # holds addresses and phone numbers people typed in, and silently
+    # destroying that on a deploy is not this code's call to make. Clear the
+    # references instead, and drop the tables by hand when you are ready.
+    LEGACY_COURSE_REF_TABLES = tuple(
+        name for name in ('early_warning',)
+        if inspect(db.engine).has_table(name)
+    )
+    if LEGACY_COURSE_REF_TABLES:
+        print(f"[MIGRATION] Legacy notification table(s) still present: "
+              f"{', '.join(LEGACY_COURSE_REF_TABLES)}. Course deletion clears "
+              f"them; drop them when convenient.")
 
     # Release the scoped session before disposing preload connections.  This
     # also keeps in-memory SQLite smoke tests from tearing down a live session.
