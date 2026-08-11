@@ -111,7 +111,9 @@ def send_warning_whatsapp(phone, student_name, course_code, attendance_pct, thre
         f"Please attend the next class to improve your record.\n\n"
         f"_ScanMark • FUNAAB_"
     )
-    notification_executor.submit(send_whatsapp_message, phone, message)
+    # Returns None when the bounded queue refused the job, so callers can
+    # tell "delivered" from "dropped" instead of assuming the former.
+    return notification_executor.submit(send_whatsapp_message, phone, message)
 
 
 # ============================================================
@@ -141,7 +143,7 @@ def send_parent_warning_whatsapp(phone, parent_name, student_name, course_code, 
         f"Please encourage them to attend upcoming classes.\n\n"
         f"_ScanMark • FUNAAB_"
     )
-    notification_executor.submit(send_whatsapp_message, phone, message)
+    return notification_executor.submit(send_whatsapp_message, phone, message)
 
 
 def send_parent_attendance_email(app_instance, mail_func, pref, student_name, course_code, course_title, timestamp_str):
@@ -304,12 +306,32 @@ def notify_early_warning(student, course, percentage, threshold, preference,
     Split out from process_early_warning so a caller that computed the
     percentage in a batch — run_early_warnings() — can send without running
     the two COUNT queries again per student.
+
+    Returns (attempted, accepted): how many channels this student has
+    configured, and how many the bounded outbound pool actually took.
+
+    Callers need both numbers, not a verdict. A batch caller must not record
+    a cooldown unless every attempted channel was queued — settling on the
+    first acceptance would drop the refused channels for the whole cooldown
+    — and `attempted == 0` means nothing was configured, which is settled
+    rather than dropped. Refusal is a real outcome here: one student can
+    generate four jobs and a full sweep submits far more than the pool holds.
     """
     pref = preference
+    attempted = 0
+    accepted = 0
+
+    def track(result):
+        nonlocal attempted, accepted
+        attempted += 1
+        if result is not None:
+            accepted += 1
 
     # ── Student alerts ──
+    # No preference row means the student has never opened the settings page.
+    # The model default is email_alerts=True, so that is a warning to send.
     if not pref or pref.email_alerts:
-        notification_executor.submit(
+        track(notification_executor.submit(
             _send_warning_email_task,
             app_instance,
             mail_func,
@@ -319,16 +341,16 @@ def notify_early_warning(student, course, percentage, threshold, preference,
             course.title,
             percentage,
             threshold
-        )
+        ))
 
     if pref and pref.whatsapp_alerts and pref.phone_number:
-        send_warning_whatsapp(
+        track(send_warning_whatsapp(
             pref.phone_number,
             student.full_name,
             course.code,
             percentage,
             threshold
-        )
+        ))
 
     # ── Parent / Guardian alerts ──
     if pref and pref.notify_parent:
@@ -336,7 +358,7 @@ def notify_early_warning(student, course, percentage, threshold, preference,
 
         # Email the parent
         if pref.parent_email:
-            notification_executor.submit(
+            track(notification_executor.submit(
                 _send_parent_warning_email_task,
                 app_instance,
                 mail_func,
@@ -347,18 +369,20 @@ def notify_early_warning(student, course, percentage, threshold, preference,
                 course.title,
                 percentage,
                 threshold
-            )
+            ))
 
         # WhatsApp the parent
         if pref.parent_phone:
-            send_parent_warning_whatsapp(
+            track(send_parent_warning_whatsapp(
                 pref.parent_phone,
                 parent_name,
                 student.full_name,
                 course.code,
                 percentage,
                 threshold
-            )
+            ))
+
+    return attempted, accepted
 
 
 def _send_warning_email_task(app_instance, mail_func, email, name, code, title, pct, threshold):

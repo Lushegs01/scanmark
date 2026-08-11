@@ -1079,7 +1079,7 @@ class TestEarlyWarningCadence:
         self._struggling(appmod, seed)
         sent = []
         monkeypatch.setattr(appmod, 'notify_early_warning',
-                            lambda **kwargs: sent.append(kwargs['student'].id))
+                            lambda **kwargs: sent.append(kwargs['student'].id) or (1, 1))
         monkeypatch.setattr(appmod, 'EARLY_WARNING_MODE', 'daily')
 
         assert appmod.run_early_warnings() == 1
@@ -1101,7 +1101,7 @@ class TestEarlyWarningCadence:
         self._struggling(appmod, seed, held=10, attended=5)
         sent = []
         monkeypatch.setattr(appmod, 'notify_early_warning',
-                            lambda **kwargs: sent.append(round(kwargs['percentage'])))
+                            lambda **kwargs: sent.append(round(kwargs['percentage'])) or (1, 1))
         monkeypatch.setattr(appmod, 'EARLY_WARNING_MODE', 'daily')
 
         with appmod.app.app_context():
@@ -1128,7 +1128,7 @@ class TestEarlyWarningCadence:
         self._struggling(appmod, seed, held=10, attended=9)   # 90%
         sent = []
         monkeypatch.setattr(appmod, 'notify_early_warning',
-                            lambda **kwargs: sent.append(1))
+                            lambda **kwargs: sent.append(1) or (1, 1))
         monkeypatch.setattr(appmod, 'EARLY_WARNING_MODE', 'daily')
 
         assert appmod.run_early_warnings() == 0
@@ -1192,3 +1192,248 @@ class TestPostScanNotificationSwitch:
         kemi.post('/mark_attendance',
                   json={'qr_data': qr_token(appmod, seed['session_id'])})
         assert len(queued) == 1
+
+
+class TestEarlyWarningSweepEdges:
+    """
+    Four defects caught in review of the sweep. Each one only shows up in a
+    situation the happy-path tests never reach.
+    """
+
+    def _course_with_sessions(self, appmod, seed, held=10):
+        from models import db, ClassSession
+        with appmod.app.app_context():
+            db.session.add_all([ClassSession(course_id=seed['course_id'], title=f'W{n}')
+                                for n in range(held)])
+            db.session.commit()
+
+    def test_a_student_who_never_opened_settings_is_still_warned(
+            self, appmod, seed, monkeypatch):
+        """
+        Candidates were drawn from NotificationPreference, but that row only
+        exists once someone has saved their settings. The model default and
+        the inline check both treat a missing row as email-alerts-on, so
+        selecting on the table silently excluded most of the cohort.
+        """
+        from models import NotificationPreference
+
+        self._course_with_sessions(appmod, seed)
+        with appmod.app.app_context():
+            assert NotificationPreference.query.filter_by(
+                user_id=seed['student_id']).first() is None, 'fixture must have no pref row'
+
+        warned = []
+        monkeypatch.setattr(appmod, 'notify_early_warning',
+                            lambda **kw: warned.append(kw['student'].id) or (1, 1))
+        monkeypatch.setattr(appmod, 'EARLY_WARNING_MODE', 'daily')
+
+        assert appmod.run_early_warnings() == 1
+        assert warned == [seed['student_id']]
+
+    def test_a_student_who_silenced_every_channel_is_not_warned(
+            self, appmod, seed, monkeypatch):
+        from models import db, NotificationPreference
+
+        self._course_with_sessions(appmod, seed)
+        with appmod.app.app_context():
+            db.session.add(NotificationPreference(
+                user_id=seed['student_id'], email_alerts=False,
+                whatsapp_alerts=False, notify_parent=False))
+            db.session.commit()
+
+        warned = []
+        monkeypatch.setattr(appmod, 'notify_early_warning',
+                            lambda **kw: warned.append(1) or (1, 1))
+        monkeypatch.setattr(appmod, 'EARLY_WARNING_MODE', 'daily')
+
+        assert appmod.run_early_warnings() == 0
+        assert warned == []
+
+    def test_a_student_on_zero_percent_is_not_warned_every_single_day(
+            self, appmod, seed, monkeypatch):
+        """
+        `previous.last_percentage or 100` read a stored 0.0 as "no record",
+        making the drop 100 points on every sweep — so the students on nought
+        percent, the ones the guard exists for, were warned daily.
+        """
+        self._course_with_sessions(appmod, seed)   # zero attendance -> 0%
+
+        warned = []
+        monkeypatch.setattr(appmod, 'notify_early_warning',
+                            lambda **kw: warned.append(kw['percentage']) or (1, 1))
+        monkeypatch.setattr(appmod, 'EARLY_WARNING_MODE', 'daily')
+
+        assert appmod.run_early_warnings() == 1
+        assert warned == [0.0]
+
+        # Every later sweep inside the cooldown must stay silent.
+        for _ in range(5):
+            assert appmod.run_early_warnings() == 0
+        assert warned == [0.0]
+
+    def test_a_dropped_delivery_does_not_earn_a_cooldown(
+            self, appmod, seed, monkeypatch):
+        """
+        The sweep submits more jobs than the bounded pool holds, so refusals
+        are a real outcome. Recording "sent" for a refused job would suppress
+        the retry for the whole cooldown.
+        """
+        from models import EarlyWarning
+
+        self._course_with_sessions(appmod, seed)
+        monkeypatch.setattr(appmod, 'EARLY_WARNING_MODE', 'daily')
+
+        # Every channel refuses.
+        monkeypatch.setattr(appmod, 'notify_early_warning', lambda **kw: (1, 0))
+        assert appmod.run_early_warnings() == 0
+        with appmod.app.app_context():
+            assert EarlyWarning.query.count() == 0, 'no cooldown for an undelivered warning'
+
+        # The queue drains; the next sweep gets through.
+        monkeypatch.setattr(appmod, 'notify_early_warning', lambda **kw: (1, 1))
+        assert appmod.run_early_warnings() == 1
+        with appmod.app.app_context():
+            assert EarlyWarning.query.count() == 1
+
+    def test_notify_early_warning_reports_what_the_queue_did(self, appmod, seed):
+        """The return value is what the sweep trusts, so pin it down."""
+        import notifications
+        from models import User, Course
+
+        class Full:
+            def submit(self, *a, **k): return None          # queue refuses
+        class Open:
+            def submit(self, *a, **k): return object()      # queue accepts
+
+        with appmod.app.app_context():
+            student = User.query.get(seed['student_id'])
+            course = Course.query.get(seed['course_id'])
+            original = notifications.notification_executor
+            try:
+                notifications.notification_executor = Full()
+                assert notifications.notify_early_warning(
+                    student=student, course=course, percentage=10, threshold=75,
+                    preference=None, app_instance=appmod.app,
+                    mail_func=appmod.send_email) == (1, 0)
+
+                notifications.notification_executor = Open()
+                assert notifications.notify_early_warning(
+                    student=student, course=course, percentage=10, threshold=75,
+                    preference=None, app_instance=appmod.app,
+                    mail_func=appmod.send_email) == (1, 1)
+            finally:
+                notifications.notification_executor = original
+
+    def test_a_course_with_warnings_can_still_be_deleted(
+            self, appmod, seed, login, monkeypatch):
+        """
+        EarlyWarning references course.id. Postgres enforces that key, so
+        forgetting it in delete_course() breaks deletion in production and
+        nowhere else.
+        """
+        from models import db, Course, EarlyWarning
+        import datetime
+
+        self._course_with_sessions(appmod, seed)
+        with appmod.app.app_context():
+            db.session.add(EarlyWarning(student_id=seed['student_id'],
+                                        course_id=seed['course_id'],
+                                        last_sent_on=datetime.date.today(),
+                                        last_percentage=0.0))
+            db.session.commit()
+
+        coordinator = login(seed['coordinator_email'])
+        response = coordinator.post(f"/delete_course/{seed['course_id']}",
+                                    follow_redirects=True)
+        assert response.status_code == 200
+        with appmod.app.app_context():
+            assert Course.query.get(seed['course_id']) is None
+            assert EarlyWarning.query.filter_by(course_id=seed['course_id']).count() == 0
+
+
+class TestEarlyWarningPartialDelivery:
+    """
+    One student can generate four jobs (own email + WhatsApp, guardian email
+    + WhatsApp) and a full sweep submits far more than the bounded pool
+    holds, so partial acceptance is a real outcome — not an edge case.
+    """
+
+    def _struggling(self, appmod, seed, held=10):
+        from models import db, ClassSession
+        with appmod.app.app_context():
+            db.session.add_all([ClassSession(course_id=seed['course_id'], title=f'W{n}')
+                                for n in range(held)])
+            db.session.commit()
+
+    def test_a_partly_queued_warning_earns_no_cooldown(
+            self, appmod, seed, monkeypatch):
+        """
+        Settling on the first acceptance would drop the refused channels —
+        a guardian never hearing about it — for the whole cooldown.
+        """
+        from models import EarlyWarning
+
+        self._struggling(appmod, seed)
+        monkeypatch.setattr(appmod, 'EARLY_WARNING_MODE', 'daily')
+        # Two channels configured, only one taken by the queue.
+        monkeypatch.setattr(appmod, 'notify_early_warning', lambda **kw: (2, 1))
+
+        assert appmod.run_early_warnings() == 0
+        with appmod.app.app_context():
+            assert EarlyWarning.query.count() == 0
+
+        # Once the pool drains, the whole warning goes out and settles.
+        monkeypatch.setattr(appmod, 'notify_early_warning', lambda **kw: (2, 2))
+        assert appmod.run_early_warnings() == 1
+        with appmod.app.app_context():
+            assert EarlyWarning.query.count() == 1
+
+    def test_a_student_with_no_channels_configured_still_settles(
+            self, appmod, seed, monkeypatch):
+        """`attempted == 0` is nothing to deliver, not a dropped delivery."""
+        from models import EarlyWarning
+
+        self._struggling(appmod, seed)
+        monkeypatch.setattr(appmod, 'EARLY_WARNING_MODE', 'daily')
+        monkeypatch.setattr(appmod, 'notify_early_warning', lambda **kw: (0, 0))
+
+        assert appmod.run_early_warnings() == 1
+        with appmod.app.app_context():
+            assert EarlyWarning.query.count() == 1
+
+    def test_the_sweep_stops_at_the_first_refusal_instead_of_grinding_on(
+            self, appmod, seed, monkeypatch):
+        """
+        Continuing past a full queue would refuse nearly everyone. Stopping
+        leaves the remainder with no cooldown, so the next sweep resumes.
+        """
+        from models import db, User, Course, EarlyWarning
+
+        self._struggling(appmod, seed)
+        with appmod.app.app_context():
+            course = Course.query.get(seed['course_id'])
+            extra = [User(full_name=f'S{n}', email=f'extra{n}@student.funaab.edu.ng',
+                          password='x', role='student', matric_no=f'E{n:04}', level='300')
+                     for n in range(5)]
+            db.session.add_all(extra)
+            db.session.commit()
+            for student in extra:
+                student.enrolled_courses.append(course)
+            db.session.commit()
+
+        monkeypatch.setattr(appmod, 'EARLY_WARNING_MODE', 'daily')
+        calls = []
+
+        def flaky(**kw):
+            calls.append(kw['student'].id)
+            # The pool has room for two, then refuses.
+            return (1, 1) if len(calls) <= 2 else (1, 0)
+
+        monkeypatch.setattr(appmod, 'notify_early_warning', flaky)
+
+        assert appmod.run_early_warnings() == 2
+        # Two delivered, the third refused and ended the sweep — the
+        # remaining students were never even attempted.
+        assert len(calls) == 3
+        with appmod.app.app_context():
+            assert EarlyWarning.query.count() == 2
