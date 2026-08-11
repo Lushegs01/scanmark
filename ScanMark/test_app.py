@@ -1172,3 +1172,28 @@ class TestLegacyNotificationTables:
             assert left == 0, 'legacy rows must be cleared with the course'
             db.session.execute(db.text('DROP TABLE early_warning'))
             db.session.commit()
+
+    def test_dropping_the_legacy_table_mid_flight_does_not_break_deletion(
+            self, appmod, seed, login, monkeypatch):
+        """
+        The startup message invites an operator to drop these tables whenever
+        they like. If a worker booted while the table existed, its cached
+        list still names it — and on Postgres the failed DELETE aborts the
+        whole transaction, so every course deletion 500s until all workers
+        restart. A savepoint plus self-healing makes the drop safe at any
+        moment.
+        """
+        from models import Course
+
+        # Booted with the table, but it is not actually there any more.
+        monkeypatch.setattr(appmod, 'LEGACY_COURSE_REF_TABLES', ('early_warning',))
+
+        coordinator = login(seed['coordinator_email'])
+        response = coordinator.post(f"/delete_course/{seed['course_id']}",
+                                    follow_redirects=True)
+        assert response.status_code == 200
+        with appmod.app.app_context():
+            assert Course.query.get(seed['course_id']) is None
+
+        # The worker stopped asking for it, so the next delete is untouched.
+        assert appmod.LEGACY_COURSE_REF_TABLES == ()
