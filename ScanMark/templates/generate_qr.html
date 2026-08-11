@@ -19,7 +19,7 @@
 
         <!-- FIX #1: Removed stray </button> tag. Clean timer display -->
         <p class="text-muted mb-4">
-            Code refreshes in <span id="timer" class="fw-bold text-danger">12</span>s
+            Code refreshes in <span id="timer" class="fw-bold text-danger">{{ qr_token_ttl }}</span>s
         </p>
 
         <!-- FIX #2: Only ONE location status block -->
@@ -165,18 +165,23 @@
 </script>
 <script>
     // --- 1. QR CODE AUTO-REFRESH ---
-    let timeLeft = 12;
+    // The server caches each token for QR_TOKEN_TTL seconds. Refresh one
+    // second AFTER it expires: asking for a new image while the old token
+    // still has a moment left just returns that same token, which reset
+    // the countdown and left one code on screen for two full cycles.
+    const QR_TOKEN_TTL = {{ qr_token_ttl }};
+    let timeLeft = QR_TOKEN_TTL;
     const timerEl = document.getElementById('timer');
     const qrImage = document.getElementById('qrImage');
 
     setInterval(() => {
         timeLeft--;
-        timerEl.innerText = timeLeft;
+        timerEl.innerText = Math.max(0, timeLeft);
 
-        if (timeLeft <= 0) {
+        if (timeLeft <= -1) {
             // Bust browser cache by appending a timestamp so it fetches a fresh token
             qrImage.src = "{{ url_for('get_qr_image', session_id=session.id) }}" + "?t=" + Date.now();
-            timeLeft = 12;
+            timeLeft = QR_TOKEN_TTL;
         }
     }, 1000);
 
@@ -237,10 +242,18 @@
         );
     }
 
+    // Whether a failed GPS fix means "no distance check" or "no scans at
+    // all" is a server setting, so say which one actually applies here
+    // rather than leaving the lecturer to guess what a red banner costs.
+    const GEOFENCE_REQUIRED = {{ 'true' if geofence_required else 'false' }};
+    const NO_LOCATION_CONSEQUENCE = GEOFENCE_REQUIRED
+        ? " Students cannot mark attendance until this is fixed."
+        : " Attendance will still be recorded, but from ANY location — the distance check is off.";
+
     function showLocationError(msg) {
         const statusEl = document.getElementById('locationStatus');
         const alertEl = document.getElementById('locationAlert');
-        statusEl.innerText = "⚠️ " + msg;
+        statusEl.innerText = "⚠️ " + msg + NO_LOCATION_CONSEQUENCE;
         alertEl.classList.remove('alert-success', 'alert-warning');
         alertEl.classList.add('alert-danger');
     }

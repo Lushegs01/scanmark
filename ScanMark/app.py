@@ -31,7 +31,6 @@ from itsdangerous import URLSafeTimedSerializer
 from flask_mail import Mail, Message
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
-from flask import send_from_directory
 from flask_wtf.csrf import CSRFProtect
 from flask_compress import Compress
 from whitenoise import WhiteNoise
@@ -306,16 +305,32 @@ mail = Mail(app)
 # 🚨 THE FIX: Create a bounded pool of workers to handle all emails safely.
 # 10 workers: this pool also runs the post-scan notification tasks, and a
 # full class marking attendance queues one task per student.
+# BACKGROUND_WORKERS / BACKGROUND_QUEUE_MAXSIZE are the fleet-wide defaults
+# documented in DEPLOYMENT.md; the per-pool variables override them. They used
+# to be documented but read nowhere, so an operator sizing the background queue
+# before a big event changed nothing.
+_BACKGROUND_WORKERS_DEFAULT = os.environ.get('BACKGROUND_WORKERS')
+_BACKGROUND_QUEUE_DEFAULT = int(os.environ.get('BACKGROUND_QUEUE_MAXSIZE', 2000))
+
+
+def _pool_workers(specific_var, fallback):
+    """Per-pool setting, else the fleet-wide default, else the built-in."""
+    value = os.environ.get(specific_var) or _BACKGROUND_WORKERS_DEFAULT
+    return int(value) if value else fallback
+
+
 notification_work_executor = BoundedExecutor(
     name='notification_work',
-    max_workers=int(os.environ.get('NOTIFICATION_WORKERS', 6)),
-    max_queue=int(os.environ.get('NOTIFICATION_QUEUE_SIZE', 2000)),
+    max_workers=_pool_workers('NOTIFICATION_WORKERS', 6),
+    max_queue=int(os.environ.get('NOTIFICATION_QUEUE_SIZE',
+                                 _BACKGROUND_QUEUE_DEFAULT)),
     metrics=runtime_metrics,
 )
 campos_executor = BoundedExecutor(
     name='campos_delivery',
-    max_workers=int(os.environ.get('CAMPOS_WORKERS', 4)),
-    max_queue=int(os.environ.get('CAMPOS_QUEUE_SIZE', 2000)),
+    max_workers=_pool_workers('CAMPOS_WORKERS', 4),
+    max_queue=int(os.environ.get('CAMPOS_QUEUE_SIZE',
+                                 _BACKGROUND_QUEUE_DEFAULT)),
     metrics=runtime_metrics,
 )
 
@@ -857,7 +872,7 @@ def extract_name_from_funaab_email(email):
         name_parts = username.replace('.', ' ').replace('_', ' ').split()
         # Capitalize each part
         return ' '.join(word.capitalize() for word in name_parts)
-    except:
+    except Exception:
         return ""
 
 
@@ -932,20 +947,37 @@ def _enrolled_count(course_id):
 # FIX #3 & #6: Signed, cached QR tokens
 # ------------------------------------------------------------------
 
-QR_TOKEN_TTL = 12   # seconds a single token stays valid in Redis
+QR_TOKEN_TTL = int(os.environ.get('QR_TOKEN_TTL', 12))   # seconds a token stays valid in Redis
 # Seconds before the attendance endpoint rejects the token. Deliberately
 # wider than the 12s on-screen rotation: expiry is checked when the request
 # is PROCESSED, not when the student scanned, and during a full-class burst
 # a legitimate scan can wait ~30s (the platform router timeout) in the queue.
 # Without the headroom those queued scans bounce as "expired" and the
 # clients retry, amplifying the burst.
-QR_CODE_WINDOW = 45
+#
+# It is also the replay window: for this many seconds a photograph of the
+# projected code will mark somebody present, so it trades integrity against
+# not failing legitimate scans under load. Narrow it only alongside a
+# measured p99 that fits inside the smaller window, and keep the geofence
+# on (see GEOFENCE_REQUIRED) as the primary presence check.
+QR_CODE_WINDOW = int(os.environ.get('QR_CODE_WINDOW', 45))
 
 # Max distance (metres) between the lecturer's pinned class location and the
 # scanning student. The old route hard-coded 50 while its message referenced
 # the configurable 100m value. One authoritative value prevents policy drift.
 # balances anti-cheating with real-world phone GPS error inside buildings.
 GEOFENCE_RADIUS_M = int(os.environ.get('GEOFENCE_RADIUS_M', 100))
+
+# When a lecturer never pins a classroom location — they dismissed the
+# browser's GPS prompt, or the projector machine has no location service —
+# get_class_location() returns None and the distance check is skipped
+# entirely, so the class is marked with no proximity requirement at all.
+# Default off, because switching it on mid-semester locks out every class
+# whose lecturer has not granted location. Turn it on when attendance is
+# graded and you would rather refuse a scan than record an unverifiable one.
+GEOFENCE_REQUIRED = os.environ.get(
+    'GEOFENCE_REQUIRED', 'false'
+).strip().lower() in ('true', '1', 'yes', 'on')
 
 
 def _make_signature(message: str) -> str:
@@ -1056,7 +1088,29 @@ def get_department_analytics(dept_name):
 
 @app.route('/service-worker.js')
 def serve_sw():
-    return send_from_directory('static', 'service-worker.js', mimetype='application/javascript')
+    """
+    Serve the worker with the server's own QR acceptance window baked in.
+
+    The offline queue has to know how long a scanned token stays redeemable,
+    otherwise it promises to retry scans the server will certainly refuse —
+    which is what used to happen: it held them for five minutes against a
+    45-second window and then deleted them without telling anyone.
+    """
+    worker_path = os.path.join(_static_root, 'service-worker.js')
+    try:
+        with open(worker_path, encoding='utf-8') as handle:
+            body = handle.read()
+    except OSError:
+        app.logger.exception('Could not read the service worker')
+        return '', 404
+    prelude = f'self.SCANMARK_QR_WINDOW_SECONDS = {QR_CODE_WINDOW};\n'
+    return Response(
+        prelude + body,
+        mimetype='application/javascript',
+        # The worker carries a server-side constant now, so it must not be
+        # pinned in an HTTP cache across a config change.
+        headers={'Cache-Control': 'no-cache'},
+    )
 
 
 # ============================================================
@@ -1122,7 +1176,8 @@ def send_verification_email(user):
         "If you did not create a ScanMark account, ignore this email — "
         "no account can be used until this link is opened.\n"
     )
-    email_executor.submit(send_async_email, app, msg)
+    if notification_work_executor.submit(send_async_email, app, msg) is None:
+        app.logger.warning('notification queue full; verification email dropped')
 
 
 @app.route('/verify_email/<token>')
@@ -1714,27 +1769,14 @@ def dashboard():
     return redirect_by_role(current_user.role)
 
 
-@app.route('/student_dashboard')
-@login_required
-def student_dashboard():
-    user_role = (current_user.role or '').lower().strip()
-    
-    if user_role != 'student':
-        flash("Access denied. Please log in again.", "error")
-        return redirect(url_for('login')) # 🚨 SAFELY KICKS THEM OUT
+def _student_attendance_summary():
+    """
+    (enrolled courses, per-course attendance rows) for the signed-in student.
 
-        # 🚨 THE NEW INTERCEPTOR
-    if not current_user.matric_no or not current_user.level:
-        flash("Please complete your profile to access your dashboard.", "info")
-        return redirect(url_for('complete_profile'))
-
-    # FIX #10: Only iterate over the student's own enrolled courses
-    pref = NotificationPreference.query.filter_by(user_id=current_user.id).first()
-    threshold = pref.warning_threshold if pref and pref.warning_threshold else 75
-
-    # Two GROUP BY queries for ALL courses at once — the old loop ran two
-    # COUNT queries per enrolled course (~18 queries per dashboard load),
-    # and this page reloads after every successful scan.
+    Two GROUP BY queries for ALL courses at once — the old loop ran two COUNT
+    queries per enrolled course (~18 queries per dashboard load), and this
+    page reloads after every successful scan.
+    """
     enrolled_courses = list(getattr(current_user, 'enrolled_courses', []) or [])
     course_ids = [c.id for c in enrolled_courses]
 
@@ -1765,6 +1807,29 @@ def student_dashboard():
             'total_sessions': total_sessions,
             'pct': pct,
         })
+
+    return enrolled_courses, attendance_data
+
+
+@app.route('/student_dashboard')
+@login_required
+def student_dashboard():
+    user_role = (current_user.role or '').lower().strip()
+    
+    if user_role != 'student':
+        flash("Access denied. Please log in again.", "error")
+        return redirect(url_for('login')) # 🚨 SAFELY KICKS THEM OUT
+
+        # 🚨 THE NEW INTERCEPTOR
+    if not current_user.matric_no or not current_user.level:
+        flash("Please complete your profile to access your dashboard.", "info")
+        return redirect(url_for('complete_profile'))
+
+    # FIX #10: Only iterate over the student's own enrolled courses
+    pref = NotificationPreference.query.filter_by(user_id=current_user.id).first()
+    threshold = pref.warning_threshold if pref and pref.warning_threshold else 75
+
+    enrolled_courses, attendance_data = _student_attendance_summary()
 
     return render_template('student_dashboard.html',
                            attendance_data=attendance_data,
@@ -2084,13 +2149,6 @@ def register_course():
 # QR CODE ROUTES  (FIX #3, #5, #6)
 # ============================================================
 
-def _is_course_authorized(course):
-    """Return True if the current user may manage this course."""
-    is_coordinator = (course.coordinator_id == current_user.id)
-    is_instructor = hasattr(course, 'instructors') and (current_user in course.instructors)
-    return is_coordinator or is_instructor
-
-
 _daily_session_locks = {}
 _daily_session_locks_guard = threading.Lock()
 
@@ -2159,7 +2217,9 @@ def session_qr(session_id):
     if not _is_course_authorized(course):
         flash('Unauthorised Access', 'error')
         return redirect(url_for('dashboard'))
-    return render_template('generate_qr.html', course=course, session=session_row)
+    return render_template('generate_qr.html', course=course, session=session_row,
+                           qr_token_ttl=QR_TOKEN_TTL,
+                           geofence_required=GEOFENCE_REQUIRED)
 
 
 @app.route('/api/qr_data/<int:session_id>')
@@ -2294,7 +2354,12 @@ def get_session_attendees(session_id):
 @app.route('/scan_page')
 @login_required
 def scan_page():
-    return render_template('scan.html')
+    # scan.html renders a "My Attendance Records" table guarded on
+    # `attendance_data`. Rendering without it meant every student always saw
+    # the "you haven't marked attendance yet" empty state, however many
+    # classes they had actually attended.
+    _courses, attendance_data = _student_attendance_summary()
+    return render_template('scan.html', attendance_data=attendance_data)
 
 
 @app.route('/set_location/<int:course_id>', methods=['POST'])
@@ -2423,6 +2488,9 @@ def _post_scan_notifications(app_instance, student_id, course_id, timestamp_str)
                     )
 
             # ── Early-warning check (alerts student + parent if below threshold) ──
+            # Hand over the preference row we already loaded: without it the
+            # pipeline re-queries NotificationPreference twice more per scan,
+            # which is 2000-4000 wasted queries across a full class.
             process_early_warning(
                 student=student,
                 course=course,
@@ -2430,7 +2498,8 @@ def _post_scan_notifications(app_instance, student_id, course_id, timestamp_str)
                 mail_func=send_email,
                 Attendance_model=Attendance,
                 ClassSession_model=ClassSession,
-                db_session=db.session
+                db_session=db.session,
+                preference=pref,
             )
         except Exception:
             app_instance.logger.exception(
@@ -2438,137 +2507,281 @@ def _post_scan_notifications(app_instance, student_id, course_id, timestamp_str)
             )
 
 
+def _insert_attendance_once(student_id, course_id, session_id, device_id, scanned_at):
+    """
+    Insert exactly one attendance row and return its id, or None if this
+    student already has a row for this class session.
+
+    On Postgres and SQLite this is a single atomic
+    ``INSERT ... ON CONFLICT DO NOTHING ... RETURNING``, so the duplicate
+    decision is made by the database and no separate SELECT is needed. The
+    unique index on (student_id, session_id) is what makes it safe: two
+    simultaneous requests cannot both win.
+    """
+    values = {
+        'student_id': student_id,
+        'course_id': course_id,
+        'session_id': session_id,
+        'device_id': device_id,
+        'timestamp': scanned_at,
+    }
+    dialect = db.session.get_bind().dialect.name
+
+    if dialect in {'postgresql', 'sqlite'}:
+        if dialect == 'postgresql':
+            from sqlalchemy.dialects.postgresql import insert as _conflict_insert
+        else:
+            from sqlalchemy.dialects.sqlite import insert as _conflict_insert
+        statement = (_conflict_insert(Attendance)
+                     .values(**values)
+                     .on_conflict_do_nothing(
+                         index_elements=['student_id', 'session_id'])
+                     .returning(Attendance.id))
+        record_id = db.session.execute(statement).scalar_one_or_none()
+        if record_id is None:
+            db.session.rollback()
+            return None
+        db.session.commit()
+        return record_id
+
+    # Any other dialect: fall back to insert-and-catch, which relies on the
+    # same unique index rather than an application-level check.
+    try:
+        record = Attendance(**values)
+        db.session.add(record)
+        db.session.commit()
+        return record.id
+    except IntegrityError:
+        db.session.rollback()
+        return None
+
+
+# Fraction of SUCCESSFUL scans that get a timing line in the log. Every
+# non-success outcome is always logged. 2% keeps a 2000-scan class to ~40
+# lines instead of 2000 while still giving a latency sample.
+SCAN_LOG_SAMPLE_RATE = max(0.0, min(1.0, float(
+    os.environ.get('SCAN_LOG_SAMPLE_RATE', '0.02')
+)))
+
+
 @app.route('/mark_attendance', methods=['POST'])
 @limiter.limit("10 per minute", error_message="Too many scan attempts. Please wait.")
 @login_required
 def mark_attendance():
+    """
+    Record one scan.
+
+    Every rejection carries a real HTTP status code, because the phone
+    scanner decides whether to stop, retry or back off from that status:
+      400  the token is malformed or expired  -> a fresh code may work
+      403  not enrolled                       -> terminal
+      404  the session no longer exists       -> terminal
+      409  already marked, or a queued scan   -> terminal
+           belonging to a different account
+      422  location missing/stale/too far     -> retryable once they move
+      429  rate limited (from the limiter)    -> back off
+      5xx  server fault                       -> back off
+    Returning 200 for all of these is what put rejected phones into an
+    endless resubmit loop.
+    """
+    request_started = time.perf_counter()
+    stage_started = request_started
+    stages = {}
+
+    def checkpoint(name):
+        nonlocal stage_started
+        now = time.perf_counter()
+        duration_ms = (now - stage_started) * 1000
+        stages[name] = duration_ms
+        runtime_metrics.observe_ms(f'scan.stage.{name}', duration_ms)
+        stage_started = now
+
+    def respond(status, message, http_status, outcome):
+        total_ms = (time.perf_counter() - request_started) * 1000
+        runtime_metrics.observe_ms('scan.response', total_ms)
+        runtime_metrics.increment(f'scan.outcome.{outcome}')
+        if status != 'success' or secrets.randbelow(10000) < int(SCAN_LOG_SAMPLE_RATE * 10000):
+            app.logger.info('scan_performance %s', json.dumps({
+                'outcome': outcome,
+                'total_ms': round(total_ms, 2),
+                'stages_ms': {key: round(value, 2) for key, value in stages.items()},
+            }, separators=(',', ':')))
+        response = jsonify({'status': status, 'message': message})
+        if stages:
+            response.headers['Server-Timing'] = ', '.join(
+                f'{name};dur={value:.2f}' for name, value in stages.items()
+            )
+        return response, http_status
+
     data = request.get_json(silent=True) or {}
-    qr_text = data.get('qr_data')
-    student_lat = data.get('lat')
-    student_lon = data.get('lon')
 
     try:
+        qr_text = data.get('qr_data')
         if not qr_text:
-            return jsonify({"status": "error", "message": "No QR data provided."})
+            return respond('error', 'No QR data provided.', 400, 'missing_qr')
 
-        # FIX #3 & #5: Verify the signed token (3-part format: S<id>|ts|sig)
         try:
-            session_id, timestamp = verify_signed_qr(qr_text)
-        except ValueError as ve:
-            return jsonify({"status": "error", "message": str(ve)})
+            session_id, _token_timestamp = verify_signed_qr(qr_text)
+        except ValueError as error:
+            return respond('error', str(error), 400, 'invalid_qr')
+        checkpoint('qr_verify')
 
-        class_session = ClassSession.query.get(session_id)
-        if not class_session:
-            return jsonify({"status": "error", "message": "Invalid QR Code: Class session not found."})
-
-        course = Course.query.get(class_session.course_id)
-        course_id = class_session.course_id
-        if not course:
-            return jsonify({"status": "error", "message": "Invalid QR Code: Course not found."})
-
-        # Enrolment check
-        if hasattr(current_user, 'enrolled_courses'):
-            if course not in current_user.enrolled_courses:
-                return jsonify({
-                    "status": "error",
-                    "message": f"🚫 Access Denied: You are not registered for {course.code}."
-                })
-
-        # Duplicate check: one scan per student per CLASS SESSION.
-        # Next week's lecture is a new session, so scanning again then is fine.
-        existing = Attendance.query.filter_by(
-            student_id=current_user.id,
-            session_id=session_id
-        ).first()
-
-        if existing:
-            return jsonify({
-                "status": "error",
-                "message": "You are already marked present for this class! Double-scanning is not allowed."
-            })
-
-        # FIX #4: Retrieve location from Redis
-        class_loc = get_class_location(course_id)
-        if class_loc:
-            # `not student_lat` also rejects a legitimate 0.0, and the equator
-            # runs through the Gulf of Guinea — close enough to Nigeria to be
-            # worth getting right. Only a genuinely absent reading is refused.
-            if student_lat is None or student_lon is None:
-                return jsonify({"status": "error", "message": "Location required! Please allow GPS access."})
-
-            try:
-                dist = calculate_distance(
-                    class_loc['lat'], class_loc['lon'],
-                    float(student_lat), float(student_lon)
-                )
-            except (TypeError, ValueError):
-                return jsonify({"status": "error", "message": "Location required! Please allow GPS access."})
-
-            # Compare against the configured radius. This used to be a
-            # hardcoded 50 while the message quoted GEOFENCE_RADIUS_M, so
-            # students were turned away at 50m by an app telling them the
-            # limit was 100m, and raising the env var changed nothing.
-            if dist > GEOFENCE_RADIUS_M:
-                return jsonify({
-                    "status": "error",
-                    "message": f"Too far from classroom. You are {int(dist)}m away (max {GEOFENCE_RADIUS_M}m)."
-                })
-
-        new_record = Attendance(
-            student_id=current_user.id,
-            course_id=course_id,
-            session_id=session_id,
-            device_id=data.get('device_id', 'browser')
-        )
-        db.session.add(new_record)
-        try:
-            db.session.commit()
-        except IntegrityError:
-            # Two simultaneous requests from the same student both passed the
-            # SELECT above; the unique index on (student_id, session_id)
-            # keeps the second insert out.
-            db.session.rollback()
-            return jsonify({
-                "status": "error",
-                "message": "You are already marked present for this class! Double-scanning is not allowed."
-            })
-
-        # Report to CampOS Core (best-effort, async — never blocks the scan).
-        try:
-            scanned_iso = (new_record.timestamp.isoformat() + "Z") if new_record.timestamp else None
-            email_executor.submit(
-                report_attendance_to_campos,
-                current_user.matric_no,
-                current_user.email,
-                course.code,
-                course.title,
-                class_session.id,
-                class_session.title,
-                f'scanmark-attendance:{new_record.id}',
-                scanned_iso,
+        # Session and course in one join instead of two point lookups.
+        target = db.session.execute(
+            select(
+                ClassSession.id.label('session_id'),
+                ClassSession.title.label('session_title'),
+                Course.id.label('course_id'),
+                Course.code.label('course_code'),
+                Course.title.label('course_title'),
             )
-        except Exception:
-            app.logger.exception('Could not queue CampOS attendance report')
+            .join(Course, Course.id == ClassSession.course_id)
+            .where(ClassSession.id == session_id)
+        ).mappings().one_or_none()
+        checkpoint('session_course')
+        if target is None:
+            return respond('error', 'Invalid QR Code: Class session not found.',
+                           404, 'missing_session')
+
+        # A scan replayed from another phone's offline queue must never land
+        # on whoever happens to be signed in now.
+        user_marker = data.get('user_marker')
+        if user_marker is not None and str(user_marker) != str(current_user.id):
+            return respond('error', 'That queued scan belongs to a different account.',
+                           409, 'wrong_user_queue')
+
+        # Indexed existence check rather than materialising every course the
+        # student is enrolled on.
+        enrolled = db.session.execute(
+            select(enrollments.c.user_id)
+            .where(enrollments.c.user_id == current_user.id,
+                   enrollments.c.course_id == target['course_id'])
+            .limit(1)
+        ).scalar_one_or_none()
+        checkpoint('enrollment')
+        if enrolled is None:
+            return respond(
+                'error',
+                f"Access denied: you are not registered for {target['course_code']}.",
+                403,
+                'not_enrolled',
+            )
+
+        class_loc = get_class_location(target['course_id'])
+        if class_loc:
+            try:
+                student_lat = float(data['lat'])
+                student_lon = float(data['lon'])
+            except (KeyError, TypeError, ValueError):
+                return respond('error', 'Location required. Please allow GPS access.',
+                               422, 'missing_location')
+            if not (-90 <= student_lat <= 90 and -180 <= student_lon <= 180):
+                return respond('error', 'Location coordinates are invalid.',
+                               422, 'invalid_location')
+            location_age_ms = data.get('location_age_ms')
+            if isinstance(location_age_ms, (int, float)) and location_age_ms > 30000:
+                return respond('error', 'Location fix is stale. Please scan again.',
+                               422, 'stale_location')
+            distance_m = calculate_distance(
+                class_loc['lat'], class_loc['lon'], student_lat, student_lon
+            )
+            if distance_m > GEOFENCE_RADIUS_M:
+                return respond(
+                    'error',
+                    f'Too far from the classroom. You are {int(distance_m)}m away '
+                    f'(max {GEOFENCE_RADIUS_M}m).',
+                    422,
+                    'outside_geofence',
+                )
+        elif GEOFENCE_REQUIRED:
+            # Opt-in strict mode: no pinned classroom means no proof of
+            # presence, so refuse rather than silently accepting from anywhere.
+            app.logger.warning(
+                'Scan refused: GEOFENCE_REQUIRED is on and course %s has no pinned location',
+                target['course_id'],
+            )
+            return respond(
+                'error',
+                'This class has no pinned location yet. Ask your lecturer to '
+                'allow location access on the QR screen.',
+                422,
+                'no_class_location',
+            )
+        checkpoint('geofence')
+
+        client_metrics = data.get('client_metrics')
+        if isinstance(client_metrics, dict):
+            for metric_name in ('camera_ready_ms', 'qr_decode_ms',
+                                'gps_wait_ms', 'capture_to_request_ms'):
+                value = client_metrics.get(metric_name)
+                if isinstance(value, (int, float)) and 0 <= value <= 120000:
+                    runtime_metrics.observe_ms(f'client.{metric_name}', value)
+
+        scanned_at = _utcnow()
+        record_id = _insert_attendance_once(
+            current_user.id,
+            target['course_id'],
+            target['session_id'],
+            str(data.get('device_id') or 'browser')[:200],
+            scanned_at,
+        )
+        checkpoint('db_insert')
+        if record_id is None:
+            return respond(
+                'error',
+                'You are already marked present for this class.',
+                409,
+                'duplicate',
+            )
+
+        # Drop the cached headcount so the lecturer's live counter moves with
+        # the name list instead of lagging behind it.
+        if redis_client:
+            try:
+                _redis_timed('delete', redis_client.delete,
+                             f"attendees_summary:{target['session_id']}")
+            except redis.RedisError:
+                runtime_metrics.increment('redis.invalidation_errors')
+
+        scanned_iso = scanned_at.isoformat() + 'Z'
+        if campos_executor.submit(
+            report_attendance_to_campos,
+            current_user.matric_no,
+            current_user.email,
+            target['course_code'],
+            target['course_title'],
+            target['session_id'],
+            target['session_title'],
+            f'scanmark-attendance:{record_id}',
+            scanned_iso,
+        ) is None:
+            app.logger.warning(
+                'CampOS delivery queue full; attendance id %s not reported', record_id)
 
         # Confirmation email, WhatsApp, parent alerts and the early-warning
-        # check all run AFTER the response, on the executor — see
-        # _post_scan_notifications above.
+        # check all run AFTER the response, on the executor.
         timestamp_str = datetime.now().strftime('%B %d, %Y at %I:%M %p')
-        try:
-            email_executor.submit(
-                _post_scan_notifications, app, current_user.id, course_id, timestamp_str
-            )
-        except Exception:
-            app.logger.exception('Could not queue post-scan notifications')
+        if notification_work_executor.submit(
+            _post_scan_notifications,
+            app,
+            current_user.id,
+            target['course_id'],
+            timestamp_str,
+        ) is None:
+            app.logger.warning(
+                'Notification queue full; no confirmation sent for attendance id %s',
+                record_id)
+        checkpoint('enqueue')
 
-        return jsonify({"status": "success", "message": "Attendance marked successfully! ✅"})
+        return respond('success', 'Attendance marked successfully!', 200, 'success')
 
     except Exception:
         # Leave no half-finished transaction on this connection for whichever
         # request picks it up next.
         db.session.rollback()
         app.logger.exception('Server error in mark_attendance')
-        return jsonify({"status": "error", "message": "An unexpected server error occurred."}), 500
+        return respond('error', 'An unexpected server error occurred.',
+                       500, 'server_error')
 
 
 @app.route('/course/<int:course_id>/attendance')

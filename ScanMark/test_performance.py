@@ -1,6 +1,3 @@
-import json
-import time
-
 import pytest
 from sqlalchemy import event
 
@@ -30,6 +27,12 @@ def isolated_database(monkeypatch):
     monkeypatch.setattr(scanmark, 'notification_work_executor', _RecordingExecutor())
     scanmark._local_locations.clear()
     with scanmark.app.app_context():
+        # Start from an empty schema as well as ending on one. Cleaning up
+        # only on the way out meant this file inherited whatever rows the
+        # previously-run test file happened to leave behind, so the very
+        # first test here could see somebody else's attendance row.
+        db.session.remove()
+        db.drop_all()
         db.create_all()
         yield
         db.session.remove()

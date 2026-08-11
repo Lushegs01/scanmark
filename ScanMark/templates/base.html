@@ -119,17 +119,15 @@
         {% endfor %}
         {% endif %}
         {% endwith %}
+        {# One get_flashed_messages() call only. Flask caches the list on the
+           request context, so a second call returns the SAME messages rather
+           than an empty list — which rendered every flash twice, the second
+           copy always styled as a yellow warning. #}
+    </div>
 
-        {% with messages = get_flashed_messages() %}
-        {% if messages %}
-        {% for message in messages %}
-        <div class="alert alert-warning alert-dismissible fade show" role="alert">
-            <i class="fas fa-triangle-exclamation me-2"></i>{{ message }}
-            <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
-        </div>
-        {% endfor %}
-        {% endif %}
-        {% endwith %}
+    <!-- Offline scan sync result (shown only when a queued scan resolves) -->
+    <div class="container">
+        <div id="offline-sync-banner" class="alert d-none" role="status"></div>
     </div>
 
     {% block content %}{% endblock %}
@@ -200,18 +198,30 @@
                 request.onerror = () => reject(request.error);
             }).catch(() => []);
 
+            const drop = key => new Promise((resolve, reject) => {
+                const transaction = database.transaction('scans', 'readwrite');
+                transaction.objectStore('scans').delete(key);
+                transaction.oncomplete = resolve;
+                transaction.onerror = () => reject(transaction.error);
+            });
+
+            let marked = 0;
+            let lost = 0;
+            let lastFailureMessage = '';
+
             for (const scanData of scans) {
-                const queuedAt = Date.parse(scanData.queued_at || '');
-                if (Number.isFinite(queuedAt) && Date.now() - queuedAt > 300000) {
-                    await new Promise((resolve, reject) => {
-                        const transaction = database.transaction('scans', 'readwrite');
-                        transaction.objectStore('scans').delete(scanData.dedupe_key);
-                        transaction.oncomplete = resolve;
-                        transaction.onerror = () => reject(transaction.error);
-                    });
+                // A queued scan is only redeemable until the server's QR
+                // window closes. Past that it is dead — say so rather than
+                // deleting it quietly and leaving the student thinking they
+                // were marked present.
+                const deadline = Number(scanData.expires_at);
+                if (Number.isFinite(deadline) && Date.now() > deadline) {
+                    await drop(scanData.dedupe_key);
+                    lost += 1;
                     continue;
                 }
                 if (String(scanData.user_marker || '') !== currentUserId) continue;
+
                 try {
                     const response = await fetch('/mark_attendance', {
                         method: 'POST',
@@ -225,18 +235,45 @@
                     const definitive = contentType.includes('application/json') &&
                         response.status !== 401 && response.status !== 429 &&
                         response.status < 500;
-                    if (definitive) {
-                        await new Promise((resolve, reject) => {
-                            const transaction = database.transaction('scans', 'readwrite');
-                            transaction.objectStore('scans').delete(scanData.dedupe_key);
-                            transaction.oncomplete = resolve;
-                            transaction.onerror = () => reject(transaction.error);
-                        });
+                    if (!definitive) continue;   // keep it queued, try again later
+
+                    const payload = await response.json().catch(() => ({}));
+                    await drop(scanData.dedupe_key);
+                    if (response.ok && payload.status === 'success') {
+                        marked += 1;
+                    } else if (response.status === 409) {
+                        // Already on the register — the queued copy was a
+                        // duplicate, which is a success from where the
+                        // student stands.
+                        marked += 1;
+                    } else {
+                        lost += 1;
+                        lastFailureMessage = payload.message || '';
                     }
                 } catch (_) {
-                    break;
+                    break;   // still offline; leave the rest queued
                 }
             }
+
+            reportOfflineSync(marked, lost, lastFailureMessage);
+        }
+
+        function reportOfflineSync(marked, lost, failureMessage) {
+            const banner = document.getElementById('offline-sync-banner');
+            if (!banner || (!marked && !lost)) return;
+
+            const parts = [];
+            if (marked) {
+                parts.push(`${marked} scan${marked === 1 ? '' : 's'} saved while you were offline ` +
+                           `${marked === 1 ? 'has' : 'have'} now been recorded.`);
+            }
+            if (lost) {
+                parts.push(`${lost} offline scan${lost === 1 ? '' : 's'} could not be recorded` +
+                           `${failureMessage ? ': ' + failureMessage : ' because the code expired.'} ` +
+                           `Please scan the code on screen again.`);
+            }
+            banner.textContent = parts.join(' ');
+            banner.className = `alert ${lost ? 'alert-warning' : 'alert-success'}`;
         }
 
         window.addEventListener('online', syncOfflineScans);

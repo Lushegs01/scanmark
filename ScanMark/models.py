@@ -156,5 +156,5 @@ class WeeklyReport(db.Model):
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     week_start = db.Column(db.Date, nullable=False)
     week_end = db.Column(db.Date, nullable=False)
-    sent_at = db.Column(db.DateTime, default=datetime.utcnow)
+    sent_at = db.Column(db.DateTime, default=utcnow_naive)
     report_type = db.Column(db.String(20), nullable=False)  # 'student' or 'lecturer'

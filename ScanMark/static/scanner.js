@@ -20,6 +20,13 @@
     const TARGET_INTERVAL_MS = 125;
     const POSITION_MAX_AGE_MS = 10000;
     const TRANSIENT_RETRY_LIMIT = 3;
+    // How many times we may re-read the same projected code and resubmit on
+    // our own after a rejection the student could plausibly fix (an expired
+    // code, a GPS fix that was too far out). Past this the camera stops and
+    // waits for a deliberate tap. Without the cap a rejected phone re-reads
+    // the screen every ~1.2s forever, which is the whole class's worth of
+    // wasted requests for the rest of the lecture.
+    const AUTO_RESUBMIT_LIMIT = 3;
 
     let stream = null;
     let track = null;
@@ -40,6 +47,7 @@
     let qrCapturedAt = 0;
     let lastDecodeMs = 0;
     let retryAttempt = 0;
+    let rejectionStreak = 0;
     let torchEnabled = false;
 
     function status(message, type) {
@@ -129,6 +137,10 @@
 
     async function startScanner() {
         stopScanner();
+        // A deliberate tap is a fresh start: give the automatic-resubmit
+        // budget back rather than inheriting the previous attempt's streak.
+        rejectionStreak = 0;
+        retryAttempt = 0;
         cameraStartedAt = performance.now();
         prewarmLocation();
         container.style.display = 'block';
@@ -306,10 +318,25 @@
             }
 
             const contentType = response.headers.get('content-type') || '';
-            if (!contentType.includes('application/json')) throw new Error(`HTTP ${response.status}`);
+            if (!contentType.includes('application/json')) {
+                // A non-JSON body from a 4xx is almost always the CSRF guard
+                // rejecting a page that has been open longer than the token
+                // lives. Retrying cannot fix that; reloading can.
+                if (response.status < 500 && response.status !== 429) {
+                    retryAttempt = 0;
+                    rejectionStreak = 0;
+                    result('Your session expired. Reload this page, then scan again.', 'danger');
+                    stopScanner();
+                    return;
+                }
+                throw new Error(`HTTP ${response.status}`);
+            }
+
             const payload = await response.json();
+
             if (response.ok && payload.status === 'success') {
                 retryAttempt = 0;
+                rejectionStreak = 0;
                 result(payload.message, 'success');
                 stopScanner();
                 return;
@@ -319,13 +346,36 @@
                 stopScanner();
                 return;
             }
+            // Server fault or rate limit: back off and try the same code again.
             if (response.status === 429 || response.status >= 500) {
                 throw new Error(payload.message || `HTTP ${response.status}`);
             }
+
             retryAttempt = 0;
-            result(payload.message || 'Attendance could not be marked.', 'danger');
-            if (response.status === 409) stopScanner();
-            else resumeScanning(1200);
+            const message = payload.message || 'Attendance could not be marked.';
+
+            // Terminal: nothing about pointing the camera again can change
+            // the answer. 403 not enrolled, 404 no such session, 409 already
+            // marked or a queued scan from another account.
+            if (response.status === 403 || response.status === 404 || response.status === 409) {
+                rejectionStreak = 0;
+                result(message, 'danger');
+                stopScanner();
+                return;
+            }
+
+            // Recoverable: an expired code (400) or a location problem (422).
+            // Give it a bounded number of automatic goes, then hand control
+            // back to the student instead of looping forever.
+            rejectionStreak += 1;
+            if (rejectionStreak >= AUTO_RESUBMIT_LIMIT) {
+                rejectionStreak = 0;
+                result(`${message} Tap "Start Advanced Scanner" to try again.`, 'danger');
+                stopScanner();
+                return;
+            }
+            result(message, 'danger');
+            resumeScanning(1200);
         } catch (error) {
             if (retryAttempt < TRANSIENT_RETRY_LIMIT) {
                 const delay = retryDelay();

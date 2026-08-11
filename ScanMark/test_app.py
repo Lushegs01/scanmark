@@ -68,7 +68,10 @@ class TestNoRouteExplodes:
         payload = feed.get_json()
         assert payload['present'] == 1
         assert payload['enrolled'] == 1
-        assert payload['attendees'][0]['matric_no'] == '20200001'
+        # The feed is cursor-based: each poll returns only rows newer than
+        # `after`, so a first poll carries the whole roll call in new_attendees.
+        assert payload['new_attendees'][0]['matric_no'] == '20200001'
+        assert payload['has_more'] is False
 
         page = lecturer.get(f"/course/{seed['course_id']}/attendance")
         assert page.status_code == 200
@@ -173,6 +176,64 @@ class TestSignupCannotMintPrivilege:
                     email='notoken@student.funaab.edu.ng').first() is None
         finally:
             appmod.app.config['WTF_CSRF_ENABLED'] = False
+
+    def test_the_signup_form_actually_ships_a_usable_csrf_token(self, appmod):
+        """
+        The form had no csrf_token field while CSRFProtect was global, so
+        every real registration got 400 and nobody could create an account.
+        The suite could not see it: conftest turns CSRF off. This test turns
+        it back on and drives the form the way a browser does.
+        """
+        import re
+        from models import User
+
+        appmod.app.config['WTF_CSRF_ENABLED'] = True
+        try:
+            c = appmod.app.test_client()
+            page = c.get('/signup')
+            assert page.status_code == 200
+            match = re.search(rb'name="csrf_token" value="([^"]+)"', page.data)
+            assert match, 'signup.html renders no csrf_token field'
+
+            response = c.post('/signup', data={
+                'csrf_token': match.group(1).decode(),
+                'full_name': 'Real Person',
+                'email': 'realperson@student.funaab.edu.ng',
+                'password': VALID_PASSWORD,
+                'matric_no': '20200099',
+                'level': '300',
+            })
+            assert response.status_code in (200, 302), response.status_code
+            with appmod.app.app_context():
+                assert User.query.filter_by(
+                    email='realperson@student.funaab.edu.ng').first() is not None
+        finally:
+            appmod.app.config['WTF_CSRF_ENABLED'] = False
+
+    def test_signup_survives_sending_the_verification_email(self, appmod):
+        """
+        send_verification_email() referenced a pool name that no longer
+        existed, so signup raised NameError AFTER committing the user — an
+        account that existed but could never be confirmed or signed into.
+        """
+        from models import User
+
+        appmod.REQUIRE_EMAIL_VERIFICATION = True
+        try:
+            c = appmod.app.test_client()
+            response = c.post('/signup', data={
+                'full_name': 'Needs Confirming',
+                'email': 'confirmme@student.funaab.edu.ng',
+                'password': VALID_PASSWORD,
+                'matric_no': '20200098', 'level': '300',
+            }, follow_redirects=False)
+            assert response.status_code != 500
+            with appmod.app.app_context():
+                user = User.query.filter_by(
+                    email='confirmme@student.funaab.edu.ng').first()
+                assert user is not None and user.email_verified is False
+        finally:
+            appmod.REQUIRE_EMAIL_VERIFICATION = False
 
     def test_signup_is_rate_limited_per_network(self, appmod):
         """Only the 1000/minute default stood between one host and bulk accounts."""
@@ -805,14 +866,21 @@ class TestOperationalGuards:
         assert client.head('/healthz').status_code == 204
 
     def test_the_background_queue_sheds_instead_of_growing_without_limit(self, appmod):
-        executor = appmod._BoundedExecutor(max_workers=1, max_queued=2)
+        from performance import BoundedExecutor, RuntimeMetrics
+
+        metrics = RuntimeMetrics()
+        executor = BoundedExecutor(name='shedtest', max_workers=1, max_queue=2,
+                                   metrics=metrics)
         blocker = __import__('threading').Event()
         try:
-            for _ in range(6):
-                executor.submit(blocker.wait, 5)
-            assert executor.dropped > 0
+            accepted = [executor.submit(blocker.wait, 5) for _ in range(6)]
+            # Capacity is max_workers + max_queue = 3; the rest are refused
+            # outright rather than queued, and refusal is observable.
+            assert accepted.count(None) > 0
+            assert metrics.snapshot()['counters']['shedtest.rejected'] > 0
         finally:
             blocker.set()
+            executor.shutdown(wait=False)
 
     def test_the_migration_block_is_idempotent(self, appmod):
         """Booting twice on the same database must not fail."""
@@ -838,3 +906,142 @@ class TestOperationalGuards:
         finally:
             appmod.limiter.enabled = False
             appmod.limiter.reset()
+
+
+class TestScanResponseContract:
+    """
+    The phone scanner decides whether to stop, retry or back off from the
+    HTTP status. When every rejection came back as 200 the scanner treated
+    it as "try again", so a rejected phone re-read the projected code and
+    resubmitted roughly every 1.2s for the rest of the lecture.
+    """
+
+    def test_a_duplicate_scan_is_a_409_not_a_200(self, appmod, seed, login):
+        kemi = login(seed['student_email'])
+        token = qr_token(appmod, seed['session_id'])
+
+        first = kemi.post('/mark_attendance', json={'qr_data': token})
+        assert first.status_code == 200
+        assert first.get_json()['status'] == 'success'
+
+        second = kemi.post('/mark_attendance', json={'qr_data': token})
+        assert second.status_code == 409
+        assert second.get_json()['status'] == 'error'
+
+    def test_an_unenrolled_student_is_a_403(self, appmod, seed, login):
+        tayo = login(seed['other_student_email'])
+        response = tayo.post('/mark_attendance',
+                             json={'qr_data': qr_token(appmod, seed['session_id'])})
+        assert response.status_code == 403
+
+    def test_an_unknown_session_is_a_404(self, appmod, seed, login):
+        kemi = login(seed['student_email'])
+        response = kemi.post('/mark_attendance',
+                             json={'qr_data': qr_token(appmod, 999999)})
+        assert response.status_code == 404
+
+    def test_a_malformed_or_expired_token_is_a_400(self, appmod, seed, login):
+        kemi = login(seed['student_email'])
+        assert kemi.post('/mark_attendance',
+                         json={'qr_data': 'garbage'}).status_code == 400
+        assert kemi.post('/mark_attendance', json={}).status_code == 400
+        stale = qr_token(appmod, seed['session_id'],
+                         age_seconds=appmod.QR_CODE_WINDOW + 5)
+        assert kemi.post('/mark_attendance',
+                         json={'qr_data': stale}).status_code == 400
+
+    def test_a_queued_scan_cannot_be_replayed_under_another_account(
+            self, appmod, seed, login):
+        """
+        An offline scan carries the id of the student who took it. Replaying
+        it while somebody else is signed in on that phone must not mark the
+        wrong person present.
+        """
+        from models import Attendance
+
+        kemi = login(seed['student_email'])
+        response = kemi.post('/mark_attendance', json={
+            'qr_data': qr_token(appmod, seed['session_id']),
+            'user_marker': str(seed['other_student_id']),
+        })
+        assert response.status_code == 409
+        with appmod.app.app_context():
+            assert Attendance.query.count() == 0
+
+
+class TestFlashMessagesRenderOnce:
+
+    def test_a_flash_is_not_duplicated_on_the_page(self, appmod, seed, client):
+        """
+        base.html called get_flashed_messages() twice. Flask caches the list
+        on the request context, so the second call re-rendered every message
+        — always styled as a yellow warning, whatever its real category.
+        """
+        response = client.post('/login',
+                               data={'email': seed['student_email'],
+                                     'password': 'definitely-wrong-9'},
+                               follow_redirects=True)
+        assert response.data.count(b'Invalid email or password.') == 1
+
+
+class TestScanPageShowsRealData:
+
+    def test_the_scan_page_lists_courses_the_student_has_attended(
+            self, appmod, seed, login):
+        """
+        scan_page() rendered the template with no context, so the guard
+        `{% if attendance_data %}` was always false and every student saw the
+        empty state no matter how many classes they had attended.
+        """
+        kemi = login(seed['student_email'])
+        kemi.post('/mark_attendance',
+                  json={'qr_data': qr_token(appmod, seed['session_id'])})
+
+        page = kemi.get('/scan_page')
+        assert page.status_code == 200
+        assert b'CSC201' in page.data
+        assert b"haven't marked attendance for any courses yet" not in page.data
+
+
+class TestOfflineQueueHonesty:
+
+    def test_the_service_worker_is_told_the_servers_qr_window(self, client, appmod):
+        """
+        The worker used to hold queued scans for 5 minutes against a
+        45-second server window, then delete them silently. It now gets the
+        real number from the server so the two cannot drift apart.
+        """
+        response = client.get('/service-worker.js')
+        assert response.status_code == 200
+        assert (f'self.SCANMARK_QR_WINDOW_SECONDS = {appmod.QR_CODE_WINDOW};'
+                in response.get_data(as_text=True))
+
+
+class TestGeofenceRequiredMode:
+
+    def test_strict_mode_refuses_a_scan_when_no_classroom_is_pinned(
+            self, appmod, seed, login, monkeypatch):
+        """
+        With no pinned location the distance check is skipped entirely, so
+        the class is marked with no proximity requirement at all. Strict
+        mode makes that refuse instead of silently accepting.
+        """
+        from models import Attendance
+
+        monkeypatch.setattr(appmod, 'GEOFENCE_REQUIRED', True)
+        kemi = login(seed['student_email'])
+        response = kemi.post('/mark_attendance', json={
+            'qr_data': qr_token(appmod, seed['session_id']),
+            'lat': 7.227, 'lon': 3.438,
+        })
+        assert response.status_code == 422
+        with appmod.app.app_context():
+            assert Attendance.query.count() == 0
+
+    def test_the_default_stays_permissive_so_a_class_is_never_locked_out(
+            self, appmod, seed, login):
+        assert appmod.GEOFENCE_REQUIRED is False
+        kemi = login(seed['student_email'])
+        response = kemi.post('/mark_attendance',
+                             json={'qr_data': qr_token(appmod, seed['session_id'])})
+        assert response.status_code == 200
