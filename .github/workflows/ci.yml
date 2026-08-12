@@ -44,7 +44,8 @@ jobs:
           python -m pyflakes app.py models.py campos_integration.py \
                              localtime.py academic.py \
                              performance.py conftest.py \
-                             test_app.py test_performance.py test_bugfixes.py
+                             test_app.py test_performance.py test_bugfixes.py \
+                             benchmarks/*.py loadtest/check_slo.py
 
       - name: Check the browser JavaScript parses
         run: |
@@ -158,6 +159,21 @@ jobs:
           echo "server never became healthy"
           pkill -x gunicorn || true
           exit 1
+
+      # The suite runs on SQLite with no Redis by default, which is why a
+      # whole class of Redis state-leakage bug was invisible: pinned
+      # classrooms and cached headcounts persisted between tests, and ids
+      # repeat, so a test expecting no geofence silently got one. Run it
+      # against the real services too.
+      - name: Run the test suite against Postgres and Redis
+        env:
+          SECRET_KEY: ci-secret-key
+          FLASK_ENV: ci
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/scanmark
+          SCANMARK_TEST_REDIS_URL: redis://localhost:6379/9
+          MAIL_SERVER: 127.0.0.1
+          MAIL_PORT: 2525
+        run: python -m pytest -q
 
       - name: Refuse to boot production without its dependencies
         env:

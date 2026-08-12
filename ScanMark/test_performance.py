@@ -1,3 +1,5 @@
+import time
+
 import pytest
 from sqlalchemy import event
 
@@ -84,7 +86,7 @@ def _point_north(latitude, longitude, metres):
 def test_authoritative_geofence_boundary(distance_m, expected_status):
     coordinator, student, course, sessions = _seed()
     origin = (7.227, 3.438)
-    scanmark.set_class_location(course.id, *origin)
+    scanmark.set_class_location(sessions[0].id, *origin)
     latitude, longitude = _point_north(*origin, distance_m)
     client = scanmark.app.test_client()
     _login(client, student)
@@ -95,6 +97,7 @@ def test_authoritative_geofence_boundary(distance_m, expected_status):
         'lon': longitude,
         'location_age_ms': 100,
         'accuracy_m': 5,
+        'captured_at': time.time() * 1000,
         'user_marker': str(student.id),
     })
 
@@ -153,6 +156,7 @@ def test_mark_attendance_query_budget():
     try:
         response = client.post('/mark_attendance', json={
             'qr_data': scanmark.generate_signed_qr(sessions[0].id),
+            'captured_at': time.time() * 1000,
             'user_marker': str(student.id),
         })
     finally:

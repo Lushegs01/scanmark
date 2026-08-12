@@ -19,7 +19,15 @@ _TMPDIR = tempfile.mkdtemp(prefix='scanmark-tests-')
 os.environ.setdefault('SECRET_KEY', 'test-secret-key-for-the-suite')
 os.environ.setdefault('DATABASE_URL', f'sqlite:///{_TMPDIR}/test.db')
 os.environ.setdefault('FLASK_ENV', 'testing')
-os.environ.pop('REDIS_URL', None)
+# The suite runs without Redis so CI needs no services. Set
+# SCANMARK_TEST_REDIS_URL to point the Redis-dependent tests (the admission
+# token bucket, which is a Lua script and only exists inside Redis) at a real
+# instance; everything else behaves identically either way.
+_test_redis = os.environ.pop('SCANMARK_TEST_REDIS_URL', '').strip()
+if _test_redis:
+    os.environ['REDIS_URL'] = _test_redis
+else:
+    os.environ.pop('REDIS_URL', None)
 # Point mail at a closed port: sends fail instantly instead of reaching out.
 os.environ.setdefault('MAIL_SERVER', '127.0.0.1')
 os.environ.setdefault('MAIL_PORT', '2525')
@@ -69,8 +77,20 @@ def appmod(flask_app):
     # all have to pin a classroom first; they opt out, and the shipped default
     # has its own tests in TestGeofenceRequiredMode.
     flask_app.GEOFENCE_REQUIRED = False
+
+    # Between-test isolation for the OTHER store. The database is emptied
+    # above; Redis has to be emptied too or state crosses test boundaries —
+    # and it does so invisibly, because ids repeat: a classroom pinned for
+    # session 1 in one test is still pinned for "session 1" in the next, so a
+    # test that expects no geofence silently gets one. Same reasoning as
+    # clearing the in-memory fallback, same scope.
+    #
+    # SCANMARK_TEST_REDIS_URL must therefore point at a scratch database.
     if flask_app.redis_client is None:
         flask_app._local_locations.clear()
+    else:
+        flask_app.redis_client.flushdb()
+        flask_app._admission_script = None
 
     yield flask_app
 
@@ -170,3 +190,24 @@ def qr_token(appmod, session_id, age_seconds=0):
         ts = int(time.time()) - age_seconds
         message = f"S{session_id}|{ts}"
         return f"{message}|{appmod._make_signature(message)}"
+
+
+def scan_body(appmod, session_id=None, token=None, **overrides):
+    """
+    The body a real phone posts, with every field the server requires.
+
+    The server rejects a scan that omits a security signal rather than
+    skipping the check, so a test that hand-builds a partial payload is
+    testing a request no client sends. Pass `token=` to supply your own (a
+    stale or forged one), and any keyword to override or — with None — drop a
+    field, which is how the "what if the client leaves this out" tests work.
+    """
+    import time as _time
+
+    body = {
+        'qr_data': token if token is not None else qr_token(appmod, session_id),
+        'captured_at': _time.time() * 1000,
+        'device_id': 'pytest-device',
+    }
+    body.update(overrides)
+    return {key: value for key, value in body.items() if value is not None}

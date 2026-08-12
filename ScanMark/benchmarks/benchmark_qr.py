@@ -1,4 +1,15 @@
-"""Measure the real ScanMark QR verifier at 10k or 100k iterations."""
+"""
+REGRESSION MICROBENCHMARK — NOT a capacity measurement.
+
+Runs sequentially, in-process, against SQLite, with no CSRF, no rate limiter,
+no Redis, no network and no concurrency. It exists to catch a change that
+makes a code path dramatically slower, and it is good at that.
+
+It says NOTHING about how many students can scan at once. Do not quote a
+number from this file as user capacity: use loadtest/ against staging, where
+the geofence, CSRF, rate limiting, Redis, Postgres and real concurrency are
+all in play. See loadtest/README.md.
+"""
 
 import argparse
 import os

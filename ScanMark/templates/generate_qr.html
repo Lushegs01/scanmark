@@ -64,10 +64,20 @@
                     </span>
                 </div>
 
+                {# The headcount is the answer this screen exists to give; the
+                   names below are the "did mine go through?" reassurance, and
+                   only the most recent ones are useful for that. Rendering all
+                   2,000 would put 2,000 nodes on the laptop driving the
+                   projector — the full sheet is its own page. #}
                 <div class="card-body p-0" style="max-height: 600px; overflow-y: auto;">
                     <ul id="live-student-list" class="list-group list-group-flush">
                         <li class="list-group-item text-muted text-center py-4">Waiting for students to scan...</li>
                     </ul>
+                </div>
+                <div class="card-footer small text-muted d-flex justify-content-between">
+                    <span>Showing the {{ projector_recent_rows }} most recent scans</span>
+                    <a href="{{ url_for('session_attendance', session_id=session.id) }}"
+                        target="_blank" rel="noopener">Full sheet →</a>
                 </div>
             </div>
         </div>
@@ -106,6 +116,10 @@
 
 <script>
     const sessionId = "{{ session.id }}";
+    // Hard ceiling on DOM rows. The feed still drains every scan so the
+    // cursor stays correct and the count is right; only the rendered window
+    // is bounded, so browser cost is independent of class size.
+    const RECENT_ROWS = {{ projector_recent_rows }};
 
     let lastAttendanceId = 0;
     let attendeePollTimer = null;
@@ -154,7 +168,18 @@
                 if (data.new_attendees.length) {
                     const waiting = list.querySelector('[data-waiting], .text-center');
                     if (waiting) waiting.remove();
-                    data.new_attendees.forEach(student => list.prepend(attendeeListItem(student)));
+
+                    // Only the tail of this batch can survive the window, so
+                    // building nodes for the rest is pure waste — on the first
+                    // drain of a full class that batch is 250 rows at a time.
+                    const visible = data.new_attendees.slice(-RECENT_ROWS);
+                    const fragment = document.createDocumentFragment();
+                    visible.forEach(student => fragment.prepend(attendeeListItem(student)));
+                    list.prepend(fragment);
+
+                    while (list.children.length > RECENT_ROWS) {
+                        list.removeChild(list.lastElementChild);
+                    }
                     lastAttendanceId = data.last_id;
                 }
                 hasMore = data.has_more;
@@ -236,8 +261,10 @@
                 alertEl.classList.add('alert-success');
                 alertEl.querySelector('.spinner-grow').classList.add('d-none'); // Hide spinner
 
-                // FIX #5: Send CSRF token with the fetch request
-                fetch("/set_location/{{ course.id }}", {
+                // Pinned against THIS meeting, not the course: the lecture,
+                // the tutorial and the makeup class are legitimately in
+                // different rooms.
+                fetch("{{ url_for('set_session_location', session_id=session.id) }}", {
                     method: "POST",
                     headers: {
                         'Content-Type': 'application/json',
