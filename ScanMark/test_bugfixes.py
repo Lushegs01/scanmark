@@ -9,7 +9,7 @@ import time
 
 import pytest
 
-from conftest import qr_token
+from conftest import qr_token, scan_body
 
 
 # ============================================================
@@ -47,7 +47,7 @@ class TestEndingAClassEndsIt:
         ada.post(f"/session/{seed['session_id']}/end")
 
         kemi = login(seed['student_email'])
-        response = kemi.post('/mark_attendance', json={'qr_data': token})
+        response = kemi.post('/mark_attendance', json=scan_body(appmod, token=token))
         assert response.status_code == 409
         assert 'ended' in response.get_json()['message'].lower()
         with appmod.app.app_context():
@@ -123,7 +123,7 @@ class TestMoreThanOneClassADay:
             tutorial_id = tutorial.id
 
         kemi = login(seed['student_email'])
-        kemi.post('/mark_attendance', json={'qr_data': qr_token(appmod, tutorial_id)})
+        kemi.post('/mark_attendance', json=scan_body(appmod, tutorial_id))
 
         with appmod.app.app_context():
             rows = Attendance.query.all()
@@ -299,7 +299,7 @@ class TestTheRosterIsFrozenPerClass:
 
         kemi = login(seed['student_email'])
         kemi.post('/mark_attendance',
-                  json={'qr_data': qr_token(appmod, seed['session_id'])})
+                  json=scan_body(appmod, seed['session_id']))
 
         # The one enrolled student leaves the course after the class.
         with appmod.app.app_context():
@@ -398,7 +398,7 @@ class TestSupervisoryScopeAndMaths:
         """
         kemi = login(seed['student_email'])
         kemi.post('/mark_attendance',
-                  json={'qr_data': qr_token(appmod, seed['session_id'])})
+                  json=scan_body(appmod, seed['session_id']))
 
         with appmod.app.app_context():
             data = appmod.get_department_analytics('Computer Science')
@@ -681,7 +681,7 @@ class TestAuditTrail:
 
         kemi = login(seed['student_email'])
         kemi.post('/mark_attendance',
-                  json={'qr_data': qr_token(appmod, seed['session_id'])})
+                  json=scan_body(appmod, seed['session_id']))
 
         ada = login(seed['coordinator_email'])
         ada.post(f"/session/{seed['session_id']}/delete")
@@ -1128,10 +1128,8 @@ class TestQrReplayWindow:
         """
         token = qr_token(appmod, seed['session_id'])
         kemi = login(seed['student_email'])
-        response = kemi.post('/mark_attendance', json={
-            'qr_data': token,
-            'captured_at': (time.time() - 3600) * 1000,
-        })
+        response = kemi.post('/mark_attendance', json=scan_body(
+            appmod, token=token, captured_at=(time.time() - 3600) * 1000))
         assert response.status_code == 400
         assert 'not read from the screen' in response.get_json()['message']
 
@@ -1139,11 +1137,32 @@ class TestQrReplayWindow:
         from datetime import datetime, timezone
 
         kemi = login(seed['student_email'])
-        response = kemi.post('/mark_attendance', json={
-            'qr_data': qr_token(appmod, seed['session_id']),
-            'captured_at': datetime.now(timezone.utc).isoformat(),
-        })
+        response = kemi.post('/mark_attendance', json=scan_body(
+            appmod, seed['session_id'],
+            captured_at=datetime.now(timezone.utc).isoformat()))
         assert response.status_code == 200
+
+    def test_a_scan_that_will_not_say_when_it_was_read_is_refused(
+            self, appmod, seed, login):
+        """
+        The check ran only when captured_at parsed, so omitting the field was
+        how you skipped it — the same shape of hole accuracy_m and
+        location_age_ms had.
+        """
+        from models import Attendance
+
+        kemi = login(seed['student_email'])
+        for value in (None, 'not-a-time', {}):
+            payload = scan_body(appmod, seed['session_id'])
+            if value is None:
+                payload.pop('captured_at')
+            else:
+                payload['captured_at'] = value
+            response = kemi.post('/mark_attendance', json=payload)
+            assert response.status_code == 400, payload
+            assert response.get_json()['outcome'] == 'missing_capture_time'
+        with appmod.app.app_context():
+            assert Attendance.query.count() == 0
 
 
 class TestReadiness:
@@ -1223,15 +1242,15 @@ class TestTheOfflineQueueTellsTheTruth:
         ada.post(f"/session/{seed['session_id']}/end")
 
         kemi = login(seed['student_email'])
-        body = kemi.post('/mark_attendance', json={'qr_data': token}).get_json()
+        body = kemi.post('/mark_attendance', json=scan_body(appmod, token=token)).get_json()
         assert body['outcome'] == 'session_ended'
 
     def test_a_genuine_duplicate_still_reports_as_a_duplicate(
             self, appmod, seed, login):
         kemi = login(seed['student_email'])
         token = qr_token(appmod, seed['session_id'])
-        kemi.post('/mark_attendance', json={'qr_data': token})
-        body = kemi.post('/mark_attendance', json={'qr_data': token}).get_json()
+        kemi.post('/mark_attendance', json=scan_body(appmod, token=token))
+        body = kemi.post('/mark_attendance', json=scan_body(appmod, token=token)).get_json()
         assert body['outcome'] == 'duplicate'
 
     def test_the_queue_matches_on_the_outcome_not_the_status(self, appmod):
@@ -1632,3 +1651,300 @@ class TestStartingAMeetingIsOneTransaction:
                 course_id=seed['course_id'], active=True).count() == 1
             assert ClassSession.query.filter_by(
                 course_id=seed['course_id']).count() == 6
+
+
+# ============================================================
+# CAPACITY HARDENING
+# ============================================================
+
+class TestBurstAdmissionControl:
+    """
+    A lecturer shows the code and 2,000 phones fire at once. The token bucket
+    smooths that microburst down to a rate the database is measured to
+    sustain — without it, arrival rate rather than sustainable rate decides
+    how much work Postgres is asked to do in the first second.
+    """
+
+    def test_it_is_off_until_a_measured_rate_is_configured(self, appmod):
+        """
+        A default here would be a guess wearing the authority of a measured
+        number. It stays off until staging says what the safe rate is.
+        """
+        assert appmod.SCAN_ADMISSION_RATE == 0
+        assert appmod.admit_scan(1) is True
+
+    def test_it_admits_the_burst_then_sheds(self, appmod, monkeypatch):
+        """One token per admitted scan, refilled at the configured rate."""
+        bucket = {'tokens': 3.0}
+
+        def fake_admit(session_id):
+            if bucket['tokens'] >= 1:
+                bucket['tokens'] -= 1
+                return True
+            return False
+
+        monkeypatch.setattr(appmod, 'admit_scan', fake_admit)
+        assert [appmod.admit_scan(1) for _ in range(5)] == [
+            True, True, True, False, False]
+
+    def test_a_shed_scan_is_a_429_that_tells_the_phone_to_retry(
+            self, appmod, seed, login, monkeypatch):
+        from models import Attendance
+
+        monkeypatch.setattr(appmod, 'admit_scan', lambda session_id: False)
+        kemi = login(seed['student_email'])
+        response = kemi.post('/mark_attendance',
+                             json=scan_body(appmod, seed['session_id']))
+
+        assert response.status_code == 429
+        body = response.get_json()
+        assert body['outcome'] == 'admission_throttled'
+        # Sub-second: attendance is time-sensitive, so this smooths a
+        # microburst rather than hiding an overload.
+        assert int(response.headers['Retry-After']) <= 2
+        assert 'not lost' in body['message']
+        with appmod.app.app_context():
+            assert Attendance.query.count() == 0
+
+    def test_it_fails_open_when_redis_is_unavailable(self, appmod, monkeypatch):
+        """
+        A limiter outage must never become an attendance outage. Without
+        shaping the system behaves as it did before this existed; with the
+        limiter refusing, a whole class loses its register.
+        """
+        class BrokenRedis:
+            def register_script(self, _source):
+                raise __import__('redis').RedisError('redis is down')
+
+        monkeypatch.setattr(appmod, 'SCAN_ADMISSION_RATE', 100.0)
+        monkeypatch.setattr(appmod, '_admission_script', None)
+        monkeypatch.setattr(appmod, 'redis_client', BrokenRedis())
+        assert appmod.admit_scan(1) is True
+
+    def test_admission_runs_after_the_cheap_rejections(self, appmod, seed, login):
+        """
+        A forged token, a closed class or an unenrolled student must not
+        consume a token from the bucket the real class is drawing on.
+        """
+        calls = []
+        real = appmod.admit_scan
+        appmod.admit_scan = lambda session_id: calls.append(session_id) or True
+        try:
+            tayo = login(seed['other_student_email'])   # not enrolled
+            tayo.post('/mark_attendance', json=scan_body(appmod, seed['session_id']))
+            assert calls == []
+
+            kemi = login(seed['student_email'])
+            kemi.post('/mark_attendance', json=scan_body(appmod, token='nonsense'))
+            assert calls == []
+
+            kemi.post('/mark_attendance', json=scan_body(appmod, seed['session_id']))
+            assert calls == [seed['session_id']]
+        finally:
+            appmod.admit_scan = real
+
+
+class TestRedisIsNotOnTheWritePath:
+
+    def test_a_successful_scan_performs_no_redis_write(
+            self, appmod, seed, login, monkeypatch):
+        """
+        Every scan used to DELETE the cached headcount — 2,000 Redis round
+        trips inside 2,000 requests, to save at most ATTENDEE_SUMMARY_TTL
+        seconds on a number that is visibly moving anyway.
+        """
+        commands = []
+
+        class RecordingRedis:
+            def __getattr__(self, name):
+                def record(*args, **kwargs):
+                    commands.append(name)
+                    return None
+                return record
+
+        monkeypatch.setattr(appmod, 'redis_client', RecordingRedis())
+        kemi = login(seed['student_email'])
+        response = kemi.post('/mark_attendance',
+                             json=scan_body(appmod, seed['session_id']))
+        assert response.status_code == 200
+        assert 'delete' not in commands, f'scan wrote to Redis: {commands}'
+
+    def test_the_lecturer_feed_survives_redis_being_down(
+            self, appmod, seed, login, monkeypatch):
+        """
+        Redis accelerates the lecturer's reads; Postgres is the source of
+        truth. A cache failure must cost database load, not the ability to
+        see who is in the room.
+        """
+        import redis as redis_module
+
+        kemi = login(seed['student_email'])
+        kemi.post('/mark_attendance', json=scan_body(appmod, seed['session_id']))
+
+        class BrokenRedis:
+            def get(self, *_args, **_kwargs):
+                raise redis_module.RedisError('down')
+
+            def setex(self, *_args, **_kwargs):
+                raise redis_module.RedisError('down')
+
+        monkeypatch.setattr(appmod, 'redis_client', BrokenRedis())
+        ada = login(seed['coordinator_email'])
+        response = ada.get(f"/api/session/{seed['session_id']}/attendees")
+        assert response.status_code == 200
+        payload = response.get_json()
+        assert payload['present'] == 1
+        assert payload['enrolled'] == 1
+
+
+class TestClassroomIsPinnedPerMeeting:
+
+    def test_two_meetings_of_one_course_can_be_in_different_rooms(
+            self, appmod, seed, login):
+        """
+        The pin was keyed by course, so the lecture in the theatre and the
+        tutorial in the computer lab geofenced against whichever was pinned
+        last — and the second room's students were all "too far away".
+        """
+        from models import db, ClassSession
+
+        with appmod.app.app_context():
+            tutorial = ClassSession(course_id=seed['course_id'], title='Tutorial')
+            db.session.add(tutorial)
+            db.session.flush()
+            appmod._snapshot_roster(tutorial)
+            db.session.commit()
+            tutorial_id = tutorial.id
+
+            appmod.set_class_location(seed['session_id'], 7.22, 3.44)
+            appmod.set_class_location(tutorial_id, 9.11, 4.55)
+
+            lecture_pin = appmod.get_class_location(seed['session_id'])
+            tutorial_pin = appmod.get_class_location(tutorial_id)
+
+        assert lecture_pin == {'lat': 7.22, 'lon': 3.44}
+        assert tutorial_pin == {'lat': 9.11, 'lon': 4.55}
+
+    def test_only_a_course_lecturer_can_pin_a_meeting(self, appmod, seed, login):
+        eve = login(seed['outsider_email'])
+        assert eve.post(f"/session/{seed['session_id']}/set_location",
+                        json={'lat': 7.22, 'lon': 3.44}).status_code == 403
+
+    def test_an_ended_meeting_cannot_be_pinned(self, appmod, seed, login):
+        ada = login(seed['coordinator_email'])
+        ada.post(f"/session/{seed['session_id']}/end")
+        assert ada.post(f"/session/{seed['session_id']}/set_location",
+                        json={'lat': 7.22, 'lon': 3.44}).status_code == 409
+
+
+class TestSaturationIsNotAServerFault:
+
+    def test_pool_exhaustion_is_a_503_with_retry_after(
+            self, appmod, seed, login, monkeypatch):
+        """
+        A request that waited out pool_timeout is saturation, not a bug. As a
+        500 it reads as "this will never work" to the scanner and as a server
+        fault on every dashboard — and the usual reaction, more workers, points
+        more connections at the same exhausted database.
+        """
+        from sqlalchemy.exc import TimeoutError as PoolTimeoutError
+
+        def exhausted(*_args, **_kwargs):
+            raise PoolTimeoutError('QueuePool limit reached')
+
+        kemi = login(seed['student_email'])
+        monkeypatch.setattr(appmod, '_insert_attendance_once', exhausted)
+        response = kemi.post('/mark_attendance',
+                             json=scan_body(appmod, seed['session_id']))
+
+        assert response.status_code == 503
+        assert response.get_json()['outcome'] == 'database_saturated'
+        assert int(response.headers['Retry-After']) >= 1
+
+
+class TestScanBudget:
+
+    def test_every_stage_has_a_declared_budget(self, appmod):
+        """
+        Stage timings without a contract are just numbers. The budget is what
+        turns "scans are slow" into "db_insert is over and nothing else is".
+        """
+        expected = {'qr_verify', 'session_course', 'enrollment', 'admission',
+                    'geofence', 'db_insert', 'enqueue'}
+        assert expected <= set(appmod.SCAN_STAGE_BUDGET_MS)
+        assert appmod.SCAN_TOTAL_BUDGET_MS > 0
+        # The whole scan has to fit far inside the window that decides whether
+        # a queued token is still redeemable.
+        assert appmod.SCAN_TOTAL_BUDGET_MS < appmod.QR_CODE_WINDOW * 1000 / 10
+
+    def test_a_breach_is_counted_per_stage(self, appmod, seed, login, monkeypatch):
+        monkeypatch.setitem(appmod.SCAN_STAGE_BUDGET_MS, 'qr_verify', 0.0000001)
+        kemi = login(seed['student_email'])
+        kemi.post('/mark_attendance', json=scan_body(appmod, seed['session_id']))
+        counters = appmod.runtime_metrics.snapshot()['counters']
+        assert counters.get('scan.budget_exceeded.qr_verify', 0) >= 1
+
+    def test_the_stage_timings_are_exported_for_a_dashboard(self, appmod, seed, login):
+        kemi = login(seed['student_email'])
+        kemi.post('/mark_attendance', json=scan_body(appmod, seed['session_id']))
+        exported = appmod.runtime_metrics.prometheus()
+        for stage in ('qr_verify', 'session_course', 'enrollment',
+                      'geofence', 'db_insert', 'enqueue'):
+            assert f'scan_stage_{stage}' in exported.replace('.', '_'), stage
+
+
+class TestTokenBucketAgainstRealRedis:
+    """
+    The bucket is a Lua script, so its arithmetic only exists inside Redis —
+    a fake would be testing the fake. Run the suite with
+    SCANMARK_TEST_REDIS_URL set to exercise these against a real instance.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _needs_redis(self, appmod):
+        if appmod.redis_client is None:
+            pytest.skip('set SCANMARK_TEST_REDIS_URL to run the bucket tests')
+
+    def test_it_shapes_a_burst_to_the_configured_rate(self, appmod, monkeypatch):
+        import time as _time
+
+        monkeypatch.setattr(appmod, 'SCAN_ADMISSION_RATE', 50.0)
+        monkeypatch.setattr(appmod, 'SCAN_ADMISSION_BURST', 60.0)
+        monkeypatch.setattr(appmod, '_admission_script', None)
+        appmod.redis_client.delete(appmod._admission_key(9991))
+
+        started = _time.time()
+        admitted = sum(1 for _ in range(500) if appmod.admit_scan(9991))
+        elapsed = _time.time() - started
+
+        # The burst passes, the rest is shed — and the ceiling is the bucket
+        # plus whatever refilled while we were calling.
+        ceiling = 60 + 50 * elapsed + 5
+        assert 55 <= admitted <= ceiling, admitted
+        assert admitted < 500
+
+    def test_the_bucket_refills_at_the_rate(self, appmod, monkeypatch):
+        import time as _time
+
+        monkeypatch.setattr(appmod, 'SCAN_ADMISSION_RATE', 50.0)
+        monkeypatch.setattr(appmod, 'SCAN_ADMISSION_BURST', 60.0)
+        monkeypatch.setattr(appmod, '_admission_script', None)
+        appmod.redis_client.delete(appmod._admission_key(9992))
+
+        while appmod.admit_scan(9992):
+            pass                      # drain
+        _time.sleep(1.0)
+        refilled = sum(1 for _ in range(500) if appmod.admit_scan(9992))
+        assert 35 <= refilled <= 75, refilled
+
+    def test_one_busy_class_does_not_throttle_another(self, appmod, monkeypatch):
+        monkeypatch.setattr(appmod, 'SCAN_ADMISSION_RATE', 50.0)
+        monkeypatch.setattr(appmod, 'SCAN_ADMISSION_BURST', 60.0)
+        monkeypatch.setattr(appmod, '_admission_script', None)
+        for key in (9993, 9994):
+            appmod.redis_client.delete(appmod._admission_key(key))
+
+        while appmod.admit_scan(9993):
+            pass                      # drain the busy session
+        assert appmod.admit_scan(9993) is False
+        assert all(appmod.admit_scan(9994) for _ in range(10))

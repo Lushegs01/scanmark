@@ -10,7 +10,7 @@ import time
 
 import pytest
 
-from conftest import VALID_PASSWORD, qr_token
+from conftest import VALID_PASSWORD, qr_token, scan_body
 
 
 # ============================================================
@@ -59,7 +59,7 @@ class TestNoRouteExplodes:
         """
         student = login(seed['student_email'])
         student.post('/mark_attendance',
-                     json={'qr_data': qr_token(appmod, seed['session_id'])})
+                     json=scan_body(appmod, seed['session_id']))
 
         lecturer = login(seed['coordinator_email'])
 
@@ -607,7 +607,7 @@ class TestScanning:
         from models import Attendance
         kemi = login(seed['student_email'])
         response = kemi.post('/mark_attendance',
-                             json={'qr_data': qr_token(appmod, seed['session_id'])})
+                             json=scan_body(appmod, seed['session_id']))
         assert response.get_json()['status'] == 'success'
         with appmod.app.app_context():
             assert Attendance.query.count() == 1
@@ -616,8 +616,8 @@ class TestScanning:
         from models import Attendance
         kemi = login(seed['student_email'])
         token = qr_token(appmod, seed['session_id'])
-        kemi.post('/mark_attendance', json={'qr_data': token})
-        response = kemi.post('/mark_attendance', json={'qr_data': token})
+        kemi.post('/mark_attendance', json=scan_body(appmod, token=token))
+        response = kemi.post('/mark_attendance', json=scan_body(appmod, token=token))
         body = response.get_json()
         assert body['status'] == 'error'
         assert 'already marked present' in body['message']
@@ -640,7 +640,7 @@ class TestScanning:
             c = appmod.app.test_client()
             c.post('/login', data={'email': seed['student_email'],
                                    'password': VALID_PASSWORD})
-            return c.post('/mark_attendance', json={'qr_data': token}).get_json()
+            return c.post('/mark_attendance', json=scan_body(appmod, token=token)).get_json()
 
         with ThreadPoolExecutor(max_workers=6) as pool:
             results = list(pool.map(scan, range(6)))
@@ -657,7 +657,7 @@ class TestScanning:
         from models import Attendance
         tayo = login(seed['other_student_email'])
         response = tayo.post('/mark_attendance',
-                             json={'qr_data': qr_token(appmod, seed['session_id'])})
+                             json=scan_body(appmod, seed['session_id']))
         assert 'not registered' in response.get_json()['message']
         with appmod.app.app_context():
             assert Attendance.query.count() == 0
@@ -666,7 +666,7 @@ class TestScanning:
         kemi = login(seed['student_email'])
         stale = qr_token(appmod, seed['session_id'],
                          age_seconds=appmod.QR_CODE_WINDOW + 5)
-        response = kemi.post('/mark_attendance', json={'qr_data': stale})
+        response = kemi.post('/mark_attendance', json=scan_body(appmod, token=stale))
         assert 'expired' in response.get_json()['message'].lower()
 
     def test_a_token_still_inside_the_window_is_accepted(self, appmod, seed, login):
@@ -675,7 +675,7 @@ class TestScanning:
         nearly = qr_token(appmod, seed['session_id'],
                           age_seconds=appmod.QR_CODE_WINDOW - 5)
         assert kemi.post('/mark_attendance',
-                         json={'qr_data': nearly}).get_json()['status'] == 'success'
+                         json=scan_body(appmod, token=nearly)).get_json()['status'] == 'success'
 
     @pytest.mark.parametrize('forged', [
         'S1|9999999999|deadbeefdeadbeef',
@@ -687,7 +687,7 @@ class TestScanning:
     def test_a_forged_or_malformed_token_is_refused(self, appmod, seed, login, forged):
         from models import Attendance
         kemi = login(seed['student_email'])
-        response = kemi.post('/mark_attendance', json={'qr_data': forged})
+        response = kemi.post('/mark_attendance', json=scan_body(appmod, token=forged))
         assert response.get_json()['status'] == 'error'
         with appmod.app.app_context():
             assert Attendance.query.count() == 0
@@ -701,7 +701,7 @@ class TestScanning:
             other_id = other.id
 
         kemi = login(seed['student_email'])
-        kemi.post('/mark_attendance', json={'qr_data': qr_token(appmod, other_id)})
+        kemi.post('/mark_attendance', json=scan_body(appmod, other_id))
         with appmod.app.app_context():
             row = Attendance.query.one()
             assert row.session_id == other_id
@@ -712,7 +712,7 @@ class TestScanning:
             kemi = login(seed['student_email'])
             codes = []
             for _ in range(14):
-                r = kemi.post('/mark_attendance', json={'qr_data': 'nonsense'})
+                r = kemi.post('/mark_attendance', json=scan_body(appmod, token='nonsense'))
                 codes.append(r.status_code)
             assert 429 in codes, codes
         finally:
@@ -722,20 +722,21 @@ class TestScanning:
 
 class TestGeofence:
 
-    def _pin(self, appmod, course_id, lat=7.22, lon=3.44):
+    def _pin(self, appmod, seed, lat=7.22, lon=3.44):
+        """Pin the MEETING's classroom — a lecture and the tutorial after it
+        are legitimately in different rooms."""
         with appmod.app.app_context():
-            appmod.set_class_location(course_id, lat, lon)
+            appmod.set_class_location(seed['session_id'], lat, lon)
 
     def _scan_at_metres(self, appmod, seed, client, metres, **overrides):
         lat = 7.22 + (metres / 111320.0)
-        payload = {
-            'qr_data': qr_token(appmod, seed['session_id']),
-            'lat': lat, 'lon': 3.44,
-            # Both are required now. They used to be accepted-if-present and
-            # ignored otherwise, so omitting them was the way past the check.
-            'accuracy_m': 10,
-            'location_age_ms': 1000,
-        }
+        payload = scan_body(
+            appmod, seed['session_id'],
+            lat=lat, lon=3.44,
+            # Required, not accepted-if-present: omitting them used to be the
+            # way past the check.
+            accuracy_m=10, location_age_ms=1000,
+        )
         payload.update(overrides)
         return client.post('/mark_attendance', json=payload).get_json()
 
@@ -747,12 +748,12 @@ class TestGeofence:
         Indoor GPS drifts 20-50m, so this rejected people sitting in the hall.
         """
         assert appmod.GEOFENCE_RADIUS_M == 100
-        self._pin(appmod, seed['course_id'])
+        self._pin(appmod, seed)
         kemi = login(seed['student_email'])
         assert self._scan_at_metres(appmod, seed, kemi, 80)['status'] == 'success'
 
     def test_beyond_the_radius_is_refused(self, appmod, seed, login):
-        self._pin(appmod, seed['course_id'])
+        self._pin(appmod, seed)
         kemi = login(seed['student_email'])
         result = self._scan_at_metres(appmod, seed, kemi, 250)
         assert result['status'] == 'error'
@@ -760,20 +761,20 @@ class TestGeofence:
 
     def test_a_missing_reading_is_refused_when_a_class_is_pinned(
             self, appmod, seed, login):
-        self._pin(appmod, seed['course_id'])
+        self._pin(appmod, seed)
         kemi = login(seed['student_email'])
         response = kemi.post('/mark_attendance',
-                             json={'qr_data': qr_token(appmod, seed['session_id'])})
+                             json=scan_body(appmod, seed['session_id']))
         assert 'Location required' in response.get_json()['message']
 
     def test_a_zero_coordinate_is_a_reading_not_a_missing_value(
             self, appmod, seed, login):
         """`not student_lat` also rejected a legitimate 0.0."""
-        self._pin(appmod, seed['course_id'], lat=0.0, lon=0.0)
+        self._pin(appmod, seed, lat=0.0, lon=0.0)
         kemi = login(seed['student_email'])
-        response = kemi.post('/mark_attendance', json={
-            'qr_data': qr_token(appmod, seed['session_id']), 'lat': 0.0, 'lon': 0.0,
-            'accuracy_m': 10, 'location_age_ms': 500})
+        response = kemi.post('/mark_attendance', json=scan_body(
+            appmod, seed['session_id'], lat=0.0, lon=0.0,
+            accuracy_m=10, location_age_ms=500))
         assert response.get_json()['status'] == 'success'
 
     @pytest.mark.parametrize('missing', ['accuracy_m', 'location_age_ms'])
@@ -785,12 +786,10 @@ class TestGeofence:
         scan submitted by hand is not obliged to be honest, but it is obliged
         to be complete.
         """
-        self._pin(appmod, seed['course_id'])
+        self._pin(appmod, seed)
         kemi = login(seed['student_email'])
-        payload = {
-            'qr_data': qr_token(appmod, seed['session_id']),
-            'lat': 7.22, 'lon': 3.44, 'accuracy_m': 10, 'location_age_ms': 500,
-        }
+        payload = scan_body(appmod, seed['session_id'], lat=7.22, lon=3.44,
+                            accuracy_m=10, location_age_ms=500)
         payload.pop(missing)
         response = kemi.post('/mark_attendance', json=payload)
         assert response.status_code == 422
@@ -801,7 +800,7 @@ class TestGeofence:
     def test_a_fix_too_imprecise_to_mean_anything_is_refused(
             self, appmod, seed, login):
         """A 5km error radius 'inside' a 100m geofence proves nothing."""
-        self._pin(appmod, seed['course_id'])
+        self._pin(appmod, seed)
         kemi = login(seed['student_email'])
         result = self._scan_at_metres(appmod, seed, kemi, 5,
                                       accuracy_m=appmod.GEOFENCE_MAX_ACCURACY_M + 1)
@@ -809,7 +808,7 @@ class TestGeofence:
         assert 'too imprecise' in result['message']
 
     def test_a_stale_fix_is_refused(self, appmod, seed, login):
-        self._pin(appmod, seed['course_id'])
+        self._pin(appmod, seed)
         kemi = login(seed['student_email'])
         result = self._scan_at_metres(
             appmod, seed, kemi, 5,
@@ -820,7 +819,7 @@ class TestGeofence:
     def test_no_pin_means_no_geofence(self, appmod, seed, login):
         kemi = login(seed['student_email'])
         response = kemi.post('/mark_attendance',
-                             json={'qr_data': qr_token(appmod, seed['session_id'])})
+                             json=scan_body(appmod, seed['session_id']))
         assert response.get_json()['status'] == 'success'
 
     def test_only_a_course_lecturer_can_pin_the_class(self, appmod, seed, login):
@@ -951,35 +950,35 @@ class TestScanResponseContract:
         kemi = login(seed['student_email'])
         token = qr_token(appmod, seed['session_id'])
 
-        first = kemi.post('/mark_attendance', json={'qr_data': token})
+        first = kemi.post('/mark_attendance', json=scan_body(appmod, token=token))
         assert first.status_code == 200
         assert first.get_json()['status'] == 'success'
 
-        second = kemi.post('/mark_attendance', json={'qr_data': token})
+        second = kemi.post('/mark_attendance', json=scan_body(appmod, token=token))
         assert second.status_code == 409
         assert second.get_json()['status'] == 'error'
 
     def test_an_unenrolled_student_is_a_403(self, appmod, seed, login):
         tayo = login(seed['other_student_email'])
         response = tayo.post('/mark_attendance',
-                             json={'qr_data': qr_token(appmod, seed['session_id'])})
+                             json=scan_body(appmod, seed['session_id']))
         assert response.status_code == 403
 
     def test_an_unknown_session_is_a_404(self, appmod, seed, login):
         kemi = login(seed['student_email'])
         response = kemi.post('/mark_attendance',
-                             json={'qr_data': qr_token(appmod, 999999)})
+                             json=scan_body(appmod, 999999))
         assert response.status_code == 404
 
     def test_a_malformed_or_expired_token_is_a_400(self, appmod, seed, login):
         kemi = login(seed['student_email'])
         assert kemi.post('/mark_attendance',
-                         json={'qr_data': 'garbage'}).status_code == 400
+                         json=scan_body(appmod, token='garbage')).status_code == 400
         assert kemi.post('/mark_attendance', json={}).status_code == 400
         stale = qr_token(appmod, seed['session_id'],
                          age_seconds=appmod.QR_CODE_WINDOW + 5)
         assert kemi.post('/mark_attendance',
-                         json={'qr_data': stale}).status_code == 400
+                         json=scan_body(appmod, token=stale)).status_code == 400
 
     def test_a_queued_scan_cannot_be_replayed_under_another_account(
             self, appmod, seed, login):
@@ -991,10 +990,9 @@ class TestScanResponseContract:
         from models import Attendance
 
         kemi = login(seed['student_email'])
-        response = kemi.post('/mark_attendance', json={
-            'qr_data': qr_token(appmod, seed['session_id']),
-            'user_marker': str(seed['other_student_id']),
-        })
+        response = kemi.post('/mark_attendance', json=scan_body(
+            appmod, seed['session_id'],
+            user_marker=str(seed['other_student_id'])))
         assert response.status_code == 409
         with appmod.app.app_context():
             assert Attendance.query.count() == 0
@@ -1026,7 +1024,7 @@ class TestScanPageShowsRealData:
         """
         kemi = login(seed['student_email'])
         kemi.post('/mark_attendance',
-                  json={'qr_data': qr_token(appmod, seed['session_id'])})
+                  json=scan_body(appmod, seed['session_id']))
 
         page = kemi.get('/scan_page')
         assert page.status_code == 200
@@ -1061,10 +1059,8 @@ class TestGeofenceRequiredMode:
 
         monkeypatch.setattr(appmod, 'GEOFENCE_REQUIRED', True)
         kemi = login(seed['student_email'])
-        response = kemi.post('/mark_attendance', json={
-            'qr_data': qr_token(appmod, seed['session_id']),
-            'lat': 7.227, 'lon': 3.438,
-        })
+        response = kemi.post('/mark_attendance', json=scan_body(
+            appmod, seed['session_id'], lat=7.227, lon=3.438))
         assert response.status_code == 422
         with appmod.app.app_context():
             assert Attendance.query.count() == 0
@@ -1087,7 +1083,7 @@ class TestGeofenceRequiredMode:
         monkeypatch.setattr(appmod, 'GEOFENCE_REQUIRED', False)
         kemi = login(seed['student_email'])
         response = kemi.post('/mark_attendance',
-                             json={'qr_data': qr_token(appmod, seed['session_id'])})
+                             json=scan_body(appmod, seed['session_id']))
         assert response.status_code == 200
 
 
@@ -1113,7 +1109,7 @@ class TestEmailIsSignupOnly:
         sent = self._captured_sends(appmod, monkeypatch)
         kemi = login(seed['student_email'])
         response = kemi.post('/mark_attendance',
-                             json={'qr_data': qr_token(appmod, seed['session_id'])})
+                             json=scan_body(appmod, seed['session_id']))
 
         assert response.status_code == 200
         assert sent == [], f'a scan queued outbound work: {sent}'

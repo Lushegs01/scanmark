@@ -21,7 +21,12 @@ from markupsafe import escape
 from flask_login import LoginManager, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
 from sqlalchemy import event, func, inspect, literal, select
-from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
+from sqlalchemy.exc import (
+    IntegrityError, OperationalError, ProgrammingError,
+    # NOT the builtin of the same name: SQLAlchemy raises its own class when a
+    # request waits out pool_timeout for a connection.
+    TimeoutError as PoolTimeoutError,
+)
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import joinedload
 from sqlalchemy.pool import Pool
@@ -413,6 +418,7 @@ def user_based_rate_limit_key():
 # A copied .env commonly contains REDIS_URL="", which is not a Redis URL.
 redis_url = (os.environ.get('REDIS_URL') or '').strip()
 redis_client = None
+redis_pool = None
 
 # Without Redis the deployment keeps working in a way that looks fine and is
 # not: sessions live in cookies, rate limits count per worker process, and the
@@ -427,7 +433,29 @@ _require_in_production(
 )
 
 if redis_url:
-    redis_client = redis.from_url(redis_url)
+    # An explicit, bounded pool. Left implicit, every gunicorn thread opens
+    # connections on demand with no ceiling and no health checking, so a
+    # burst multiplies connections against the Redis plan at exactly the
+    # moment the class needs them. Sized from the request-slot ceiling
+    # (workers x threads) plus headroom for the background executors.
+    REDIS_MAX_CONNECTIONS = int(os.environ.get(
+        'REDIS_MAX_CONNECTIONS',
+        int(os.environ.get('WEB_CONCURRENCY', 4))
+        * int(os.environ.get('GUNICORN_THREADS', 8)) + 8,
+    ))
+    redis_pool = redis.ConnectionPool.from_url(
+        redis_url,
+        max_connections=REDIS_MAX_CONNECTIONS,
+        # A scan must not sit behind a Redis command that will never answer:
+        # these are well inside the platform router timeout on purpose.
+        socket_connect_timeout=float(os.environ.get('REDIS_CONNECT_TIMEOUT', 2)),
+        socket_timeout=float(os.environ.get('REDIS_SOCKET_TIMEOUT', 2)),
+        socket_keepalive=True,
+        # Recycle a connection that has been idle across a proxy's idle cut.
+        health_check_interval=int(os.environ.get('REDIS_HEALTH_CHECK_INTERVAL', 30)),
+        retry_on_timeout=True,
+    )
+    redis_client = redis.Redis(connection_pool=redis_pool)
 
     # A broken REDIS_URL used to look like a successful boot: nothing touched
     # the connection until the first request needed it.
@@ -442,6 +470,7 @@ if redis_url:
         print(f"⚠️  WARNING: Redis is configured but unreachable ({exc}). "
               "Falling back to cookie sessions.")
         redis_client = None
+        redis_pool = None
         redis_url = ''
 
 if redis_client is not None:
@@ -553,6 +582,18 @@ ATTENDANCE_TARGET_PERCENT = int(os.environ.get('ATTENDANCE_TARGET_PERCENT', 75))
 # one document is what turned a ten-session, 2000-student course into 20,000
 # table rows nobody could open.
 ATTENDANCE_PREVIEW_ROWS = max(1, int(os.environ.get('ATTENDANCE_PREVIEW_ROWS', 25)))
+
+# How long the lecturer's headcount is cached. This is the ONLY thing that
+# bounds how stale the live counter is — nothing invalidates it per scan any
+# more, because doing so put a Redis round trip inside all 2,000 requests to
+# save at most this many seconds on a number that is visibly moving anyway.
+ATTENDEE_SUMMARY_TTL = max(1, int(os.environ.get('ATTENDEE_SUMMARY_TTL', 2)))
+
+# Rows the live projector screen keeps in the DOM. The screen answers "how
+# many are in, and who just scanned"; the full sheet is its own paginated
+# page. Without a bound, a 2,000-student class ends with 2,000 <li> nodes on
+# a laptop that is also driving a projector.
+PROJECTOR_RECENT_ROWS = max(5, int(os.environ.get('PROJECTOR_RECENT_ROWS', 50)))
 
 
 def send_async_email(app_instance, msg):
@@ -845,12 +886,24 @@ _pool_lock = threading.Lock()
 _pool_checked_out = 0
 
 
+@event.listens_for(Pool, 'connect')
+def _pool_connect(_dbapi_connection, _connection_record):
+    runtime_metrics.increment('db.pool.connections_opened')
+
+
 @event.listens_for(Pool, 'checkout')
 def _pool_checkout(_dbapi_connection, _connection_record, _connection_proxy):
+    """
+    Pool DEPTH. How long a request waited for its connection is recorded
+    separately by InstrumentedQueuePool as `db.pool.wait` — depth alone cannot
+    tell "busy and fine" apart from "every request is queueing", which is the
+    difference between raising the worker count and lowering it.
+    """
     global _pool_checked_out
     with _pool_lock:
         _pool_checked_out += 1
-        runtime_metrics.gauge('db.pool.checked_out', _pool_checked_out)
+        depth = _pool_checked_out
+    runtime_metrics.gauge('db.pool.checked_out', depth)
     runtime_metrics.increment('db.pool.checkouts')
 
 
@@ -1095,28 +1148,60 @@ def _redis_timed(operation, function, *args, **kwargs):
         )
         runtime_metrics.increment(f'redis.{operation}')
 
-def set_class_location(course_id, lat, lon):
-    """Store lecturer's class location in Redis (expires after 4 hours)."""
+# A classroom belongs to a MEETING, not to a course. The same course legitimately
+# runs in different rooms on the same day — the lecture in the theatre, the
+# tutorial in a computer lab, the makeup class wherever was free — and a
+# course-scoped pin geofences all of them against whichever room was pinned
+# last. Keyed by session id, it is also self-cleaning: the key dies with the
+# meeting instead of lingering to catch the next one.
+CLASS_LOCATION_TTL = int(os.environ.get('CLASS_LOCATION_TTL', 14400))   # 4 hours
+
+
+def set_class_location(session_id, lat, lon):
+    """Store the lecturer's pinned classroom for ONE class session."""
     if redis_client:
         _redis_timed(
             'setex', redis_client.setex,
-            f"class_location:{course_id}", 14400, f"{lat},{lon}"
+            f"class_location:session:{session_id}", CLASS_LOCATION_TTL,
+            f"{lat},{lon}"
         )
     else:
         # Local-dev fallback: module-level dict (single process only)
-        _local_locations[course_id] = {'lat': lat, 'lon': lon}
+        _local_locations[session_id] = {'lat': lat, 'lon': lon}
 
 
-def get_class_location(course_id):
-    """Retrieve the active class location for a course."""
-    if redis_client:
-        val = _redis_timed('get', redis_client.get, f"class_location:{course_id}")
-        if val:
-            lat_str, lon_str = val.decode().split(',')
-            return {'lat': float(lat_str), 'lon': float(lon_str)}
+def _parse_location(raw):
+    try:
+        lat_str, lon_str = raw.decode().split(',')
+        return {'lat': float(lat_str), 'lon': float(lon_str)}
+    except (AttributeError, UnicodeDecodeError, ValueError):
         return None
-    else:
-        return _local_locations.get(course_id)
+
+
+def get_class_location(session_id, course_id=None):
+    """
+    The pinned classroom for this meeting.
+
+    Falls back to the old course-scoped key so a class already running through
+    a rolling deploy keeps its pin instead of suddenly having none — which,
+    with GEOFENCE_REQUIRED on, would refuse every remaining scan in the room.
+    """
+    if not redis_client:
+        found = _local_locations.get(session_id)
+        if found is None and course_id is not None:
+            found = _local_locations.get(f"course:{course_id}")
+        return found
+
+    value = _redis_timed('get', redis_client.get,
+                         f"class_location:session:{session_id}")
+    if value:
+        return _parse_location(value)
+    if course_id is not None:
+        legacy = _redis_timed('get', redis_client.get,
+                              f"class_location:{course_id}")
+        if legacy:
+            return _parse_location(legacy)
+    return None
 
 
 # Local-dev fallback only (never used when Redis is available)
@@ -1209,6 +1294,12 @@ QR_CODE_WINDOW = int(os.environ.get('QR_CODE_WINDOW', 45))
 # a queued offline scan is still judged on when it was taken rather than on
 # when the phone got signal back.
 QR_CAPTURE_WINDOW = int(os.environ.get('QR_CAPTURE_WINDOW', QR_CODE_WINDOW))
+
+# Whether a scan must say when its camera read the code. On by default: the
+# check is worthless if leaving the field out is how you skip it. The switch
+# exists only for the window in which offline scans queued by a service worker
+# from before this release are still draining.
+REQUIRE_CAPTURED_AT = _env_flag('REQUIRE_CAPTURED_AT', True)
 
 # Max distance (metres) between the lecturer's pinned class location and the
 # scanning student. The old route hard-coded 50 while its message referenced
@@ -1970,6 +2061,21 @@ def internal_metrics():
             return '', 404
     elif is_production_environment():
         return '', 404
+
+    # Redis pool occupancy, sampled at scrape time rather than tracked on
+    # every command. "How many connections are in use, out of how many we
+    # allow" is the number that says whether Redis is the bottleneck.
+    if redis_pool is not None:
+        try:
+            in_use = len(getattr(redis_pool, '_in_use_connections', ()) or ())
+            available = len(getattr(redis_pool, '_available_connections', ()) or ())
+            runtime_metrics.gauge('redis.pool.in_use', in_use)
+            runtime_metrics.gauge('redis.pool.available', available)
+            runtime_metrics.gauge('redis.pool.max',
+                                  getattr(redis_pool, 'max_connections', 0))
+        except Exception:
+            runtime_metrics.increment('redis.pool.stat_errors')
+
     return Response(runtime_metrics.prometheus(), mimetype='text/plain')
 
 
@@ -3577,6 +3683,7 @@ def session_qr(session_id):
     return render_template('generate_qr.html', course=course, session=session_row,
                            qr_token_ttl=QR_TOKEN_TTL,
                            expected_total=expected,
+                           projector_recent_rows=PROJECTOR_RECENT_ROWS,
                            geofence_required=GEOFENCE_REQUIRED)
 
 
@@ -3678,15 +3785,21 @@ def get_session_attendees(session_id):
     batch_size = min(500, max(1, request.args.get('limit', default=250, type=int) or 250))
     cache_key = f"attendees_summary:{session_id}"
     present = enrolled_total = None
+
+    # Redis is an accelerator here, never a dependency. Postgres can answer
+    # both of these; a cache that has gone unhealthy must cost the lecturer
+    # some database load, not the ability to see who is in the room.
     if redis_client:
-        cached = _redis_timed('get', redis_client.get, cache_key)
-        if cached:
-            try:
+        try:
+            cached = _redis_timed('get', redis_client.get, cache_key)
+            if cached:
                 summary = json.loads(cached)
                 present = int(summary['present'])
                 enrolled_total = int(summary['enrolled'])
-            except (TypeError, ValueError, KeyError, json.JSONDecodeError):
-                present = enrolled_total = None
+        except (redis.RedisError, TypeError, ValueError, KeyError,
+                json.JSONDecodeError):
+            runtime_metrics.increment('redis.feed_cache_errors')
+            present = enrolled_total = None
 
     if present is None:
         present = (db.session.query(func.count(Attendance.id))
@@ -3694,10 +3807,14 @@ def get_session_attendees(session_id):
                    .scalar()) or 0
         enrolled_total = _enrolled_count(course.id)
         if redis_client:
-            _redis_timed('setex', redis_client.setex, cache_key, 2, json.dumps({
-                'present': present,
-                'enrolled': enrolled_total,
-            }))
+            try:
+                _redis_timed('setex', redis_client.setex, cache_key,
+                             ATTENDEE_SUMMARY_TTL, json.dumps({
+                                 'present': present,
+                                 'enrolled': enrolled_total,
+                             }))
+            except redis.RedisError:
+                runtime_metrics.increment('redis.feed_cache_errors')
 
     rows = (db.session.query(Attendance.id, Attendance.timestamp, User.full_name,
                              User.matric_no, User.level)
@@ -3744,25 +3861,70 @@ def scan_page():
     return render_template('scan.html', attendance_data=attendance_data)
 
 
-@app.route('/set_location/<int:course_id>', methods=['POST'])
-@login_required
-def set_location(course_id):
-    course = Course.query.get_or_404(course_id)
-    if not _is_course_authorized(course):
-        return jsonify({"status": "error", "message": "Unauthorised"}), 403
-
-    data = request.get_json(silent=True) or {}
+def _read_pin(data):
+    """Validate a posted classroom pin, returning (lat, lon) or an error."""
     try:
         latitude = float(data['lat'])
         longitude = float(data['lon'])
     except (KeyError, TypeError, ValueError):
-        return jsonify({"status": "error", "message": "Valid latitude and longitude are required."}), 400
+        return None, "Valid latitude and longitude are required."
     if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
-        return jsonify({"status": "error", "message": "Latitude or longitude is out of range."}), 400
+        return None, "Latitude or longitude is out of range."
+    return (latitude, longitude), None
 
-    # FIX #4: Persisted in Redis (not a local dict)
-    set_class_location(course_id, latitude, longitude)
-    app.logger.info('Class location set for course %s', course_id)
+
+@app.route('/session/<int:session_id>/set_location', methods=['POST'])
+@login_required
+def set_session_location(session_id):
+    """
+    Pin the room THIS meeting is in.
+
+    The projector page posts here every 30 seconds while the class runs.
+    """
+    session_row = db.get_or_404(ClassSession, session_id)
+    course = db.get_or_404(Course, session_row.course_id)
+    if not _is_course_authorized(course):
+        return jsonify({"status": "error", "message": "Unauthorised"}), 403
+    if not session_row.is_open:
+        return jsonify({"status": "error", "message": "This class has ended."}), 409
+
+    pin, problem = _read_pin(request.get_json(silent=True) or {})
+    if problem:
+        return jsonify({"status": "error", "message": problem}), 400
+
+    set_class_location(session_id, *pin)
+    app.logger.info('Classroom pinned for session %s (course %s)',
+                    session_id, course.id)
+    return jsonify({"status": "ok"})
+
+
+@app.route('/set_location/<int:course_id>', methods=['POST'])
+@login_required
+def set_location(course_id):
+    """
+    Compatibility shim for a projector page cached from a previous release.
+
+    It pins the course's currently-open meeting, because that is what the old
+    course-scoped call actually meant. Without it, a lecturer whose browser is
+    still running yesterday's JavaScript silently pins nothing and — with
+    GEOFENCE_REQUIRED on — every scan in the room is refused.
+    """
+    course = db.get_or_404(Course, course_id)
+    if not _is_course_authorized(course):
+        return jsonify({"status": "error", "message": "Unauthorised"}), 403
+
+    pin, problem = _read_pin(request.get_json(silent=True) or {})
+    if problem:
+        return jsonify({"status": "error", "message": problem}), 400
+
+    session_row = open_session_for(course_id)
+    if session_row is None:
+        return jsonify({"status": "error",
+                        "message": "No class is currently running."}), 409
+
+    set_class_location(session_row.id, *pin)
+    app.logger.info('Classroom pinned for session %s via the legacy '
+                    'course-scoped endpoint', session_row.id)
     return jsonify({"status": "ok"})
 
 
@@ -3880,6 +4042,132 @@ def _insert_attendance_once(student_id, course_id, session_id, device_id, scanne
         return None
 
 
+# ------------------------------------------------------------------
+# BURST ADMISSION CONTROL
+# ------------------------------------------------------------------
+# A lecturer puts the code on the projector and two thousand phones fire at
+# once. Every one of those requests can otherwise walk independently into the
+# database, so the arrival rate — not the sustainable rate — decides how much
+# work Postgres is asked to do in the first second. Past its capacity that
+# does not degrade gently: connections queue, latency crosses the QR window,
+# scans start bouncing as "expired", and the phones retry, which is the burst
+# again but larger.
+#
+# A token bucket per session smooths the microburst down to a rate the
+# database is measured to sustain. It is emphatically NOT a queue: a shed scan
+# is told to retry in well under a second, because attendance is time-sensitive
+# and hiding overload for minutes would be worse than refusing it. The point is
+# to convert a 1,000/sec spike into a steady admitted rate, not to absorb a
+# genuine overload.
+#
+# Set SCAN_ADMISSION_RATE from the staging matrix — the measured safe rate for
+# YOUR database plan. It defaults to 0 (off), because a number invented here
+# would be a guess with the authority of a default.
+SCAN_ADMISSION_RATE = float(os.environ.get('SCAN_ADMISSION_RATE', 0))
+
+# How much instantaneous burst is allowed through untouched before shaping
+# begins. One second's worth by default: a class that arrives inside the
+# sustainable rate never sees this code at all.
+SCAN_ADMISSION_BURST = float(
+    os.environ.get('SCAN_ADMISSION_BURST') or max(SCAN_ADMISSION_RATE, 1)
+)
+
+# What a shed phone is told to wait. Deliberately sub-second.
+SCAN_ADMISSION_RETRY_SECONDS = float(
+    os.environ.get('SCAN_ADMISSION_RETRY_SECONDS', 0.5)
+)
+
+# Atomic token bucket. Lua because the read-modify-write has to be one
+# operation: with 2,000 callers, a GET/SET pair admits far more than the rate.
+_ADMISSION_LUA = """
+local key = KEYS[1]
+local rate = tonumber(ARGV[1])
+local burst = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+local ttl = tonumber(ARGV[4])
+
+local bucket = redis.call('HMGET', key, 'tokens', 'updated')
+local tokens = tonumber(bucket[1])
+local updated = tonumber(bucket[2])
+
+if tokens == nil then
+  tokens = burst
+  updated = now
+end
+
+-- Refill for the time that has passed, capped at the burst size.
+local elapsed = math.max(0, now - updated)
+tokens = math.min(burst, tokens + elapsed * rate)
+
+local admitted = 0
+if tokens >= 1 then
+  tokens = tokens - 1
+  admitted = 1
+end
+
+redis.call('HMSET', key, 'tokens', tokens, 'updated', now)
+redis.call('EXPIRE', key, ttl)
+return admitted
+"""
+
+_admission_script = None
+
+
+def _admission_key(session_id):
+    return f"scanburst:{session_id}"
+
+
+def admit_scan(session_id):
+    """
+    True when this scan may proceed to the database right now.
+
+    Fails OPEN: if Redis is unavailable or the script errors, the scan is
+    admitted. A limiter outage must never become an attendance outage — the
+    worst case without shaping is the behaviour this code was added to
+    improve, not a loss of the register.
+    """
+    if SCAN_ADMISSION_RATE <= 0 or redis_client is None:
+        return True
+
+    global _admission_script
+    try:
+        if _admission_script is None:
+            _admission_script = redis_client.register_script(_ADMISSION_LUA)
+        admitted = _admission_script(
+            keys=[_admission_key(session_id)],
+            args=[SCAN_ADMISSION_RATE, SCAN_ADMISSION_BURST, time.time(),
+                  max(60, int(SCAN_ADMISSION_BURST / max(SCAN_ADMISSION_RATE, 0.001)) + 60)],
+        )
+        return bool(admitted)
+    except redis.RedisError as error:
+        runtime_metrics.increment('scan.admission.errors')
+        app.logger.warning('Scan admission control unavailable, admitting: %s',
+                           error)
+        return True
+
+
+# ------------------------------------------------------------------
+# SCAN RESPONSE BUDGET
+# ------------------------------------------------------------------
+# The contract each stage of a scan is held to, in milliseconds. Breaching one
+# is not an error the student sees — it is a counter that says WHICH part of
+# the system is the problem during a rehearsal, so "the scan got slow" becomes
+# "Postgres insertion is fine, Redis is the problem" without guesswork.
+#
+# Derive these from your own staging run; the defaults are a starting shape
+# sized so the total sits an order of magnitude inside QR_CODE_WINDOW.
+SCAN_STAGE_BUDGET_MS = {
+    'qr_verify': float(os.environ.get('BUDGET_QR_VERIFY_MS', 1)),
+    'session_course': float(os.environ.get('BUDGET_SESSION_COURSE_MS', 10)),
+    'enrollment': float(os.environ.get('BUDGET_ENROLLMENT_MS', 10)),
+    'admission': float(os.environ.get('BUDGET_ADMISSION_MS', 5)),
+    'geofence': float(os.environ.get('BUDGET_GEOFENCE_MS', 5)),
+    'db_insert': float(os.environ.get('BUDGET_DB_INSERT_MS', 20)),
+    'enqueue': float(os.environ.get('BUDGET_ENQUEUE_MS', 5)),
+}
+SCAN_TOTAL_BUDGET_MS = float(os.environ.get('BUDGET_SCAN_TOTAL_MS', 100))
+
+
 # Fraction of SUCCESSFUL scans that get a timing line in the log. Every
 # non-success outcome is always logged. 2% keeps a 2000-scan class to ~40
 # lines instead of 2000 while still giving a latency sample.
@@ -3928,12 +4216,20 @@ def mark_attendance():
         duration_ms = (now - stage_started) * 1000
         stages[name] = duration_ms
         runtime_metrics.observe_ms(f'scan.stage.{name}', duration_ms)
+        # Which stage broke its contract, counted separately from how long it
+        # took. During a rehearsal this is the difference between "scans are
+        # slow" and "db_insert is over budget and nothing else is".
+        budget = SCAN_STAGE_BUDGET_MS.get(name)
+        if budget and duration_ms > budget:
+            runtime_metrics.increment(f'scan.budget_exceeded.{name}')
         stage_started = now
 
-    def respond(status, message, http_status, outcome):
+    def respond(status, message, http_status, outcome, headers=None):
         total_ms = (time.perf_counter() - request_started) * 1000
         runtime_metrics.observe_ms('scan.response', total_ms)
         runtime_metrics.increment(f'scan.outcome.{outcome}')
+        if total_ms > SCAN_TOTAL_BUDGET_MS:
+            runtime_metrics.increment('scan.budget_exceeded.total')
         if status != 'success' or secrets.randbelow(10000) < int(SCAN_LOG_SAMPLE_RATE * 10000):
             app.logger.info('scan_performance %s', json.dumps({
                 'outcome': outcome,
@@ -3950,6 +4246,8 @@ def mark_attendance():
             response.headers['Server-Timing'] = ', '.join(
                 f'{name};dur={value:.2f}' for name, value in stages.items()
             )
+        for header, value in (headers or {}).items():
+            response.headers[header] = value
         return response, http_status
 
     data = request.get_json(silent=True) or {}
@@ -4023,11 +4321,40 @@ def mark_attendance():
                 'not_enrolled',
             )
 
+        # Admission control sits here on purpose: after the cheap rejections
+        # (a forged token, a closed class, a student who is not on the course
+        # should never consume a token) and before anything touches the
+        # database. It shapes the arrival rate into the write path, which is
+        # the only part of this request that Postgres has to absorb.
+        if not admit_scan(target['session_id']):
+            runtime_metrics.increment('scan.admission.shed')
+            return respond(
+                'error',
+                'The class is being marked very quickly right now. '
+                'Your scan was not lost — please try again in a moment.',
+                429,
+                'admission_throttled',
+                headers={'Retry-After': str(max(1, round(SCAN_ADMISSION_RETRY_SECONDS)))},
+            )
+        runtime_metrics.increment('scan.admission.admitted')
+        checkpoint('admission')
+
         # How long ago the CLIENT says it read the code. Checked against the
         # token timestamp rather than the arrival time, so a scan that queued
         # offline is still judged on when the camera actually saw the screen.
         captured_epoch = _parse_client_timestamp(data.get('captured_at'))
-        if captured_epoch is not None:
+        if captured_epoch is None:
+            if REQUIRE_CAPTURED_AT:
+                # A security signal the client omitted is not a signal that
+                # does not apply. Skipping the freshness check whenever
+                # `captured_at` failed to parse made omitting it the way to
+                # avoid it — the same shape of hole `accuracy_m` and
+                # `location_age_ms` had.
+                return respond('error',
+                               'Your device did not report when it read the code. '
+                               'Please reload the scan page and try again.',
+                               400, 'missing_capture_time')
+        else:
             capture_lag = captured_epoch - _token_timestamp
             if capture_lag > QR_CAPTURE_WINDOW or capture_lag < -QR_CAPTURE_WINDOW:
                 return respond('error',
@@ -4035,7 +4362,7 @@ def mark_attendance():
                                'Please scan the current code.',
                                400, 'capture_out_of_window')
 
-        class_loc = get_class_location(target['course_id'])
+        class_loc = get_class_location(target['session_id'], target['course_id'])
         if class_loc:
             try:
                 student_lat = float(data['lat'])
@@ -4134,14 +4461,12 @@ def mark_attendance():
                 'duplicate',
             )
 
-        # Drop the cached headcount so the lecturer's live counter moves with
-        # the name list instead of lagging behind it.
-        if redis_client:
-            try:
-                _redis_timed('delete', redis_client.delete,
-                             f"attendees_summary:{target['session_id']}")
-            except redis.RedisError:
-                runtime_metrics.increment('redis.invalidation_errors')
+        # Deliberately NO cache invalidation here. The lecturer's headcount is
+        # cached for ATTENDEE_SUMMARY_TTL seconds, so it is at most that stale
+        # whether or not each scan deletes the key — and deleting it made every
+        # one of 2,000 scans do a Redis round trip inside the request, to buy
+        # back at most two seconds on a number that is already moving. Redis
+        # accelerates the lecturer's reads; it is not on the write path.
 
         scanned_iso = scanned_at.isoformat() + 'Z'
         if campos_executor.submit(
@@ -4167,6 +4492,21 @@ def mark_attendance():
 
         return respond('success', 'Attendance marked successfully!', 200, 'success')
 
+    except PoolTimeoutError:
+        # Saturation, not a fault. Told apart from a 500 so the scanner backs
+        # off and retries instead of treating it as terminal, and so the
+        # metric that fires points at the database rather than at this code.
+        db.session.rollback()
+        runtime_metrics.increment('db.pool.exhausted')
+        app.logger.error('Scan refused: no database connection available')
+        return respond(
+            'error',
+            'The system is very busy right now. Please try again in a moment '
+            '— your scan was not recorded.',
+            503, 'database_saturated',
+            headers={'Retry-After': str(max(1, int(
+                os.environ.get('DB_SATURATION_RETRY_SECONDS', 2))))},
+        )
     except Exception:
         # Leave no half-finished transaction on this connection for whichever
         # request picks it up next.
@@ -4656,6 +4996,39 @@ def ratelimit_handler(e):
         f"<p>{escape(str(e.description))}</p>"
         f"<p>Please wait a minute and <a href='{url_for('dashboard')}'>try again</a>.</p>",
         status=429, mimetype='text/html'
+    )
+
+
+@app.errorhandler(PoolTimeoutError)
+def database_pool_exhausted(error):
+    """
+    Every database connection is busy and this request waited its full
+    pool_timeout for one.
+
+    That is saturation, not a bug, and the distinction matters to the caller:
+    503 with Retry-After tells the phone scanner to back off and try again,
+    while the 500 it used to get says "this will never work" and is recorded
+    as a server fault in every dashboard. Raising the worker count in response
+    to those 500s makes it worse, by pointing more connections at the same
+    exhausted database.
+    """
+    db.session.rollback()
+    runtime_metrics.increment('db.pool.exhausted')
+    app.logger.error('Database pool exhausted: %s', error)
+    retry_after = str(max(1, int(os.environ.get('DB_SATURATION_RETRY_SECONDS', 2))))
+    if request.is_json or request.path.startswith('/api/'):
+        response = jsonify({
+            'status': 'error',
+            'outcome': 'database_saturated',
+            'message': 'The system is very busy right now. Please try again '
+                       'in a moment — your scan was not recorded.',
+        })
+        response.headers['Retry-After'] = retry_after
+        return response, 503
+    return Response(
+        "<h2>Very busy right now</h2>"
+        "<p>The database is at capacity. Please try again in a moment.</p>",
+        status=503, mimetype='text/html', headers={'Retry-After': retry_after},
     )
 
 

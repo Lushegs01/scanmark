@@ -18,6 +18,103 @@ Windows console failed with `UnicodeEncodeError` before an application route
 could be benchmarked. After the changes, the complete suite terminates normally
 with 72 passing tests in 3.18 seconds.
 
+
+## Capacity hardening and harness rebuild (this change)
+
+### What the previous capacity evidence was worth
+
+The Locust harness sent `lat: null, lon: null` and omitted `accuracy_m`,
+`location_age_ms` and `captured_at`. With the geofence on, those scans are
+refused at the location check — before the database insert, the CampOS
+enqueue and most of the work a real scan does. Any throughput number it
+produced described the rejection path. It has been rebuilt to send the exact
+body a phone sends, and the scenarios now run with CSRF, rate limiting,
+Redis, Postgres, sessions and the geofence all enabled.
+
+### Local harness validation (NOT a capacity claim)
+
+Run on one 4-core container with Postgres 16, Redis 7, gunicorn 4x8 and the
+load generator all competing for the same cores. That makes the
+client-observed latency a measurement of the box, not of ScanMark; it is
+recorded here only to show what the harness now exercises.
+
+Scenario: 2,000 seeded students, one open session, one QR token, spawn rate
+500/sec, geofence required, `captured_at` required, CSRF on, rate limiting on.
+
+| Measure | Result |
+|---|---|
+| Scans issued | 2,000 |
+| Locust failures | 0 |
+| Attendance rows written | 2,000 |
+| Distinct students | 2,000 |
+| Duplicate (student, session) pairs | 0 |
+| Roster entries with no attendance | 0 |
+| Distinct device ids | 2,000 |
+| Token-expiry rejections | 0 |
+| 5xx | 0 |
+| Server-side `scan_response` p50 / p95 / p99 | 31 / 60 / 76 ms |
+| Client-observed p50 / p95 | 3,600 / 6,700 ms |
+
+The gap between 31 ms server-side and 3.6 s client-observed is queueing in
+front of the application on a saturated 4-core box shared with the load
+generator. That the two can be told apart at all is the point of the
+per-stage instrumentation: on staging the same comparison distinguishes "the
+app is slow" from "gunicorn is queueing".
+
+**The staging matrix remains the only capacity authority.** No number above
+should be quoted as user capacity.
+
+One observation worth carrying into staging: on this contended box the stage
+most often over budget was `enqueue` (the hand-off to the bounded CampOS
+executor) at ~8 ms p50 against a 5 ms budget, not `db_insert` at ~10 ms
+against 20 ms. On four shared cores that is as likely to be scheduling
+contention as real work, which is exactly why the budgets are documented as
+requiring calibration from staging rather than accepted from this run.
+
+### Two defects the local run exposed
+
+Both were invisible without actually running it:
+
+1. **The harness under-counted its own load.** With `--processes 3`, each
+   Locust process imported the file fresh and restarted its user counter, so
+   three processes signed in as the same students. The duplicates came back
+   409, which the scenario counts as success — correctly, from a student's
+   point of view — so the run reported 2,000 scans against **667 rows**.
+   Processes now take disjoint interleaved slices of the roster.
+
+2. **The suite could not run against real Redis.** Pinned classrooms, cached
+   headcounts and admission buckets persisted between tests, and because ids
+   repeat, a classroom pinned for "session 1" in one test was still pinned in
+   the next — so tests expecting no geofence silently got one. 12 tests
+   failed the first time the suite met a real Redis. Redis is now flushed
+   between tests exactly as the in-memory fallback is cleared, and the whole
+   suite passes both with and without it.
+
+### Admission control, measured against real Redis
+
+`SCAN_ADMISSION_RATE=50`, `SCAN_ADMISSION_BURST=60`:
+
+| Input | Admitted | Expected |
+|---|---:|---|
+| 500 calls, instantaneous | 62 | 60 burst + ~0.05s refill ~= 63 |
+| 500 calls after 1s idle | 53 | ~50, one second of refill |
+| 10 calls on a different session | 10 | unaffected — buckets are per session |
+| Any call with Redis unreachable | admitted | fails open by design |
+
+The local load generator tops out around 80 scans/sec, well under any
+sensible bucket, so shedding could not be provoked end-to-end on this
+hardware — it is verified directly against Redis and by unit tests instead.
+Set the rate from the staging matrix; it ships at 0 (off).
+
+### Redis is no longer on the write path
+
+A successful scan performed a Redis `DELETE` to invalidate the lecturer's
+cached headcount: 2,000 round trips inside 2,000 requests, to save at most
+`ATTENDEE_SUMMARY_TTL` (2s) on a number that is visibly moving anyway. Removed.
+The TTL alone bounds staleness, and the feed now falls back to Postgres when
+Redis is unhealthy rather than failing.
+
+
 ## 1. Attendance correctness and hot database path (P0/P2)
 
 FILE(S): `app.py`, `models.py`, `test_performance.py`

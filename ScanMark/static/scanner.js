@@ -2,6 +2,36 @@
     'use strict';
 
     const config = window.SCANMARK_SCANNER_CONFIG || {};
+
+    // A stable per-installation identifier, so "this scan came from the same
+    // phone as that one" is answerable. Every scan used to report the literal
+    // string 'browser', which made the column useless for the one thing it is
+    // good for: spotting one device marking six people present.
+    //
+    // NOT a credential. It is client-generated, client-stored and trivially
+    // forged; the server treats it as a diagnostic label and nothing else.
+    // Anything that needs to be true about who scanned comes from the session.
+    const DEVICE_ID_KEY = 'scanmark_device_id';
+
+    function deviceId() {
+        try {
+            let stored = localStorage.getItem(DEVICE_ID_KEY);
+            if (!stored) {
+                stored = (crypto.randomUUID && crypto.randomUUID()) ||
+                    // Older WebViews have getRandomValues without randomUUID.
+                    Array.from(crypto.getRandomValues(new Uint8Array(16)))
+                        .map(b => b.toString(16).padStart(2, '0')).join('');
+                localStorage.setItem(DEVICE_ID_KEY, stored);
+            }
+            return stored;
+        } catch (_) {
+            // Private mode, or storage disabled. Say so rather than inventing
+            // a fresh id per scan, which would look like many devices.
+            return 'unavailable';
+        }
+    }
+
+    const DEVICE_ID = deviceId();
     const analysisCanvas = document.getElementById('processing-canvas');
     const context = analysisCanvas.getContext('2d', { willReadFrequently: true });
     const video = document.getElementById('camera-feed');
@@ -45,6 +75,12 @@
     let cameraStartedAt = 0;
     let cameraReadyMs = 0;
     let qrCapturedAt = 0;
+    // Wall-clock instant the camera actually decoded the code. Distinct from
+    // qrCapturedAt, which is a performance.now() reading used for local
+    // timing: the server needs a real timestamp to compare against the
+    // token's own, and it must be the moment of the READ — not the moment of
+    // the POST, which on a slow GPS fix can be seconds later.
+    let qrCapturedAtEpoch = 0;
     let lastDecodeMs = 0;
     let retryAttempt = 0;
     let rejectionStreak = 0;
@@ -254,6 +290,7 @@
     async function qrDetected(qrData) {
         active = false;
         qrCapturedAt = performance.now();
+        qrCapturedAtEpoch = Date.now();
         scanFrame.classList.add('success');
         status('QR code found', 'success');
         if (navigator.vibrate) navigator.vibrate(120);
@@ -301,9 +338,9 @@
                         lon: position.coords.longitude,
                         accuracy_m: position.coords.accuracy,
                         location_age_ms: Math.max(0, Date.now() - position.timestamp),
-                        captured_at: new Date().toISOString(),
+                        captured_at: new Date(qrCapturedAtEpoch || Date.now()).toISOString(),
                         user_marker: config.userMarker,
-                        device_id: 'browser',
+                        device_id: DEVICE_ID,
                         client_metrics: {
                             camera_ready_ms: cameraReadyMs,
                             qr_decode_ms: lastDecodeMs,
