@@ -1,22 +1,61 @@
 {% extends "base.html" %}
 {% block content %}
 <div class="container mt-4">
-    <h2 class="text-danger">🏛️ Director of Academic Planning</h2>
-    <p class="lead">University Oversight</p>
+    <div class="d-flex flex-column flex-md-row justify-content-between align-items-md-center gap-2 mb-3">
+        <div>
+            <h2 class="text-danger mb-1">🏛️ Director of Academic Planning</h2>
+            <p class="lead mb-0">University Oversight &nbsp;·&nbsp; {{ term_label }}</p>
+        </div>
+        {# The analytics page had no link from anywhere; you had to know the URL. #}
+        <a href="{{ url_for('dap_analytics', academic_year=academic_year, semester=semester) }}"
+            class="btn btn-danger">📊 University Analytics</a>
+    </div>
 
-    <div class="row mb-4">
-        <div class="col-md-6">
-            <div class="card bg-light p-4 text-center">
+    <div class="row mb-4 g-3">
+        <div class="col-md-4">
+            <div class="card bg-light p-4 text-center h-100">
                 <h3>{{ total_students }}</h3>
-                <p>Total Students</p>
+                <p class="mb-0">Total Students</p>
             </div>
         </div>
-        <div class="col-md-6">
-            <div class="card bg-light p-4 text-center">
+        <div class="col-md-4">
+            <div class="card bg-light p-4 text-center h-100">
+                <h3>{{ total_staff }}</h3>
+                <p class="mb-0">Teaching &amp; Supervisory Staff</p>
+            </div>
+        </div>
+        <div class="col-md-4">
+            <div class="card bg-light p-4 text-center h-100">
                 <h3>{{ total_courses }}</h3>
-                <p>Total Courses</p>
+                <p class="mb-0">Courses this term</p>
             </div>
         </div>
     </div>
+
+    {% if terms %}
+    <form method="GET" class="row g-2 align-items-end">
+        <div class="col-auto">
+            <label class="form-label small mb-0">Academic year</label>
+            <select name="academic_year" class="form-select form-select-sm" onchange="this.form.submit()">
+                <option value="all" {{ 'selected' if not academic_year }}>All terms</option>
+                {% for term in terms %}
+                <option value="{{ term.academic_year }}" {{ 'selected' if term.academic_year == academic_year }}>
+                    {{ term.academic_year }}
+                </option>
+                {% endfor %}
+            </select>
+        </div>
+        <div class="col-auto">
+            <label class="form-label small mb-0">Semester</label>
+            <select name="semester" class="form-select form-select-sm" onchange="this.form.submit()">
+                <option value="First" {{ 'selected' if semester == 'First' }}>First</option>
+                <option value="Second" {{ 'selected' if semester == 'Second' }}>Second</option>
+            </select>
+        </div>
+        <div class="col-auto">
+            <noscript><button class="btn btn-sm btn-secondary" type="submit">Apply</button></noscript>
+        </div>
+    </form>
+    {% endif %}
 </div>
 {% endblock %}

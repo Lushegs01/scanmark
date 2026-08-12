@@ -6,11 +6,19 @@
         <div>
             <h2>📋 {{ course.code }} Attendance Records</h2>
             <p class="text-muted mb-0">
-                <strong>{{ sessions_data|length }}</strong> class{{ 'es' if sessions_data|length != 1 }} held
-                &nbsp;·&nbsp; <strong>{{ enrolled_total }}</strong> enrolled
-                {% if sessions_data %}
+                {# classes_held is every session the course has run. This used
+                   to print the number on the CURRENT PAGE, so a semester of
+                   thirty lectures reported "10 classes held" forever. #}
+                <strong>{{ classes_held }}</strong> class{{ 'es' if classes_held != 1 }} held
+                &nbsp;·&nbsp; <strong>{{ enrolled_total }}</strong> enrolled now
+                {% if classes_held %}
                 &nbsp;·&nbsp; avg <strong>{{ avg_present }}</strong> present per class
+                &nbsp;·&nbsp; {{ total_scans }} scan{{ '' if total_scans == 1 else 's' }} recorded
                 {% endif %}
+            </p>
+            <p class="text-muted small mb-0">{{ course.term_label }}
+                {% if course.archived %}<span class="badge bg-secondary">Archived</span>{% endif %}
+                &nbsp;·&nbsp; times shown in {{ local_timezone_name }}
             </p>
         </div>
         <div class="d-flex flex-wrap gap-2">
@@ -21,6 +29,10 @@
                 📥 Semester Register (CSV)
             </a>
             {% endif %}
+            <a href="{{ url_for('course_audit', course_id=course.id) }}" class="btn btn-outline-secondary"
+                title="Who started, ended or deleted what">
+                🧾 Audit Trail
+            </a>
             <button class="btn btn-outline-success" onclick="window.print()">🖨️ Print View</button>
         </div>
     </div>
@@ -44,10 +56,16 @@
                     <div class="d-flex flex-wrap align-items-center gap-2 w-100 me-3">
                         <strong>{{ sess.title }}</strong>
                         <span class="text-muted small">
-                            {{ sess.date_created.strftime('%A, %d %B %Y') if sess.date_created }}
+                            {{ sess.date_created | local_dt('%A, %d %B %Y, %I:%M %p') }}
                         </span>
+                        {% if sess.is_open %}
+                        <span class="badge bg-danger">● Live</span>
+                        {% endif %}
+                        {# Measured against the roster as it stood THAT DAY, not
+                           today's enrolment — which is how a course that lost a
+                           student used to report more than 100% attendance. #}
                         <span class="badge bg-success ms-auto">
-                            {{ item.present }} / {{ enrolled_total }} present
+                            {{ item.present }} / {{ item.expected }} present
                             {% if item.pct is not none %}({{ item.pct }}%){% endif %}
                         </span>
                     </div>
@@ -67,13 +85,17 @@
                             </tr>
                         </thead>
                         <tbody>
+                            {# Only the first `preview_rows` scans are rendered.
+                               A ten-session, 2000-student course is 20,000 rows
+                               in one document otherwise — the full sheet has its
+                               own paginated page below. #}
                             {% for record in item.records %}
                             <tr>
                                 <td>{{ loop.index }}</td>
-                                <td>{{ record.student.full_name if record.student else 'Deleted User' }}</td>
-                                <td>{{ record.student.matric_no if record.student else 'N/A' }}</td>
-                                <td>{{ record.student.level ~ 'L' if record.student and record.student.level else 'N/A' }}</td>
-                                <td>{{ record.timestamp.strftime('%I:%M %p') if record.timestamp }}</td>
+                                <td>{{ record.full_name or 'Deleted User' }}</td>
+                                <td>{{ record.matric_no or 'N/A' }}</td>
+                                <td>{{ record.level ~ 'L' if record.level else 'N/A' }}</td>
+                                <td>{{ record.timestamp | local_time }}</td>
                             </tr>
                             {% else %}
                             <tr>
@@ -84,21 +106,46 @@
                             {% endfor %}
                         </tbody>
                     </table>
-                    {% if can_manage %}
-                    <div class="d-flex justify-content-between align-items-center p-2 border-top">
-                        <a href="{{ url_for('download_csv', course_id=course.id, session_id=sess.id) }}"
-                            class="btn btn-sm btn-outline-primary">
-                            📥 This class only (CSV)
+                    {% if item.truncated %}
+                    <div class="p-2 border-top small text-muted">
+                        Showing the first {{ preview_rows }} of {{ item.present }} scans.
+                        <a href="{{ url_for('session_attendance', session_id=sess.id) }}">
+                            View the full sheet →
                         </a>
+                    </div>
+                    {% endif %}
+                    <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 p-2 border-top">
+                        <div class="d-flex flex-wrap gap-2">
+                            <a href="{{ url_for('session_attendance', session_id=sess.id) }}"
+                                class="btn btn-sm btn-outline-secondary">
+                                📄 Full sheet
+                            </a>
+                            {% if can_manage %}
+                            <a href="{{ url_for('download_csv', course_id=course.id, session_id=sess.id) }}"
+                                class="btn btn-sm btn-outline-primary">
+                                📥 This class only (CSV)
+                            </a>
+                            {% endif %}
+                            {% if can_manage and sess.is_open %}
+                            <form method="POST" action="{{ url_for('end_session', session_id=sess.id) }}" class="m-0">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <button type="submit" class="btn btn-sm btn-warning">🛑 End this class</button>
+                            </form>
+                            {% endif %}
+                        </div>
+                        {# Deleting a session destroys its whole attendance sheet,
+                           so it belongs to the coordinator who owns the course —
+                           not to every invited instructor. #}
+                        {% if can_delete %}
                         <form method="POST" action="{{ url_for('delete_session', session_id=sess.id) }}" class="m-0"
-                            onsubmit="return confirm('Delete “{{ sess.title }}” and its {{ item.present }} record(s)? It will no longer count as a class held.')">
+                            onsubmit="return confirm('Delete “{{ sess.title }}” and its {{ item.present }} record(s)? It will no longer count as a class held. This is recorded in the audit trail.')">
                             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                             <button type="submit" class="btn btn-sm btn-outline-danger" title="Delete this session">
                                 🗑️ Delete session
                             </button>
                         </form>
+                        {% endif %}
                     </div>
-                    {% endif %}
                 </div>
             </div>
         </div>

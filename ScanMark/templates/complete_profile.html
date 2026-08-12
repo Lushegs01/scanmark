@@ -30,19 +30,18 @@
 
                 <div class="mb-3">
                     <label class="form-label fw-bold small text-muted">Matriculation Number</label>
-                    <input type="text" name="matric_no" class="form-control" placeholder="e.g. 2021/0001" required>
+                    <input type="text" name="matric_no" class="form-control" placeholder="e.g. 2021/0001"
+                        pattern="[A-Za-z0-9/\-. ]{4,25}" maxlength="25" required>
+                    <div class="form-text">4-20 letters and digits. Separators such as / - . are ignored.</div>
                 </div>
 
                 <div class="mb-4">
                     <label class="form-label fw-bold small text-muted">Current Level</label>
                     <select name="level" class="form-select" required>
                         <option value="" disabled selected>Select your level</option>
-                        <option value="100">100 Level</option>
-                        <option value="200">200 Level</option>
-                        <option value="300">300 Level</option>
-                        <option value="400">400 Level</option>
-                        <option value="500">500 Level</option>
-                        <option value="600">600 Level</option>
+                        {% for choice in levels %}
+                        <option value="{{ choice }}">{{ choice }} Level</option>
+                        {% endfor %}
                     </select>
                 </div>
 

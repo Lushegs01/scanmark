@@ -77,9 +77,15 @@
                         </button>
                     </li>
                     <li class="nav-item">
-                        <a class="nav-link btn-logout ms-lg-2 d-inline-block" href="/logout">
-                            <i class="fas fa-sign-out-alt me-1"></i>Logout
-                        </a>
+                        {# A POST, so it carries a CSRF token. As a GET, any
+                           page on the internet could sign a student out
+                           mid-lecture with an <img src="/logout">. #}
+                        <form method="POST" action="{{ url_for('logout') }}" class="m-0">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                            <button type="submit" class="nav-link btn-logout ms-lg-2 d-inline-block border-0 bg-transparent">
+                                <i class="fas fa-sign-out-alt me-1"></i>Logout
+                            </button>
+                        </form>
                     </li>
                     {% else %}
                     <li class="nav-item">
@@ -234,10 +240,16 @@
                     await drop(scanData.dedupe_key);
                     if (response.ok && payload.status === 'success') {
                         marked += 1;
-                    } else if (response.status === 409) {
+                    } else if (payload.outcome === 'duplicate') {
                         // Already on the register — the queued copy was a
                         // duplicate, which is a success from where the
                         // student stands.
+                        //
+                        // Matched on the outcome, not on the 409 status: that
+                        // status also covers "the class had ended before this
+                        // reached us" and "that queued scan belongs to another
+                        // account", and reporting either of those as recorded
+                        // tells a student they are present when they are not.
                         marked += 1;
                     } else {
                         lost += 1;

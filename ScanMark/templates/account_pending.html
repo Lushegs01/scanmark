@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container mt-5">
+    <div class="card shadow-sm mx-auto" style="max-width: 640px;">
+        <div class="card-body p-4 text-center">
+            <span style="font-size: 2.5rem;">🪪</span>
+            <h2 class="h4 mt-2">Your account has no dashboard yet</h2>
+            <p class="text-muted">
+                ScanMark does not recognise the role on your account
+                (<code>{{ role }}</code>), so there is nothing here to show you.
+                This is not something you can fix from this page.
+            </p>
+            <p class="text-muted small">
+                Ask academic planning or your department to set your role to
+                Student, Lecturer, Course Coordinator, HOD, Dean or DAP. If you
+                signed in through CampOS, opening ScanMark again from CampOS
+                with the right identity selected will also fix it.
+            </p>
+
+            {# The end of the chain. This page deliberately does not redirect
+               anywhere: an unrecognised role used to be sent to the student
+               dashboard, which bounced to /login, which sent it straight back
+               — a loop with no exit but closing the tab. #}
+            <form method="POST" action="{{ url_for('logout') }}" class="mt-3">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <button type="submit" class="btn btn-secondary">Sign out</button>
+            </form>
+        </div>
+    </div>
+</div>
+{% endblock %}

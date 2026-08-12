@@ -49,12 +49,63 @@ class CamposIntegrationError(ValueError):
     """A safe-to-log CampOS integration failure."""
 
 
-def is_production_environment(env: Mapping[str, str] | None = None) -> bool:
+# Names that positively declare a NON-production deployment. Anything else —
+# including an unrecognised value and a completely undeclared environment —
+# counts as production, because every protection keyed off this decision
+# (secure cookies, HSTS, email confirmation, a real secret key, protected
+# metrics) is one that hurts nobody in development and is load-bearing in
+# production. Guessing wrong in the safe direction costs a developer one
+# environment variable; guessing wrong in the other direction ships the
+# public development secret to real students.
+DEVELOPMENT_ENVIRONMENT_NAMES = frozenset(
+    {"development", "dev", "local", "test", "testing", "ci", "debug"}
+)
+
+# Markers set by the platform itself. They cannot make a deployment
+# non-production — only an explicit declaration does that — but they are what
+# lets a misconfigured deployment be reported precisely.
+PLATFORM_MARKERS = (
+    "RENDER",              # Render
+    "DYNO",                # Heroku
+    "RAILWAY_ENVIRONMENT",  # Railway
+    "FLY_APP_NAME",        # Fly.io
+    "K_SERVICE",           # Google Cloud Run
+    "WEBSITE_SITE_NAME",   # Azure App Service
+    "AWS_EXECUTION_ENV",   # AWS (ECS/Lambda/App Runner)
+    "ECS_CONTAINER_METADATA_URI",
+    "KUBERNETES_SERVICE_HOST",
+    "DOKKU_APP_NAME",
+    "VERCEL",
+)
+
+
+def declared_environment(env: Mapping[str, str] | None = None) -> str:
+    """The environment name this deployment declares, normalised."""
     values = os.environ if env is None else env
     return (
-        values.get("FLASK_ENV", "").strip().lower() == "production"
-        or values.get("RENDER", "").strip().lower() == "true"
+        values.get("SCANMARK_ENV", "").strip().lower()
+        or values.get("FLASK_ENV", "").strip().lower()
     )
+
+
+def detected_platform(env: Mapping[str, str] | None = None) -> str | None:
+    """Name of the hosting platform marker present, if any."""
+    values = os.environ if env is None else env
+    for marker in PLATFORM_MARKERS:
+        if (values.get(marker, "") or "").strip():
+            return marker
+    return None
+
+
+def is_production_environment(env: Mapping[str, str] | None = None) -> bool:
+    """
+    True unless the deployment positively says it is not production.
+
+    The previous rule recognised exactly ``FLASK_ENV=production`` and
+    ``RENDER=true``, so the same image on any other host — or on Render with
+    the variable spelled differently — quietly ran with development defaults.
+    """
+    return declared_environment(env) not in DEVELOPMENT_ENVIRONMENT_NAMES
 
 
 def get_campos_core_url(env: Mapping[str, str] | None = None) -> str:

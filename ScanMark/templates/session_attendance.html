@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container mt-4">
+    <div class="d-flex flex-column flex-md-row justify-content-between align-items-md-center gap-2 mb-3">
+        <div>
+            <h2 class="mb-1">📄 {{ session.title }}</h2>
+            <p class="text-muted mb-0">
+                {{ course.code }} — {{ course.title }}
+                &nbsp;·&nbsp; {{ session.date_created | local_dt('%A, %d %B %Y, %I:%M %p') }}
+                {% if session.ended_at %}
+                &nbsp;·&nbsp; ended {{ session.ended_at | local_time }}
+                {% elif session.is_open %}
+                &nbsp;·&nbsp; <span class="badge bg-danger">● Live</span>
+                {% endif %}
+            </p>
+            <p class="text-muted small mb-0">
+                {{ pagination.total }} present of {{ expected }} on the roster
+                {% if pct is not none %}({{ pct }}%){% endif %}
+                &nbsp;·&nbsp; times in {{ local_timezone_name }}
+            </p>
+        </div>
+        <div class="d-flex flex-wrap gap-2">
+            <a href="{{ url_for('view_attendance', course_id=course.id) }}" class="btn btn-secondary">
+                ← All classes
+            </a>
+            {% if can_manage %}
+            <a href="{{ url_for('download_csv', course_id=course.id, session_id=session.id) }}"
+                class="btn btn-primary">📥 CSV</a>
+            {% endif %}
+        </div>
+    </div>
+
+    <div class="table-responsive">
+        <table class="table table-striped table-hover">
+            <thead class="bg-dark text-white">
+                <tr>
+                    <th>#</th>
+                    <th>Full Name</th>
+                    <th>Matric No</th>
+                    <th>Level</th>
+                    <th>Time Scanned</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for record in records %}
+                <tr>
+                    <td>{{ loop.index + (pagination.page - 1) * pagination.per_page }}</td>
+                    <td>{{ record.full_name or 'Deleted User' }}</td>
+                    <td>{{ record.matric_no or 'N/A' }}</td>
+                    <td>{{ record.level ~ 'L' if record.level else 'N/A' }}</td>
+                    <td>{{ record.timestamp | local_time }}</td>
+                </tr>
+                {% else %}
+                <tr>
+                    <td colspan="5" class="text-center py-4 text-muted">
+                        Nobody scanned for this class.
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
+    {% if pagination.pages > 1 %}
+    <nav aria-label="Attendance pages">
+        <ul class="pagination justify-content-center">
+            <li class="page-item {{ 'disabled' if not pagination.has_prev }}">
+                <a class="page-link" href="{{ url_for('session_attendance', session_id=session.id, page=pagination.prev_num) if pagination.has_prev else '#' }}">Previous</a>
+            </li>
+            <li class="page-item disabled"><span class="page-link">Page {{ pagination.page }} of {{ pagination.pages }}</span></li>
+            <li class="page-item {{ 'disabled' if not pagination.has_next }}">
+                <a class="page-link" href="{{ url_for('session_attendance', session_id=session.id, page=pagination.next_num) if pagination.has_next else '#' }}">Next</a>
+            </li>
+        </ul>
+    </nav>
+    {% endif %}
+</div>
+{% endblock %}

@@ -9,14 +9,21 @@
             <div class="accent-line"></div>
             <h1 class="page-title">My Dashboard</h1>
             <p class="page-subtitle mb-0">Manage your classes &amp; attendance records</p>
+            <p class="page-subtitle mb-0 small">{{ current_term }}</p>
         </div>
-        {% if can_create %}
-        <button class="btn btn-gold d-flex align-items-center gap-2 align-self-start" data-bs-toggle="modal"
-            data-bs-target="#createClassModal">
-            <i class="fas fa-plus"></i>
-            <span>New Class</span>
-        </button>
-        {% endif %}
+        <div class="d-flex align-items-center gap-2 align-self-start">
+            <a class="btn btn-glass btn-sm"
+                href="{{ url_for('lecturer_dashboard', archived=0 if show_archived else 1) }}">
+                {{ 'Hide archived' if show_archived else 'Show archived' }}
+            </a>
+            {% if can_create %}
+            <button class="btn btn-gold d-flex align-items-center gap-2" data-bs-toggle="modal"
+                data-bs-target="#createClassModal">
+                <i class="fas fa-plus"></i>
+                <span>New Class</span>
+            </button>
+            {% endif %}
+        </div>
     </div>
 
     <!-- ===== STATS ROW ===== -->
@@ -32,9 +39,18 @@
         <div class="col-6 col-lg-3">
             <div class="glass-card stat-card h-100">
                 <div class="stat-icon" style="background: rgba(0,90,43,0.12);">👥</div>
-                <div class="stat-number">{{ courses | sum(attribute='instructors') | list | length if false else '—' }}
-                </div>
+                {# Counted in the view. This tile used to render an em dash
+                   through `if false` — a placeholder that shipped as a
+                   statistic. #}
+                <div class="stat-number">{{ instructor_total }}</div>
                 <div class="stat-label">Instructors</div>
+            </div>
+        </div>
+        <div class="col-6 col-lg-3">
+            <div class="glass-card stat-card h-100">
+                <div class="stat-icon" style="background: rgba(220,53,69,0.12);">🔴</div>
+                <div class="stat-number">{{ open_sessions | length }}</div>
+                <div class="stat-label">Classes Running</div>
             </div>
         </div>
     </div>
@@ -59,17 +75,58 @@
                             <i class="fas fa-user-tie me-1"></i>{{ course.instructors.count() }}
                         </span>
                     </div>
-                    <p class="course-title">{{ course.title }}</p>
+                    <p class="course-title mb-1">{{ course.title }}</p>
+                    <p class="section-label mb-2" style="font-size:0.68rem;">
+                        {{ course.term_label }}
+                        {% if course.archived %}<span class="badge bg-secondary ms-1">Archived</span>{% endif %}
+                    </p>
 
-                    <!-- Primary CTA: opens (or resumes) TODAY's class session -->
+                    {# Resume the class that is RUNNING, or open a new one. A
+                       second meeting on the same day — a tutorial, a makeup
+                       class — is a deliberate second button, not a silent
+                       merge into the morning's lecture. #}
+                    {% set live_session = open_sessions.get(course.id) %}
+                    {% if live_session %}
+                    <a href="{{ url_for('session_qr', session_id=live_session) }}"
+                        class="btn btn-danger w-100 d-flex align-items-center justify-content-center gap-2 mb-2">
+                        <i class="fas fa-circle fa-xs"></i>
+                        <span>Resume Live Class</span>
+                    </a>
                     <form action="{{ url_for('start_session', course_id=course.id) }}" method="POST" class="mb-3">
                         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                        <button type="submit"
-                            class="btn btn-success w-100 d-flex align-items-center justify-content-center gap-2">
-                            <i class="fas fa-qrcode"></i>
-                            <span>Start Attendance</span>
-                        </button>
+                        <input type="hidden" name="new_session" value="1">
+                        <div class="input-group input-group-sm">
+                            <select name="kind" class="form-select">
+                                <option>Lecture</option>
+                                <option>Tutorial</option>
+                                <option>Practical</option>
+                                <option>Makeup Class</option>
+                                <option>Test</option>
+                            </select>
+                            <button type="submit" class="btn btn-outline-success"
+                                onclick="return confirm('Start another meeting? The class currently running will be ended.')">
+                                Start another
+                            </button>
+                        </div>
                     </form>
+                    {% elif not course.archived %}
+                    <form action="{{ url_for('start_session', course_id=course.id) }}" method="POST" class="mb-3">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <div class="input-group">
+                            <select name="kind" class="form-select">
+                                <option>Lecture</option>
+                                <option>Tutorial</option>
+                                <option>Practical</option>
+                                <option>Makeup Class</option>
+                                <option>Test</option>
+                            </select>
+                            <button type="submit" class="btn btn-success d-flex align-items-center gap-2">
+                                <i class="fas fa-qrcode"></i>
+                                <span>Start Attendance</span>
+                            </button>
+                        </div>
+                    </form>
+                    {% endif %}
 
                     <!-- Secondary Actions -->
                     <div class="d-flex gap-2 mb-2">
@@ -85,9 +142,21 @@
                             class="btn btn-primary btn-sm flex-fill d-flex align-items-center justify-content-center gap-1">
                             <i class="fas fa-chart-bar fa-xs"></i> Analytics
                         </a>
-                        {% if current_user.role == 'Course Coordinator' %}
+                        {# Role casing: a coordinator created by CampOS is stored
+                           as 'course coordinator', by signup as 'Course
+                           Coordinator'. An exact-string test hid these controls
+                           from half the coordinators who own the course. #}
+                        {% if is_coordinator %}
+                        <form method="POST" action="{{ url_for('archive_course', course_id=course.id) }}" class="m-0">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                            {% if course.archived %}<input type="hidden" name="unarchive" value="1">{% endif %}
+                            <button type="submit" class="btn btn-outline-secondary btn-sm"
+                                title="{{ 'Restore this course' if course.archived else 'Archive this finished term' }}">
+                                <i class="fas fa-box-archive fa-xs"></i>
+                            </button>
+                        </form>
                         <form method="POST" action="/delete_course/{{ course.id }}"
-                            onsubmit="return confirm('Delete {{ course.code }}? This cannot be undone.')" class="m-0">
+                            onsubmit="return confirm('Delete {{ course.code }} and every attendance record in it? This cannot be undone. Archive it instead if the term has simply ended.')" class="m-0">
                             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                             <button type="submit" class="btn btn-outline-danger btn-sm" title="Delete course">
                                 <i class="fas fa-trash fa-xs"></i>
@@ -97,7 +166,7 @@
                     </div>
 
                     <!-- Invite Instructor (Coordinator only) -->
-                    {% if current_user.role == 'Course Coordinator' %}
+                    {% if is_coordinator %}
                     <div class="mt-auto pt-2" style="border-top: 1px solid var(--divider);">
                         <form action="{{ url_for('add_instructor') }}" method="POST">
                             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -158,6 +227,27 @@
                         <label class="form-label">Course Title</label>
                         <input type="text" name="title" class="form-control"
                             placeholder="e.g. Introduction to Computer Science" required>
+                    </div>
+                    {# A course belongs to a term. The same code runs again next
+                       year, and without a term it either collides with this
+                       year's or inherits its class sessions. #}
+                    <div class="row g-2">
+                        <div class="col-6">
+                            <label class="form-label">Academic Year</label>
+                            <input type="text" name="academic_year" class="form-control"
+                                value="{{ current_term.split(' ')[0] }}" placeholder="2025/2026">
+                        </div>
+                        <div class="col-6">
+                            <label class="form-label">Semester</label>
+                            <select name="semester" class="form-select">
+                                <option value="First" {{ 'selected' if 'First' in current_term }}>First</option>
+                                <option value="Second" {{ 'selected' if 'Second' in current_term }}>Second</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div>
+                        <label class="form-label">Section <span class="text-muted small">(optional)</span></label>
+                        <input type="text" name="section" class="form-control" placeholder="e.g. A">
                     </div>
                 </div>
                 <div class="modal-footer">

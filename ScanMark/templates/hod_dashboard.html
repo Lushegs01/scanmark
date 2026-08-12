@@ -1,33 +1,103 @@
 {% extends "base.html" %}
 {% block content %}
 <div class="container mt-4">
-    <h2 class="text-primary">👨‍💼 HOD Dashboard</h2>
-    <div class="alert alert-info">Managing Department: <strong>{{ dept }}</strong></div>
+    <div class="d-flex flex-column flex-md-row justify-content-between align-items-md-center gap-2 mb-3">
+        <div>
+            <h2 class="text-primary mb-1">👨‍💼 HOD Dashboard</h2>
+            <p class="text-muted mb-0">
+                {% if dept %}Managing Department: <strong>{{ dept }}</strong>{% else %}
+                <span class="text-danger">No department assigned</span>{% endif %}
+                &nbsp;·&nbsp; {{ term_label }}
+            </p>
+        </div>
+        {# Every analytics surface used to be reachable only by typing its URL. #}
+        <div class="d-flex flex-wrap gap-2">
+            <a href="{{ url_for('hod_analytics', academic_year=academic_year, semester=semester) }}"
+                class="btn btn-primary">📊 Department Analytics</a>
+        </div>
+    </div>
+
+    {% if not dept %}
+    <div class="alert alert-warning">
+        Your account is not linked to a department, so no courses are listed.
+        An HOD with no department presides over nothing — this page used to show
+        every unclassified course in the institution instead.
+    </div>
+    {% endif %}
+
+    {% if terms %}
+    <form method="GET" class="row g-2 align-items-end mb-3">
+        <div class="col-auto">
+            <label class="form-label small mb-0">Term</label>
+            <select name="academic_year" class="form-select form-select-sm"
+                onchange="this.form.submit()">
+                <option value="all" {{ 'selected' if not academic_year }}>All terms</option>
+                {% for term in terms %}
+                <option value="{{ term.academic_year }}"
+                    data-semester="{{ term.semester }}"
+                    {{ 'selected' if term.academic_year == academic_year }}>
+                    {{ term.academic_year }}
+                </option>
+                {% endfor %}
+            </select>
+        </div>
+        <div class="col-auto">
+            <label class="form-label small mb-0">Semester</label>
+            <select name="semester" class="form-select form-select-sm" onchange="this.form.submit()">
+                <option value="First" {{ 'selected' if semester == 'First' }}>First</option>
+                <option value="Second" {{ 'selected' if semester == 'Second' }}>Second</option>
+            </select>
+        </div>
+        <div class="col-auto">
+            <noscript><button class="btn btn-sm btn-secondary" type="submit">Apply</button></noscript>
+        </div>
+    </form>
+    {% endif %}
 
     <h4>Departmental Courses</h4>
-    <table class="table table-striped">
-        <thead>
-            <tr>
-                <th>Code</th>
-                <th>Title</th>
-                <th>Actions</th>
-            </tr>
-        </thead>
-        <tbody>
-            {% for course in courses %}
-            <tr>
-                <td>{{ course.code }}</td>
-                <td>{{ course.title }}</td>
-                <td><a href="#" class="btn btn-sm btn-outline-primary">Audit Attendance</a></td>
-            </tr>
-            {% endfor %}
-        </tbody>
-    </table>
-    {% if pagination.pages > 1 %}
+    <div class="table-responsive">
+        <table class="table table-striped align-middle">
+            <thead>
+                <tr>
+                    <th>Code</th>
+                    <th>Title</th>
+                    <th>Term</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for course in courses %}
+                <tr>
+                    <td>{{ course.code }}</td>
+                    <td>{{ course.title }}</td>
+                    <td class="small text-muted">{{ course.term_label }}</td>
+                    <td class="d-flex flex-wrap gap-1">
+                        {# These were href="#" and did nothing at all. #}
+                        <a href="{{ url_for('view_attendance', course_id=course.id) }}"
+                            class="btn btn-sm btn-outline-primary">Audit Attendance</a>
+                        <a href="{{ url_for('course_analytics', course_id=course.id) }}"
+                            class="btn btn-sm btn-outline-secondary">Analytics</a>
+                        <a href="{{ url_for('download_csv', course_id=course.id) }}"
+                            class="btn btn-sm btn-outline-success">CSV</a>
+                        <a href="{{ url_for('course_audit', course_id=course.id) }}"
+                            class="btn btn-sm btn-outline-dark">Trail</a>
+                    </td>
+                </tr>
+                {% else %}
+                <tr>
+                    <td colspan="4" class="text-center text-muted py-4">
+                        No courses for this department in {{ term_label }}.
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% if pagination and pagination.pages > 1 %}
     <nav aria-label="Course pages"><ul class="pagination justify-content-center">
-        <li class="page-item {{ 'disabled' if not pagination.has_prev }}"><a class="page-link" href="{{ url_for('hod_dashboard', page=pagination.prev_num) if pagination.has_prev else '#' }}">Previous</a></li>
+        <li class="page-item {{ 'disabled' if not pagination.has_prev }}"><a class="page-link" href="{{ url_for('hod_dashboard', page=pagination.prev_num, academic_year=academic_year, semester=semester) if pagination.has_prev else '#' }}">Previous</a></li>
         <li class="page-item disabled"><span class="page-link">Page {{ pagination.page }} of {{ pagination.pages }}</span></li>
-        <li class="page-item {{ 'disabled' if not pagination.has_next }}"><a class="page-link" href="{{ url_for('hod_dashboard', page=pagination.next_num) if pagination.has_next else '#' }}">Next</a></li>
+        <li class="page-item {{ 'disabled' if not pagination.has_next }}"><a class="page-link" href="{{ url_for('hod_dashboard', page=pagination.next_num, academic_year=academic_year, semester=semester) if pagination.has_next else '#' }}">Next</a></li>
     </ul></nav>
     {% endif %}
 </div>

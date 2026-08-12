@@ -117,10 +117,16 @@
 
 <script id="chart-dates" type="application/json">{{ dates | tojson | safe }}</script>
 <script id="chart-counts" type="application/json">{{ counts | tojson | safe }}</script>
+<script id="chart-rates" type="application/json">{{ percentages | tojson | safe }}</script>
+<script id="chart-titles" type="application/json">{{ titles | tojson | safe }}</script>
 
 <script>
     const chartLabels = JSON.parse(document.getElementById('chart-dates').textContent || '[]');
     const chartData   = JSON.parse(document.getElementById('chart-counts').textContent || '[]');
+    // Measured against each meeting's own roster snapshot, so the rate means
+    // the same thing before and after the roster changed.
+    const chartRates  = JSON.parse(document.getElementById('chart-rates').textContent || '[]');
+    const chartTitles = JSON.parse(document.getElementById('chart-titles').textContent || '[]');
 
     if (chartLabels.length > 0) {
         // Quick Stats
@@ -170,7 +176,14 @@
                         bodyFont:  { size: 13, family: 'Poppins', weight: 'bold' },
                         padding: 12,
                         cornerRadius: 10,
-                        displayColors: false
+                        displayColors: false,
+                        callbacks: {
+                            title: items => chartTitles[items[0].dataIndex] || items[0].label,
+                            label: item => `${item.parsed.y} present` +
+                                (chartRates[item.dataIndex] !== undefined
+                                    ? ` (${chartRates[item.dataIndex]}% of that day's roster)`
+                                    : '')
+                        }
                     }
                 },
                 scales: {
