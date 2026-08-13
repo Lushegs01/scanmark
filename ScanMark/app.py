@@ -308,8 +308,47 @@ csrf = CSRFProtect(app)
 # WhiteNoise serves /static at the WSGI layer (before Flask routing) with
 # Cache-Control headers and pre-compressed gzip/brotli variants, so a class
 # of phones pulling CSS/logo doesn't occupy Flask request handlers.
-# Filenames aren't content-hashed, so keep max-age moderate (1 day default).
 _static_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
+
+
+def _compute_asset_version():
+    """
+    A short hash of everything under static/, recomputed at boot.
+
+    Filenames are not content-hashed, so a deploy that changes style.css
+    leaves every returning browser — and every installed service worker —
+    holding the previous copy at the same URL. That shipped: the signup page
+    went out with new markup and the old stylesheet, so the redesigned rows
+    rendered as bare list bullets. Templates hang this hash off the URL as
+    ?v=, which makes a changed asset a different URL and retires the old one
+    everywhere at once.
+    """
+    digest = hashlib.md5(usedforsecurity=False)
+    for directory, _subdirs, filenames in sorted(os.walk(_static_root)):
+        for filename in sorted(filenames):
+            if filename.endswith(('.gz', '.br')):
+                continue        # generated below from these same bytes
+            path = os.path.join(directory, filename)
+            try:
+                with open(path, 'rb') as handle:
+                    digest.update(os.path.relpath(path, _static_root).encode())
+                    digest.update(handle.read())
+            except OSError:
+                continue
+    return digest.hexdigest()[:12]
+
+
+#: Bumped implicitly by any change to a static file. Never edit by hand.
+ASSET_VERSION = _compute_asset_version()
+
+
+@app.context_processor
+def inject_static_url():
+    """`static_url('style.css')` -> '/static/style.css?v=<hash>'."""
+    def static_url(filename):
+        return f"{url_for('static', filename=filename)}?v={ASSET_VERSION}"
+    return {'static_url': static_url, 'asset_version': ASSET_VERSION}
+
 
 # Generate .gz/.br siblings at boot so WhiteNoise can serve them (it only
 # serves compressed variants that already exist on disk). Best-effort: on a
@@ -1538,6 +1577,11 @@ def serve_sw():
     otherwise it promises to retry scans the server will certainly refuse —
     which is what used to happen: it held them for five minutes against a
     45-second window and then deleted them without telling anyone.
+
+    The asset hash goes in the same way, and it is what makes this file
+    byte-different after a deploy that touched static/. That difference is
+    what makes the browser install the new worker, which names its cache
+    after the hash and drops the previous one.
     """
     worker_path = os.path.join(_static_root, 'service-worker.js')
     try:
@@ -1546,7 +1590,8 @@ def serve_sw():
     except OSError:
         app.logger.exception('Could not read the service worker')
         return '', 404
-    prelude = f'self.SCANMARK_QR_WINDOW_SECONDS = {QR_CODE_WINDOW};\n'
+    prelude = (f'self.SCANMARK_QR_WINDOW_SECONDS = {QR_CODE_WINDOW};\n'
+               f'self.SCANMARK_ASSET_VERSION = "{ASSET_VERSION}";\n')
     return Response(
         prelude + body,
         mimetype='application/javascript',

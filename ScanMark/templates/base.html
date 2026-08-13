@@ -13,7 +13,7 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="apple-mobile-web-app-title" content="ScanMark" />
 
-    <link rel="icon" type="image/png" href="{{ url_for('static', filename='logo-192.png') }}">
+    <link rel="icon" type="image/png" href="{{ static_url('logo-192.png') }}">
     <!-- CSRF token for background fetches (offline scan sync) -->
     <meta name="csrf-token" content="{{ csrf_token() }}">
     <meta name="current-user-id" content="{{ current_user.id if current_user.is_authenticated else '' }}">
@@ -24,8 +24,9 @@
     <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
     <!-- Font Awesome -->
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <!-- ScanMark Styles -->
-    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <!-- ScanMark Styles. ?v= is the static-file hash: without it a deploy
+         leaves browsers and service workers on the previous stylesheet. -->
+    <link rel="stylesheet" href="{{ static_url('style.css') }}">
     {% block head_extra %}{% endblock %}
 
     <!-- Apply saved theme immediately (no flash) -->

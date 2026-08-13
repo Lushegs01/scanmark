@@ -432,7 +432,7 @@
 </style>
 
 <!-- Pinned, self-hosted fallback; BarcodeDetector is preferred when available. -->
-<script src="{{ url_for('static', filename='vendor/jsQR.min.js') }}"></script>
+<script src="{{ static_url('vendor/jsQR.min.js') }}"></script>
 
 <script>
     window.SCANMARK_SCANNER_CONFIG = {
@@ -441,5 +441,5 @@
         endpoint: "{{ url_for('mark_attendance') }}"
     };
 </script>
-<script src="{{ url_for('static', filename='scanner.js') }}"></script>
+<script src="{{ static_url('scanner.js') }}"></script>
 {% endblock %}

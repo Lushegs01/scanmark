@@ -1,4 +1,10 @@
-const CACHE_NAME = 'scanmark-cache-v3';
+// Injected by the /service-worker.js route from the server's hash of
+// everything in static/. Naming the cache after it means a deploy that
+// changes an asset lands in a NEW cache and deletes the old one on
+// activate — the hand-edited 'v3' before this could not do that, so a
+// stylesheet cached under it outlived every deploy that followed.
+const ASSET_VERSION = self.SCANMARK_ASSET_VERSION || 'dev';
+const CACHE_NAME = `scanmark-cache-${ASSET_VERSION}`;
 const STATIC_ASSETS = [
     '/static/style.css',
     '/static/logo.png',
@@ -8,9 +14,16 @@ const STATIC_ASSETS = [
     '/static/vendor/jsQR.min.js'
 ];
 
+const versioned = path => `${path}?v=${ASSET_VERSION}`;
+
 self.addEventListener('install', event => {
     self.skipWaiting();
-    event.waitUntil(caches.open(CACHE_NAME).then(cache => cache.addAll(STATIC_ASSETS)));
+    // Fetched at the versioned URL, so the browser's own HTTP cache cannot
+    // hand the install a copy from the previous deploy. Both spellings are
+    // stored: pages ask for the versioned one, while the manifest and the
+    // icons it names ask for the bare path.
+    event.waitUntil(caches.open(CACHE_NAME).then(cache => cache.addAll(
+        STATIC_ASSETS.map(versioned).concat(STATIC_ASSETS))));
 });
 
 self.addEventListener('activate', event => {
@@ -28,9 +41,37 @@ self.addEventListener('fetch', event => {
         return;
     }
     if (event.request.method === 'GET' && STATIC_ASSETS.includes(url.pathname)) {
-        event.respondWith(caches.match(event.request).then(cached => cached || fetch(event.request)));
+        event.respondWith(staleWhileRevalidate(event));
     }
 });
+
+/**
+ * Answer from the cache so a scan still works underground, but always
+ * refetch in the background, so the worst a changed asset can cost is one
+ * page load rather than living in the cache until someone edits this file.
+ *
+ * The match is deliberately exact — NOT ignoreSearch. During a deploy the
+ * outgoing worker is still the one answering, and with ignoreSearch its
+ * previous-version entry happily answers a request for the new ?v=, which
+ * is the whole bug: the page asks for the new stylesheet and is handed the
+ * old one. An exact match misses, so the request reaches the network.
+ */
+function staleWhileRevalidate(event) {
+    const request = event.request;
+    return caches.open(CACHE_NAME).then(cache =>
+        cache.match(request).then(cached => {
+            const network = fetch(request).then(response => {
+                if (response && response.ok) cache.put(request, response.clone());
+                return response;
+            });
+            if (cached) {
+                event.waitUntil(network.catch(() => {}));
+                return cached;
+            }
+            return network.catch(() => cached);
+        })
+    );
+}
 
 // The server refuses a scanned token older than this, checked when the
 // request is PROCESSED. Injected by the /service-worker.js route from the
