@@ -9,7 +9,30 @@ Capacity is accepted only from the staging matrix below.
 |---|---|
 | **PostgreSQL** (`DATABASE_URL`) | SQLite is single-writer and sits on ephemeral disk on Heroku/Render — concurrent scans lock up and **attendance data is wiped on every restart**. Production **refuses to boot** without it (override: `ALLOW_SQLITE_IN_PRODUCTION=true`). |
 | **Redis** (`REDIS_URL`) | Sessions, rate limits, class locations, QR token + attendee-feed + QR-image caches. Production **refuses to boot** without it, and pings it at startup so a broken URL fails immediately rather than on the first request (override: `ALLOW_MISSING_REDIS=true`). Without Redis the pinned classroom lives in one worker's memory, so a scan is geofenced only if it happens to land on the same worker. Provision enough memory and prefer eviction policy `volatile-lru` (or `noeviction`) — arbitrary eviction of session keys logs people out mid-class. |
-| **SMTP** (`MAIL_*`) | Signup confirmation links and password resets. That is all ScanMark sends — nothing goes out during a class, so provider quotas are no longer a capacity concern. |
+| **SMTP** (`MAIL_*`) | Signup confirmation links and password resets. That is all ScanMark sends — nothing goes out during a class, so provider quotas are no longer a capacity concern. Verify the settings with `python mail_selftest.py` (below) rather than by signing up and waiting. |
+
+### When mail does not arrive
+
+Configured is not the same as working, and a send fails in the background
+where nobody sees it. Two things tell you which:
+
+1. **`python mail_selftest.py`** — reads the same `MAIL_*` variables the app
+   reads, through the same resolver, then connects, negotiates TLS, logs in,
+   and (given an address) sends one real message. It names the cause instead
+   of the symptom. Run it wherever the app runs; running it from a laptop as
+   well is worth doing, because "works here, not there" means the network is
+   blocking SMTP, not that the credentials are wrong.
+2. **The logs.** Every failed send is now an `ERROR` line — `Email NOT sent
+   (...)` — carrying the reason and the effective config, and the boot line
+   `Mail configured: {...}` states the settings the process actually resolved.
+
+The three causes that account for almost all of it:
+
+| What you see | Cause |
+|---|---|
+| `authentication rejected (535)` | Gmail needs a 16-character **App Password** from an account with 2-Step Verification on; the account password has not worked since 2022. |
+| `could not reach ...:587 within 15s` | Something between the app and the server drops outbound SMTP — many hosting plans do. Try 465, or send through an HTTP email API instead. |
+| `sender ... refused` | `MAIL_DEFAULT_SENDER` must normally be the mailbox `MAIL_USERNAME` authenticates as. |
 
 ## Environment variables
 
@@ -47,6 +70,9 @@ Capacity is accepted only from the staging matrix below.
 | `CAMPOS_SSO_REQUIRE_STATE` | true | CampOS callbacks must carry a `state` value this browser was issued (set by `/sso/start`), so a hand-off code cannot be fed to somebody else's browser to sign it into the attacker's account. Turn off only for a CampOS that predates state support. |
 | `REQUIRE_EMAIL_VERIFICATION` | on in production | Self-service **student** signups must click an emailed link before their password works. Lecturers and Course Coordinators are not gated — their account works as soon as it is created (they are still sent the link, but nothing waits on it), because a `@staff` signup is a handful of people known to their department who are needed in front of a class today, while a class is hundreds of self-registered strangers. **Do not turn this off in production** — the link is what stops one of those strangers registering in another student's name. CampOS SSO and Google sign-ins are pre-verified and unaffected. |
 | `MIN_PASSWORD_LENGTH` | 10 | Enforced identically at signup and at password reset. |
+| `MAIL_PORT` | 587 | 587 negotiates STARTTLS, 465 is implicit SSL. The TLS mode follows the port, so 465 no longer opens a plaintext socket and then asks a server that only speaks TLS for STARTTLS. `MAIL_USE_TLS` / `MAIL_USE_SSL` override it. |
+| `MAIL_TIMEOUT` | 15 | Seconds to wait on the mail server. Flask-Mail passes no timeout to smtplib, so without this a host that filters outbound SMTP parks a worker thread on connect indefinitely; four of those and every later message queues and then drops, with nothing in the log because nothing ever failed. |
+| `LOG_LEVEL` | INFO | Level for the app logger. Flask inherits WARNING from the root logger unless something sets it, which silenced the audit trail, the sampled scan telemetry, and every "email sent" line. |
 | `ANON_RATE_LIMIT_PER_MINUTE` / `ANON_RATE_LIMIT_PER_DAY` | 20000 / 500000 | Default budget for *anonymous* requests, which are keyed by IP — one campus NAT is a single key for thousands of phones. Sensitive unauthenticated endpoints carry their own tight per-address limits on top of this. |
 | `BACKGROUND_QUEUE_MAXSIZE` / `BACKGROUND_WORKERS` | 500 / 4 | Sizes the account-email pool (signup links, password resets). `ACCOUNT_EMAIL_WORKERS` overrides the worker count. Nothing is queued during a class, so this pool is idle under scan load. |
 | `ATTENDANCE_TARGET_PERCENT` | 75 | Percentage shown as the target on student dashboards. Display only — nothing is sent when a student falls below it. |

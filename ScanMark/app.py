@@ -5,6 +5,7 @@ import hmac
 import hashlib
 import json
 import secrets
+import smtplib
 import sys
 import threading
 import tempfile
@@ -33,7 +34,7 @@ from sqlalchemy.pool import Pool
 import redis
 from flask_session import Session
 from itsdangerous import URLSafeTimedSerializer
-from flask_mail import Mail, Message
+from flask_mail import Connection as FlaskMailConnection, Mail, Message
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from flask_wtf.csrf import CSRFProtect
@@ -63,6 +64,7 @@ from models import (
     db, User, Course, Attendance, AuditLog, ClassSession, SessionRoster,
     course_instructors, enrollments,
 )
+from mailconfig import resolve_mail_settings
 from performance import BoundedExecutor, InstrumentedQueuePool, runtime_metrics
 from campos_integration import (
     CamposIntegrationError,
@@ -163,6 +165,19 @@ if sentry_dsn:
 # ============================================================
 
 app = Flask(__name__)
+
+# Flask's logger inherits the root level — WARNING — unless something sets it,
+# and nothing did. Every app.logger.info() in this file has therefore been
+# invisible in production: the audit trail, the scan telemetry, and (the way
+# this was noticed) every "email sent" line, so a mail problem showed up as
+# silence rather than as a log. Scan logging is already sampled by
+# SCAN_LOG_SAMPLE_RATE, so INFO is the level this code was written for.
+_log_level = (os.environ.get('LOG_LEVEL') or 'INFO').strip().upper()
+try:
+    app.logger.setLevel(_log_level)
+except ValueError:
+    app.logger.setLevel('INFO')
+    app.logger.warning('Ignoring unrecognised LOG_LEVEL %r', _log_level)
 
 print(f"🌍 Environment: {DECLARED_ENVIRONMENT} "
       f"({'PRODUCTION' if IS_PRODUCTION else 'development'})"
@@ -562,13 +577,66 @@ print(f"🛡️ Rate Limiter Active (Storage: {limiter_storage.split(':')[0]})")
 # FLASK-MAIL CONFIGURATION
 # ============================================================
 
-app.config['MAIL_SERVER'] = os.environ.get('MAIL_SERVER', 'smtp.gmail.com')
-app.config['MAIL_PORT'] = int(os.environ.get('MAIL_PORT', 587))
-app.config['MAIL_USE_TLS'] = True
-app.config['MAIL_USERNAME'] = os.environ.get('MAIL_USERNAME')
-app.config['MAIL_PASSWORD'] = os.environ.get('MAIL_PASSWORD')
-app.config['MAIL_DEFAULT_SENDER'] = os.environ.get('MAIL_DEFAULT_SENDER', os.environ.get('MAIL_USERNAME'))
-mail = Mail(app)
+MAIL_SETTINGS = resolve_mail_settings()
+
+app.config['MAIL_SERVER'] = MAIL_SETTINGS.server
+app.config['MAIL_PORT'] = MAIL_SETTINGS.port
+app.config['MAIL_USE_SSL'] = MAIL_SETTINGS.use_ssl
+app.config['MAIL_USE_TLS'] = MAIL_SETTINGS.use_tls
+app.config['MAIL_USERNAME'] = MAIL_SETTINGS.username
+app.config['MAIL_PASSWORD'] = MAIL_SETTINGS.password
+app.config['MAIL_DEFAULT_SENDER'] = MAIL_SETTINGS.sender
+
+# Seconds to wait on the mail server. Flask-Mail passes no timeout to smtplib,
+# so the default is "block forever": a host that filters outbound SMTP (many
+# PaaS plans do) parks a worker thread on connect and never returns. Four of
+# those and the pool is gone — every later message queues, then drops, and the
+# log never shows a single failure because nothing ever fails.
+MAIL_TIMEOUT = MAIL_SETTINGS.timeout
+
+
+class _TimeoutConnection(FlaskMailConnection):
+    """Flask-Mail's connection, with a timeout on the socket."""
+
+    def configure_host(self):
+        if self.mail.use_ssl:
+            host = smtplib.SMTP_SSL(self.mail.server, self.mail.port,
+                                    timeout=MAIL_TIMEOUT)
+        else:
+            host = smtplib.SMTP(self.mail.server, self.mail.port,
+                                timeout=MAIL_TIMEOUT)
+        host.set_debuglevel(int(self.mail.debug))
+        if self.mail.use_tls:
+            host.starttls()
+        if self.mail.username and self.mail.password:
+            host.login(self.mail.username, self.mail.password)
+        return host
+
+
+class TimeoutMail(Mail):
+    def connect(self):
+        return _TimeoutConnection(app.extensions['mail'])
+
+
+mail = TimeoutMail(app)
+
+
+def mail_config_summary():
+    """The effective mail settings, with nothing secret in them."""
+    return MAIL_SETTINGS.summary
+
+
+# Logged at import, not under __main__: under gunicorn the __main__ banner
+# never prints, which is exactly where this needed to be readable.
+app.logger.info('Mail configured: %s', mail_config_summary())
+if not MAIL_SETTINGS.is_configured:
+    app.logger.warning(
+        'Mail is not fully configured (%s) — signup confirmation and '
+        'password-reset mail cannot be sent.', mail_config_summary())
+if MAIL_SETTINGS.password_had_spaces:
+    app.logger.warning(
+        'MAIL_PASSWORD contained spaces; they were stripped. A Gmail App '
+        'Password is 16 characters — the spaces are display only.')
 
 
 # ============================================================
@@ -635,6 +703,31 @@ ATTENDEE_SUMMARY_TTL = max(1, int(os.environ.get('ATTENDEE_SUMMARY_TTL', 2)))
 PROJECTOR_RECENT_ROWS = max(5, int(os.environ.get('PROJECTOR_RECENT_ROWS', 50)))
 
 
+#: Why the last send failed, for the readiness report. No addresses in it.
+last_mail_failure = {'at': None, 'error': None}
+
+
+def _describe_smtp_error(exc):
+    """Turn an smtplib exception into the one line that identifies the cause."""
+    if isinstance(exc, smtplib.SMTPAuthenticationError):
+        return (f'authentication rejected ({exc.smtp_code}) — for Gmail the '
+                f'password must be a 16-character App Password from an account '
+                f'with 2-Step Verification on, not the account password')
+    if isinstance(exc, smtplib.SMTPSenderRefused):
+        return (f'sender {exc.sender!r} refused ({exc.smtp_code}) — '
+                f'MAIL_DEFAULT_SENDER usually has to be the mailbox that '
+                f'MAIL_USERNAME authenticates as')
+    if isinstance(exc, smtplib.SMTPRecipientsRefused):
+        return f'every recipient was refused: {list(exc.recipients)[:1]}'
+    if isinstance(exc, (TimeoutError, OSError)) and not isinstance(
+            exc, smtplib.SMTPException):
+        return (f'could not reach {app.config["MAIL_SERVER"]}:'
+                f'{app.config["MAIL_PORT"]} within {MAIL_TIMEOUT}s '
+                f'({type(exc).__name__}: {exc}) — a host that blocks outbound '
+                f'SMTP looks exactly like this')
+    return f'{type(exc).__name__}: {exc}'
+
+
 def send_async_email(app_instance, msg):
     """Send email asynchronously to avoid blocking"""
     with app_instance.app_context():
@@ -642,8 +735,19 @@ def send_async_email(app_instance, msg):
             mail.send(msg)
             # Recipients are student addresses — count them, don't print them.
             app_instance.logger.info('Email sent to %d recipient(s)', len(msg.recipients))
-        except Exception as e:
-            app_instance.logger.warning('Failed to send email: %s', e)
+            last_mail_failure['at'] = None
+            last_mail_failure['error'] = None
+        except Exception as exc:
+            # ERROR, not warning: signup confirmation and password reset are
+            # account access. Losing them silently is how "mail is configured"
+            # and "mail is arriving" came apart with nothing in the log
+            # explaining which of the two was true.
+            reason = _describe_smtp_error(exc)
+            last_mail_failure['at'] = datetime.now(timezone.utc).isoformat()
+            last_mail_failure['error'] = reason
+            app_instance.logger.error(
+                'Email NOT sent (%s). Config: %s', reason, mail_config_summary())
+            runtime_metrics.increment('account_email.failed')
 
 
 def send_email(subject, recipients, text_body, html_body, sender=None):
@@ -2069,13 +2173,26 @@ def _check_redis():
 
 
 def _check_smtp():
-    """Open a connection to the mail server without sending anything."""
+    """
+    Open a connection to the mail server without sending anything.
+
+    Reachability only — it deliberately does not log in, because a readiness
+    probe running every few seconds must not hammer the provider with auth
+    attempts. Credentials are proved by real sends, so the last one that
+    failed is reported here instead: the old check said 'ok' while every
+    message was being refused, which is the worst thing it could have said.
+    """
     if not app.config.get('MAIL_SERVER') or not app.config.get('MAIL_USERNAME'):
         return 'not configured'
-    import smtplib
-    with smtplib.SMTP(app.config['MAIL_SERVER'], app.config['MAIL_PORT'],
-                      timeout=3) as smtp:
+    if app.config.get('MAIL_USE_SSL'):
+        opener = smtplib.SMTP_SSL
+    else:
+        opener = smtplib.SMTP
+    with opener(app.config['MAIL_SERVER'], app.config['MAIL_PORT'],
+                timeout=3) as smtp:
         smtp.ehlo()
+    if last_mail_failure['error']:
+        return f"reachable, but last send failed: {last_mail_failure['error']}"
     return 'ok'
 
 
