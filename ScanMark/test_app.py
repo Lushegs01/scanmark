@@ -272,6 +272,47 @@ class TestEmailVerification:
         finally:
             appmod.REQUIRE_EMAIL_VERIFICATION = False
 
+    @pytest.mark.parametrize('staff_role,stored', [
+        ('Lecturer', 'Lecturer'),
+        ('Course Coordinator', 'Course Coordinator'),
+    ])
+    def test_staff_sign_in_the_moment_the_account_exists(
+            self, appmod, client, staff_role, stored):
+        """
+        Only students are gated. A lecturer who signs up minutes before a class
+        must not be stuck waiting on an inbox — the account works immediately,
+        unconfirmed address and all.
+        """
+        from models import User
+
+        appmod.REQUIRE_EMAIL_VERIFICATION = True
+        try:
+            email = f"{stored.split()[0].lower()}.now@staff.funaab.edu.ng"
+            client.post('/signup', data={
+                'full_name': 'Straight In', 'email': email,
+                'password': VALID_PASSWORD, 'staff_role': staff_role,
+            })
+            with appmod.app.app_context():
+                user = User.query.filter_by(email=email).first()
+                assert user is not None and user.role == stored
+                # The row still records the truth: nobody proved this address.
+                assert user.email_verified is False
+
+            c = appmod.app.test_client()
+            response = c.post('/login', data={'email': email,
+                                              'password': VALID_PASSWORD})
+            assert response.status_code == 302, 'staff were held at the login page'
+            assert '/lecturer_dashboard' in response.headers['Location']
+        finally:
+            appmod.REQUIRE_EMAIL_VERIFICATION = False
+
+    def test_only_the_student_role_is_gated(self, appmod):
+        assert appmod.role_requires_email_verification('student') is True
+        assert appmod.role_requires_email_verification('Student') is True
+        assert appmod.role_requires_email_verification('Lecturer') is False
+        assert appmod.role_requires_email_verification('course coordinator') is False
+        assert appmod.role_requires_email_verification('HOD') is False
+
     def test_a_bad_verification_token_is_refused(self, client):
         response = client.get('/verify_email/rubbish', follow_redirects=True)
         assert response.status_code == 200

@@ -965,10 +965,12 @@ SELF_SERVICE_STAFF_ROLES = {
 # Minimum password length for accounts ScanMark itself authenticates.
 MIN_PASSWORD_LENGTH = int(os.environ.get('MIN_PASSWORD_LENGTH', 10))
 
-# Self-service accounts must confirm their address before the password works.
+# Self-service STUDENT accounts must confirm their address before the password
+# works; staff sign-ups are usable immediately (see VERIFICATION_REQUIRED_ROLES).
 # Defaults on in production and off elsewhere, so a local checkout without SMTP
 # still logs in. Never disable it in production: the signup form accepts any
-# address, including a @staff one the registrant does not own.
+# address, and the link is the only thing standing between a stranger and an
+# account in somebody else's name.
 REQUIRE_EMAIL_VERIFICATION = (
     os.environ.get('REQUIRE_EMAIL_VERIFICATION', '').strip().lower()
     or ('true' if IS_PRODUCTION else 'false')
@@ -1751,6 +1753,36 @@ def record_audit(action, target_type=None, target_id=None, target_label=None,
 
 EMAIL_VERIFY_MAX_AGE = 24 * 60 * 60   # link is good for a day
 
+#: Roles whose password stays locked until the address is confirmed.
+#: Only students: a class is hundreds of self-registered strangers, and the
+#: link is what stops one of them registering under somebody else's name.
+#: Staff sign-ups (Lecturer, Course Coordinator) are a handful of people who
+#: are known to their department and are needed in front of a class today, so
+#: their account works the moment it exists. They are still SENT the link —
+#: confirming still clears the "unproven address" flag CampOS/Google adoption
+#: reads — but nothing waits on it.
+VERIFICATION_REQUIRED_ROLES = (STUDENT_ROLE,)
+
+
+def role_requires_email_verification(role):
+    """True when an account of this role may not sign in until confirmed."""
+    return normalize_role(role) in VERIFICATION_REQUIRED_ROLES
+
+
+def account_needs_verification(user):
+    """True when this specific account is being held back by an unconfirmed
+    address — the switch is on, the flag is unset, AND the role is gated."""
+    return (REQUIRE_EMAIL_VERIFICATION
+            and getattr(user, 'email_verified', None) is False
+            and role_requires_email_verification(getattr(user, 'role', None)))
+
+
+@app.context_processor
+def inject_verification_policy():
+    """So the signup page tells each visitor what actually applies to them,
+    rather than promising a gate that a staff account never meets."""
+    return {'email_verification_required': REQUIRE_EMAIL_VERIFICATION}
+
 
 def send_verification_email(user):
     """Mail a signed, single-use confirmation link to a new self-service account."""
@@ -1763,13 +1795,24 @@ def send_verification_email(user):
         recipients=[user.email],
         sender=app.config['MAIL_DEFAULT_SENDER'],
     )
+    # Say which of the two things this link actually is, so a lecturer who is
+    # already signed in is not told to wait for an email they don't need.
+    if account_needs_verification(user):
+        closing = ("If you did not create a ScanMark account, ignore this "
+                   "email — no account can be used until this link is "
+                   "opened.\n")
+    else:
+        closing = ("Your account already works — signing in does not wait for "
+                   "this link. Opening it just confirms the address is "
+                   "yours.\n\n"
+                   "If you did not create a ScanMark account, tell your "
+                   "department: somebody registered using your address.\n")
     msg.body = (
         f"Hello {user.full_name},\n\n"
         "Confirm your ScanMark account by opening the link below "
         "(valid for 24 hours):\n\n"
         f"{verify_url}\n\n"
-        "If you did not create a ScanMark account, ignore this email — "
-        "no account can be used until this link is opened.\n"
+        + closing
     )
     if account_email_executor.submit(send_async_email, app, msg) is None:
         app.logger.warning('notification queue full; verification email dropped')
@@ -2515,9 +2558,10 @@ def login():
         user = User.query.filter_by(email=email).first()
 
         if user and check_password_hash(user.password, password):
-            # An unconfirmed self-service account is not yet proof that the
-            # person typing owns the address they registered.
-            if REQUIRE_EMAIL_VERIFICATION and user.email_verified is False:
+            # An unconfirmed self-service STUDENT account is not yet proof
+            # that the person typing owns the address they registered. Staff
+            # accounts are not held here — see role_requires_email_verification.
+            if account_needs_verification(user):
                 flash("Please confirm your email address first. "
                       "Check your inbox for the verification link.", "warning")
                 return render_template('login.html', unverified_email=email)
@@ -2618,11 +2662,12 @@ def signup():
         send_verification_email(new_user)
         send_welcome_email(email, name, final_role)
 
-        if REQUIRE_EMAIL_VERIFICATION:
+        if account_needs_verification(new_user):
             flash('Account created! Check your email for a verification link '
                   'before you sign in.', 'success')
         else:
-            flash('Account created successfully! Welcome to ScanMark', 'success')
+            flash('Account created successfully! You can sign in now — '
+                  'welcome to ScanMark.', 'success')
         return redirect(url_for('login'))
 
     return render_template('signup.html')
@@ -5466,7 +5511,8 @@ if __name__ == '__main__':
     print(f"📧 Mail Server: {app.config['MAIL_SERVER']}")
     print("🔐 CSRF Protection: Enabled")
     print("🛡️  Rate Limiting: Enabled")
-    print(f"📧 Email Verification: {'Required' if REQUIRE_EMAIL_VERIFICATION else 'Not required'}")
+    print("📧 Email Verification: "
+          f"{'Required (students only)' if REQUIRE_EMAIL_VERIFICATION else 'Not required'}")
     print("📭 Email is sent at signup and password reset only")
     print(f"🎯 Attendance target shown on dashboards: {ATTENDANCE_TARGET_PERCENT}%")
     print("=" * 60 + "\n")

@@ -555,6 +555,247 @@ h1, h2, h3, h4, h5, h6 { font-weight: 700; }
   margin-bottom: 1.4rem;
 }
 
+/* --- AUTH PAGES (login / signup) --------------------------------
+   One grid drives both pages so the hero column and the card line up
+   on the same baselines. Everything inside the card is sized from the
+   same few tokens, so labels, inputs, hints and buttons share one
+   left edge and one rhythm instead of each element bringing its own
+   Bootstrap margins. */
+.auth-wrap {
+  display: flex;
+  align-items: center;
+  min-height: calc(100vh - 190px);
+  padding: 2rem 0 3rem;
+}
+
+.auth-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  justify-content: center;
+  align-items: center;
+  gap: 2.5rem;
+  width: 100%;
+}
+
+@media (min-width: 992px) {
+  .auth-grid {
+    /* Fixed card, flexible hero: the card never stretches to an
+       awkward width, and the gutter between the two absorbs the slack. */
+    grid-template-columns: minmax(0, 26rem) minmax(0, 27rem);
+    gap: 5rem;
+  }
+}
+
+/* --- Hero column --- */
+.auth-hero { max-width: 26rem; }
+
+.auth-hero .auth-title {
+  font-size: 2.1rem;
+  line-height: 1.18;
+  margin-bottom: 0.9rem;
+}
+
+.auth-hero .auth-lede {
+  font-size: 0.95rem;
+  line-height: 1.7;
+  margin-bottom: 2rem;
+}
+
+.auth-features {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 1.15rem;
+  margin: 0;
+  padding: 0;
+}
+
+/* A fixed first track, so every icon AND every text block starts on
+   exactly the same x — a flex row cannot promise that once the icon
+   carries `margin: 0 auto` (which .stat-icon does, for stat cards). */
+.auth-feature {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr);
+  align-items: center;
+  gap: 0.9rem;
+}
+
+.auth-feature-icon {
+  width: 44px;
+  height: 44px;
+  border-radius: 13px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1rem;
+  margin: 0;
+  background: var(--gold-dim);
+  color: var(--text-secondary);
+}
+
+.auth-feature-icon.icon-gold  { background: var(--gold-dim); color: #b58a00; }
+.auth-feature-icon.icon-green { background: rgba(0, 90, 43, 0.12); color: var(--green); }
+.auth-feature-icon.icon-blue  { background: rgba(72, 101, 214, 0.12); color: #4865d6; }
+
+[data-theme="dark"] .auth-feature-icon.icon-gold  { color: var(--gold); }
+[data-theme="dark"] .auth-feature-icon.icon-green { color: #38c57a; }
+[data-theme="dark"] .auth-feature-icon.icon-blue  { color: #8ea2f2; }
+
+.auth-feature-title {
+  font-size: 0.88rem;
+  font-weight: 700;
+  color: var(--text);
+  line-height: 1.3;
+  margin: 0 0 2px;
+}
+
+.auth-feature-text {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  line-height: 1.45;
+  margin: 0;
+}
+
+/* --- Card column --- */
+/* Below the two-column breakpoint the card is the whole page, so it keeps
+   its own width instead of stretching to the container's 720px. */
+.auth-card-col {
+  width: 100%;
+  max-width: 27rem;
+  margin: 0 auto;
+}
+
+.auth-card {
+  width: 100%;
+  padding: 2.25rem;
+}
+
+.auth-card-head {
+  text-align: center;
+  margin-bottom: 1.6rem;
+}
+
+.auth-card-icon {
+  display: block;
+  font-size: 1.85rem;
+  line-height: 1;
+  color: var(--gold);
+  margin-bottom: 0.85rem;
+}
+
+.auth-card-title {
+  font-size: 1.4rem;
+  margin-bottom: 0.35rem;
+}
+
+.auth-card-head .page-subtitle { margin-bottom: 0; }
+
+/* Every full-width control in the card — Google button, submit button —
+   is the same height, so the two ends of the form align. */
+.btn-auth {
+  width: 100%;
+  min-height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.55rem;
+  font-size: 0.9rem;
+}
+
+.auth-divider {
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+  margin: 1.15rem 0;
+}
+
+.auth-divider::before,
+.auth-divider::after {
+  content: '';
+  flex: 1 1 0;
+  height: 1px;
+  background: var(--divider);
+}
+
+.auth-divider span {
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.9px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  line-height: 1;
+}
+
+.auth-field { margin-bottom: 1.1rem; }
+.auth-field:last-child { margin-bottom: 0; }
+
+.auth-field .form-control,
+.auth-field .form-select { min-height: 46px; }
+
+/* Bootstrap's <small> hints arrive as inline text with no spacing of
+   their own; this gives every hint the same gap and line-height so
+   one-line and two-line hints do not shift the fields below them. */
+.field-hint {
+  display: block;
+  font-size: 0.75rem;
+  line-height: 1.45;
+  color: var(--text-muted);
+  margin-top: 0.4rem;
+}
+
+.field-hint.is-valid { color: var(--green); }
+[data-theme="dark"] .field-hint.is-valid { color: #38c57a; }
+.field-hint.is-invalid { color: #dc3545; }
+
+.auth-badge-row { margin-top: 0.5rem; }
+.auth-badge-row:empty { display: none; }
+
+.auth-actions { margin-top: 1.5rem; }
+
+.auth-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.6rem;
+  font-size: 0.78rem;
+  line-height: 1.5;
+  padding: 0.7rem 0.9rem;
+  margin: 1rem 0 0;
+}
+
+.auth-note i { margin-top: 0.15rem; }
+
+.auth-alt {
+  text-align: center;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  margin: 1.5rem 0 0;
+}
+
+.auth-alt a {
+  font-weight: 700;
+  text-decoration: none;
+  color: var(--green);
+}
+
+[data-theme="dark"] .auth-alt a { color: var(--gold); }
+
+.auth-forgot {
+  display: block;
+  text-align: right;
+  font-size: 0.78rem;
+  font-weight: 600;
+  text-decoration: none;
+  color: var(--green);
+  margin-top: 0.5rem;
+}
+
+[data-theme="dark"] .auth-forgot { color: var(--gold); }
+
+@media (max-width: 575.98px) {
+  .auth-wrap { padding: 1rem 0 2.5rem; min-height: 0; }
+  .auth-card { padding: 1.5rem; }
+}
+
 /* --- SECTION LABEL --- */
 .section-label {
   font-size: 0.72rem;

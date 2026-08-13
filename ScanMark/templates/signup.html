@@ -1,61 +1,64 @@
 {% extends "base.html" %}
 
 {% block content %}
-<div class="container page-wrap">
-    <div class="row align-items-center justify-content-center" style="min-height: calc(100vh - 140px);">
+<div class="container">
+    <div class="auth-wrap">
+        <div class="auth-grid">
 
-        <!-- ===== LEFT HERO PANEL (desktop only) ===== -->
-        <div class="col-md-5 mb-5 d-none d-md-block pe-5">
-            <div class="accent-line"></div>
-            <h1 class="page-title" style="font-size: 2.2rem; line-height: 1.2;">
-                Join <span style="color: var(--gold);">ScanMark</span>
-            </h1>
-            <p class="page-subtitle mt-3" style="font-size: 0.95rem; line-height: 1.7;">
-                Create your account to start managing or<br>
-                marking attendance instantly with QR scanning.
-            </p>
+            <!-- ===== LEFT HERO PANEL (desktop only) ===== -->
+            <div class="auth-hero d-none d-lg-block">
+                <div class="accent-line"></div>
+                <h1 class="page-title auth-title">
+                    Join <span style="color: var(--gold);">ScanMark</span>
+                </h1>
+                <p class="page-subtitle auth-lede">
+                    Create your account to start managing or marking attendance
+                    instantly with QR scanning.
+                </p>
 
-            <div class="mt-4 d-flex flex-column gap-3">
-                <div class="d-flex align-items-center gap-3">
-                    <div class="stat-icon flex-shrink-0" style="background: var(--gold-dim); font-size: 1rem;">📧</div>
-                    <div>
-                        <p class="mb-0 fw-bold" style="color: var(--text); font-size: 0.88rem;">FUNAAB or Gmail Required</p>
-                        <p class="mb-0 small" style="color: var(--text-muted);">Use @student, @staff, @funaab.edu.ng, or @gmail.com</p>
-                    </div>
-                </div>
-                <div class="d-flex align-items-center gap-3">
-                    <div class="stat-icon flex-shrink-0" style="background: rgba(0,90,43,0.12); font-size: 1rem;">🎓</div>
-                    <div>
-                        <p class="mb-0 fw-bold" style="color: var(--text); font-size: 0.88rem;">For Students</p>
-                        <p class="mb-0 small" style="color: var(--text-muted);">Mark attendance &amp; track your history</p>
-                    </div>
-                </div>
-                <div class="d-flex align-items-center gap-3">
-                    <div class="stat-icon flex-shrink-0" style="background: rgba(100,100,250,0.10); font-size: 1rem;">👨‍🏫</div>
-                    <div>
-                        <p class="mb-0 fw-bold" style="color: var(--text); font-size: 0.88rem;">For Lecturers</p>
-                        <p class="mb-0 small" style="color: var(--text-muted);">Create classes &amp; export CSV reports</p>
-                    </div>
-                </div>
+                <ul class="auth-features">
+                    <li class="auth-feature">
+                        <span class="auth-feature-icon icon-gold" aria-hidden="true">
+                            <i class="fas fa-envelope"></i>
+                        </span>
+                        <div>
+                            <p class="auth-feature-title">FUNAAB or Gmail required</p>
+                            <p class="auth-feature-text">Use @student, @staff, @funaab.edu.ng, or @gmail.com</p>
+                        </div>
+                    </li>
+                    <li class="auth-feature">
+                        <span class="auth-feature-icon icon-green" aria-hidden="true">
+                            <i class="fas fa-graduation-cap"></i>
+                        </span>
+                        <div>
+                            <p class="auth-feature-title">For students</p>
+                            <p class="auth-feature-text">Mark attendance &amp; track your history</p>
+                        </div>
+                    </li>
+                    <li class="auth-feature">
+                        <span class="auth-feature-icon icon-blue" aria-hidden="true">
+                            <i class="fas fa-chalkboard-user"></i>
+                        </span>
+                        <div>
+                            <p class="auth-feature-title">For lecturers</p>
+                            <p class="auth-feature-text">Create classes &amp; export CSV reports</p>
+                        </div>
+                    </li>
+                </ul>
             </div>
-        </div>
 
-        <!-- ===== SIGNUP CARD ===== -->
-        <div class="col-md-5">
-            <div class="glass-card p-4 p-md-5">
+            <!-- ===== SIGNUP CARD ===== -->
+            <div class="auth-card-col">
+                <div class="glass-card auth-card">
 
-                <div class="text-center mb-4">
-                    <div class="mb-3">
-                        <i class="fas fa-user-plus" style="font-size: 2rem; color: var(--gold);"></i>
+                    <div class="auth-card-head">
+                        <i class="fas fa-user-plus auth-card-icon"></i>
+                        <h2 class="page-title auth-card-title">Create Account</h2>
+                        <p class="page-subtitle">Fill in your FUNAAB or Gmail details to get started</p>
                     </div>
-                    <h2 class="page-title" style="font-size: 1.4rem;">Create Account</h2>
-                    <p class="page-subtitle">Fill in your FUNAAB or Gmail details to get started</p>
-                </div>
 
-                <!-- Google Sign-Up -->
-                <div class="d-grid mb-3">
-                    <a href="{{ url_for('login_google') }}"
-                        class="btn btn-glass btn-lg d-flex align-items-center justify-content-center gap-2">
+                    <!-- Google Sign-Up -->
+                    <a href="{{ url_for('login_google') }}" class="btn btn-glass btn-auth">
                         <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 48 48">
                             <path fill="#FFC107" d="M43.611,20.083H42V20H24v8h11.303c-1.649,4.657-6.08,8-11.303,8c-6.627,0-12-5.373-12-12c0-6.627,5.373-12,12-12c3.059,0,5.842,1.154,7.961,3.039l5.657-5.657C34.046,6.053,29.268,4,24,4C12.955,4,4,12.955,4,24c0,11.045,8.955,20,20,20c11.045,0,20-8.955,20-20C44,22.659,43.862,21.35,43.611,20.083z" />
                             <path fill="#FF3D00" d="M6.306,14.691l6.571,4.819C14.655,15.108,18.961,12,24,12c3.059,0,5.842,1.154,7.961,3.039l5.657-5.657C34.046,6.053,29.268,4,24,4C16.318,4,9.656,8.337,6.306,14.691z" />
@@ -64,111 +67,107 @@
                         </svg>
                         Sign up with Google
                     </a>
-                </div>
 
-                <!-- Divider -->
-                <div class="d-flex align-items-center mb-3">
-                    <hr class="flex-grow-1">
-                    <span class="mx-3 section-label">or</span>
-                    <hr class="flex-grow-1">
-                </div>
+                    <div class="auth-divider"><span>or</span></div>
 
-                <!-- Signup Form -->
-                <form method="POST" action="/signup" id="signupForm">
-                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <!-- Signup Form -->
+                    <form method="POST" action="/signup" id="signupForm">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 
-                    <div class="mb-3">
-                        <label class="form-label">Full Name</label>
-                        <input type="text" name="full_name" id="fullNameInput" class="form-control"
-                            placeholder="John Doe" required>
-                    </div>
-
-                    <div class="mb-3">
-                        <label class="form-label">Email Address</label>
-                        <input type="email" name="email" id="emailInput" class="form-control"
-                            placeholder="student@funaab.edu.ng or @gmail.com" required>
-                        <small class="text-muted mt-1 d-block" id="emailHelp">
-                            Your role will be automatically detected from your email domain.
-                        </small>
-                        <div id="detectedRole" class="mt-2"></div>
-                    </div>
-
-                    <div class="mb-3" id="staffRoleSelector" style="display: none;">
-                        <label class="form-label">Select Your Role</label>
-                        <select name="staff_role" id="staffRoleInput" class="form-select">
-                            <option value="">Choose your role...</option>
-                            <option value="Lecturer">Lecturer — Teach assigned courses</option>
-                            <option value="Course Coordinator">Course Coordinator — Create &amp; manage courses
-                            </option>
-                        </select>
-                        <small class="text-muted">Course Coordinators can create courses; Lecturers can be assigned
-                            to teach.</small>
-                    </div>
-
-                    <div class="mb-3">
-                        <label class="form-label">Password</label>
-                        <div class="input-group">
-                            <input type="password" name="password" id="passwordInput" class="form-control"
-                                placeholder="Min. {{ min_password_length }} characters"
-                                minlength="{{ min_password_length }}" required>
-                            <span class="input-group-text" id="togglePassword" style="cursor: pointer;">
-                                <i class="fa fa-eye" id="eyeIcon" style="color: var(--text-muted);"></i>
-                            </span>
+                        <div class="auth-field">
+                            <label class="form-label" for="fullNameInput">Full Name</label>
+                            <input type="text" name="full_name" id="fullNameInput" class="form-control"
+                                placeholder="John Doe" autocomplete="name" required>
                         </div>
-                        <small class="text-muted">
-                            {{ password_policy_text }}
-                        </small>
-                    </div>
 
-                    <input type="hidden" name="role" id="roleField" value="student">
+                        <div class="auth-field">
+                            <label class="form-label" for="emailInput">Email Address</label>
+                            <input type="email" name="email" id="emailInput" class="form-control"
+                                placeholder="student@funaab.edu.ng or @gmail.com" autocomplete="email" required>
+                            <small class="field-hint" id="emailHelp">
+                                Your role is detected from your email domain.
+                            </small>
+                            <div id="detectedRole" class="auth-badge-row"></div>
+                        </div>
 
-                    <div id="studentFields" style="display: none;">
-                        <div class="row">
-                            <div class="col-6 mb-3">
-                                <label class="form-label">Matric No</label>
-                                <input type="text" name="matric_no" id="matricInput" class="form-control"
-                                    placeholder="2021...">
+                        <div class="auth-field" id="staffRoleSelector" hidden>
+                            <label class="form-label" for="staffRoleInput">Select Your Role</label>
+                            <select name="staff_role" id="staffRoleInput" class="form-select">
+                                <option value="">Choose your role...</option>
+                                <option value="Lecturer">Lecturer — Teach assigned courses</option>
+                                <option value="Course Coordinator">Course Coordinator — Create &amp; manage courses</option>
+                            </select>
+                            <small class="field-hint">
+                                Course Coordinators can create courses; Lecturers can be assigned to teach.
+                            </small>
+                        </div>
+
+                        <div class="auth-field">
+                            <label class="form-label" for="passwordInput">Password</label>
+                            <div class="input-group">
+                                <input type="password" name="password" id="passwordInput" class="form-control"
+                                    placeholder="Min. {{ min_password_length }} characters"
+                                    minlength="{{ min_password_length }}" autocomplete="new-password" required>
+                                <span class="input-group-text" id="togglePassword" role="button"
+                                    tabindex="0" aria-label="Show password" style="cursor: pointer;">
+                                    <i class="fa fa-eye" id="eyeIcon"></i>
+                                </span>
                             </div>
-                            <div class="col-6 mb-3">
-                                <label class="form-label">Level</label>
-                                <select name="level" id="levelInput" class="form-select">
-                                    <option value="">Select</option>
-                                    <option value="100">100</option>
-                                    <option value="200">200</option>
-                                    <option value="300">300</option>
-                                    <option value="400">400</option>
-                                    <option value="500">500</option>
-                                </select>
+                            <small class="field-hint">{{ password_policy_text }}</small>
+                        </div>
+
+                        <input type="hidden" name="role" id="roleField" value="student">
+
+                        <div class="auth-field" id="studentFields" hidden>
+                            <div class="row g-3">
+                                <div class="col-6">
+                                    <label class="form-label" for="matricInput">Matric No</label>
+                                    <input type="text" name="matric_no" id="matricInput" class="form-control"
+                                        placeholder="2021...">
+                                </div>
+                                <div class="col-6">
+                                    <label class="form-label" for="levelInput">Level</label>
+                                    <select name="level" id="levelInput" class="form-select">
+                                        <option value="">Select</option>
+                                        <option value="100">100</option>
+                                        <option value="200">200</option>
+                                        <option value="300">300</option>
+                                        <option value="400">400</option>
+                                        <option value="500">500</option>
+                                    </select>
+                                </div>
                             </div>
                         </div>
+
+                        <div class="auth-actions">
+                            <button type="submit" class="btn btn-primary btn-auth">
+                                <i class="fas fa-user-plus"></i>Create Account
+                            </button>
+                        </div>
+                    </form>
+
+                    {# Who actually has to open the confirmation link. Students do;
+                       lecturers and coordinators can sign in immediately. #}
+                    <div class="alert alert-success auth-note" id="confirmNote">
+                        <i class="fas fa-envelope-open-text" aria-hidden="true"></i>
+                        <span id="confirmNoteText">
+                            {% if email_verification_required %}
+                            Students confirm their email before the first sign-in. Lecturers and
+                            Course Coordinators can sign in as soon as the account is created.
+                            {% else %}
+                            You'll receive a confirmation email after signing up.
+                            {% endif %}
+                        </span>
                     </div>
 
-                    <div class="d-grid mt-4">
-                        <button type="submit" class="btn btn-primary btn-lg">
-                            <i class="fas fa-user-plus me-2"></i>Create Account
-                        </button>
-                    </div>
-                </form>
-
-                <div class="text-center mt-3">
-                    <div class="alert alert-success py-2 px-3 d-inline-flex align-items-center gap-2 mb-0" style="font-size: 0.78rem;">
-                        <span>✉️</span>
-                        <span>You'll receive a confirmation email after signing up.</span>
-                    </div>
-                </div>
-
-                <div class="text-center mt-4">
-                    <p class="page-subtitle">
-                        Already have an account?
-                        <a href="/login" class="fw-bold text-decoration-none" style="color: var(--green);">
-                            Login here
-                        </a>
+                    <p class="auth-alt">
+                        Already have an account? <a href="/login">Login here</a>
                     </p>
+
                 </div>
-
             </div>
-        </div>
 
+        </div>
     </div>
 </div>
 
@@ -180,57 +179,72 @@
     const emailHelp = document.getElementById('emailHelp');
     const staffRoleSelector = document.getElementById('staffRoleSelector');
     const staffRoleInput = document.getElementById('staffRoleInput');
+    const confirmNoteText = document.getElementById('confirmNoteText');
+
+    // Whether the server is holding unconfirmed STUDENT accounts back. Staff
+    // accounts are never held, so the note only ever changes for students.
+    const VERIFY_STUDENTS = {{ 'true' if email_verification_required else 'false' }};
+
+    const STUDENT_NOTE = VERIFY_STUDENTS
+        ? "Confirm your email from the link we send you, then sign in."
+        : "You'll receive a confirmation email after signing up.";
+    const STAFF_NOTE =
+        "No confirmation needed — you can sign in as soon as your account is created.";
+    const DEFAULT_NOTE = VERIFY_STUDENTS
+        ? "Students confirm their email before the first sign-in. Lecturers and " +
+          "Course Coordinators can sign in as soon as the account is created."
+        : "You'll receive a confirmation email after signing up.";
+
+    function setHint(text, state) {
+        emailHelp.className = 'field-hint' + (state ? ' ' + state : '');
+        emailHelp.textContent = text;
+    }
+
+    function applyStudent(badge, hint) {
+        detectedRoleDiv.innerHTML = badge;
+        roleField.value = 'student';
+        studentFields.hidden = false;
+        staffRoleSelector.hidden = true;
+        staffRoleInput.required = false;
+        setHint(hint, 'is-valid');
+        confirmNoteText.textContent = STUDENT_NOTE;
+    }
 
     emailInput.addEventListener('input', function () {
         const email = this.value.toLowerCase().trim();
 
         if (email.includes('@student.funaab.edu.ng')) {
-            detectedRoleDiv.innerHTML = '<span class="badge bg-primary">Student</span>';
-            roleField.value = 'student';
-            studentFields.style.display = 'block';
-            staffRoleSelector.style.display = 'none';
-            staffRoleInput.required = false;
-            emailHelp.className = 'text-success mt-1 d-block';
-            emailHelp.textContent = '✓ Valid FUNAAB student email';
+            applyStudent('<span class="badge bg-primary">Student</span>',
+                         '✓ Valid FUNAAB student email');
         } else if (email.includes('@staff.funaab.edu.ng')) {
             detectedRoleDiv.innerHTML = '<span class="badge bg-warning text-dark">Staff Member</span>';
             roleField.value = 'lecturer';
-            studentFields.style.display = 'none';
-            staffRoleSelector.style.display = 'block';
+            studentFields.hidden = true;
+            staffRoleSelector.hidden = false;
             staffRoleInput.required = true;
-            emailHelp.className = 'text-success mt-1 d-block';
-            emailHelp.textContent = '✓ Valid FUNAAB staff email — please select your role below';
+            setHint('✓ Valid FUNAAB staff email — please select your role below', 'is-valid');
+            confirmNoteText.textContent = STAFF_NOTE;
         } else if (email.endsWith('@funaab.edu.ng')) {
-            detectedRoleDiv.innerHTML = '<span class="badge bg-info text-dark">Student (General)</span>';
-            roleField.value = 'student';
-            studentFields.style.display = 'block';
-            staffRoleSelector.style.display = 'none';
-            staffRoleInput.required = false;
-            emailHelp.className = 'text-success mt-1 d-block';
-            emailHelp.textContent = '✓ Valid FUNAAB email';
+            applyStudent('<span class="badge bg-info text-dark">Student (General)</span>',
+                         '✓ Valid FUNAAB email');
         } else if (email.endsWith('@gmail.com')) {
-            detectedRoleDiv.innerHTML = '<span class="badge bg-info text-dark">Student (Gmail)</span>';
-            roleField.value = 'student';
-            studentFields.style.display = 'block';
-            staffRoleSelector.style.display = 'none';
-            staffRoleInput.required = false;
-            emailHelp.className = 'text-success mt-1 d-block';
-            emailHelp.textContent = '✓ Valid Gmail account';
+            applyStudent('<span class="badge bg-info text-dark">Student (Gmail)</span>',
+                         '✓ Valid Gmail account');
         } else if (email.includes('@')) {
             detectedRoleDiv.innerHTML = '<span class="badge bg-danger">Invalid — must use FUNAAB or Gmail</span>';
             roleField.value = '';
-            studentFields.style.display = 'none';
-            staffRoleSelector.style.display = 'none';
+            studentFields.hidden = true;
+            staffRoleSelector.hidden = true;
             staffRoleInput.required = false;
-            emailHelp.className = 'text-danger mt-1 d-block';
-            emailHelp.textContent = '✗ Only FUNAAB or Gmail emails are allowed';
+            setHint('✗ Only FUNAAB or Gmail emails are allowed', 'is-invalid');
+            confirmNoteText.textContent = DEFAULT_NOTE;
         } else {
             detectedRoleDiv.textContent = '';
-            studentFields.style.display = 'none';
-            staffRoleSelector.style.display = 'none';
+            studentFields.hidden = true;
+            staffRoleSelector.hidden = true;
             staffRoleInput.required = false;
-            emailHelp.className = 'text-muted mt-1 d-block';
-            emailHelp.textContent = 'Your role will be automatically detected from your email domain.';
+            setHint('Your role is detected from your email domain.');
+            confirmNoteText.textContent = DEFAULT_NOTE;
         }
     });
 
@@ -246,21 +260,21 @@
         });
     }
 
-    document.getElementById('togglePassword').addEventListener('click', function () {
+    const toggle = document.getElementById('togglePassword');
+    function togglePasswordVisibility() {
         const pw = document.getElementById('passwordInput');
         const icon = document.getElementById('eyeIcon');
         const hidden = pw.getAttribute('type') === 'password';
         pw.setAttribute('type', hidden ? 'text' : 'password');
         icon.className = hidden ? 'fa fa-eye-slash' : 'fa fa-eye';
-    });
-
-    document.getElementById('signupForm').addEventListener('submit', function () {
-        console.log('=== SIGNUP FORM SUBMISSION ===');
-        console.log('Full Name:', document.getElementById('fullNameInput').value);
-        console.log('Email:', document.getElementById('emailInput').value);
-        console.log('Role:', roleField.value);
-        console.log('Matric No:', document.getElementById('matricInput').value || 'N/A');
-        console.log('Level:', document.getElementById('levelInput').value || 'N/A');
+        toggle.setAttribute('aria-label', hidden ? 'Hide password' : 'Show password');
+    }
+    toggle.addEventListener('click', togglePasswordVisibility);
+    toggle.addEventListener('keydown', function (event) {
+        if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            togglePasswordVisibility();
+        }
     });
 </script>
 {% endblock %}
