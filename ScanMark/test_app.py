@@ -236,6 +236,61 @@ class TestSignupCannotMintPrivilege:
             appmod.limiter.reset()
 
 
+class TestStaticAssetVersioning:
+    """
+    A deploy shipped new markup against the previously cached stylesheet, so
+    the redesigned signup page rendered as bare list bullets for anyone who
+    had visited before. Two caches held it there: a 1-day max-age on an
+    unversioned URL, and a service worker whose cache name was hand-edited
+    (v3) and so survived every deploy that followed.
+    """
+
+    def test_the_stylesheet_url_carries_the_asset_hash(self, appmod, client):
+        import re
+
+        body = client.get('/signup').get_data(as_text=True)
+        match = re.search(r'/static/style\.css\?v=([0-9a-f]+)', body)
+        assert match, 'style.css is linked without a cache-busting version'
+        assert match.group(1) == appmod.ASSET_VERSION
+
+    def test_the_asset_hash_follows_the_files(self, appmod, tmp_path, monkeypatch):
+        """Same bytes, same hash; a changed file, a changed hash."""
+        static = tmp_path / 'static'
+        static.mkdir()
+        (static / 'style.css').write_text('body { color: red; }')
+        monkeypatch.setattr(appmod, '_static_root', str(static))
+
+        first = appmod._compute_asset_version()
+        assert first == appmod._compute_asset_version()
+
+        (static / 'style.css').write_text('body { color: blue; }')
+        assert appmod._compute_asset_version() != first
+
+    def test_the_worker_names_its_cache_after_the_deploy(self, appmod, client):
+        body = client.get('/service-worker.js').get_data(as_text=True)
+        assert f'self.SCANMARK_ASSET_VERSION = "{appmod.ASSET_VERSION}"' in body
+        assert 'scanmark-cache-${ASSET_VERSION}' in body, \
+            'the cache name must come from the asset hash, not a hand-edited one'
+
+    def test_the_worker_does_not_answer_a_new_url_from_an_old_cache(self, appmod,
+                                                                    client):
+        """
+        cache.match(request, {ignoreSearch: true}) reintroduces the whole bug:
+        during a deploy the outgoing worker matches the page's request for
+        ?v=<new> against its own ?v=<old> entry and serves the stale file.
+        """
+        body = client.get('/service-worker.js').get_data(as_text=True)
+        # The option, not the word: the code explains itself in a comment.
+        assert 'ignoreSearch:' not in body
+
+    def test_static_files_are_not_pinned_for_long(self, appmod, client):
+        """Versioned URLs make caching safe; an unbounded max-age would not."""
+        response = client.get('/static/style.css')
+        cache_control = response.headers.get('Cache-Control', '')
+        if cache_control:      # WhiteNoise is bypassed by the test client
+            assert 'immutable' not in cache_control
+
+
 class TestEmailVerification:
 
     def test_an_unconfirmed_account_cannot_sign_in(self, appmod, client):
