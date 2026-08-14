@@ -31,6 +31,15 @@ class User(UserMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
     campos_user_id = db.Column(db.String(100), unique=True, nullable=True, index=True)
     campos_institution_id = db.Column(db.String(100), nullable=True, index=True)
+
+    # Which university this person belongs to, as the domain their address
+    # sits under ('funaab.edu.ng', 'unilag.edu.ng'). One deployment serves
+    # several, so this is what keeps one university's courses, rosters and
+    # dashboards out of another's. Derived from the address at signup;
+    # NULL for a personal-email account until it registers for its first
+    # course, and NULL on rows that predate the column until the boot
+    # backfill reaches them.
+    institution = db.Column(db.String(120), nullable=True, index=True)
     full_name = db.Column(db.String(100), nullable=False)
     email = db.Column(db.String(120), unique=True, nullable=False)
     password = db.Column(db.String(200), nullable=False)
@@ -109,6 +118,13 @@ class Course(db.Model):
     archived = db.Column(db.Boolean, nullable=False, default=False)
     archived_at = db.Column(db.DateTime, nullable=True)
 
+    # The university this offering belongs to, inherited from its
+    # coordinator. Empty string rather than NULL for the same reason as
+    # `section`: SQL treats NULLs as distinct, so a nullable column would let
+    # the uniqueness rule below stop biting on unassigned rows.
+    institution = db.Column(db.String(120), nullable=False, default='',
+                            server_default='', index=True)
+
 # NEW: Links a course to a department so the HOD can see it
     department = db.Column(db.String(50), nullable=True)
 
@@ -122,8 +138,11 @@ class Course(db.Model):
     faculty = db.Column(db.String(50), nullable=True)
 
     __table_args__ = (
-        db.UniqueConstraint('code', 'academic_year', 'semester', 'section',
-                            name='uq_course_offering'),
+        # Institution is part of the key: CSC101 at FUNAAB and CSC101 at
+        # UNILAG are different courses, and without it the second university
+        # to create one this term is told it already exists.
+        db.UniqueConstraint('code', 'institution', 'academic_year', 'semester',
+                            'section', name='uq_course_offering'),
         db.Index('ix_course_term', 'academic_year', 'semester'),
     )
 

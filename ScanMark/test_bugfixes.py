@@ -177,6 +177,7 @@ class TestCoursesRecurNextTerm:
             existing = db.session.get(Course, seed['course_id'])
             clash = Course(code='CSC201', title='Clash',
                            coordinator_id=existing.coordinator_id,
+                           institution=existing.institution,
                            academic_year=existing.academic_year,
                            semester=existing.semester,
                            section=existing.section)
@@ -401,7 +402,8 @@ class TestSupervisoryScopeAndMaths:
                   json=scan_body(appmod, seed['session_id']))
 
         with appmod.app.app_context():
-            data = appmod.get_department_analytics('Computer Science')
+            data = appmod.get_department_analytics('Computer Science',
+                                                   institution='funaab.edu.ng')
 
         assert data['labels'] == ['CSC201']
         # One scan, one place on the roster -> 100%, not "1".
@@ -1502,7 +1504,10 @@ class TestOfferingUniquenessSurvivesUpgrade:
 
         with appmod.app.app_context():
             inspector = db.inspect(db.engine)
-            wanted = sorted(['code', 'academic_year', 'semester', 'section'])
+            # Institution joined the key so two universities can each run
+            # CSC201 this term; within one, the offering is still unique.
+            wanted = sorted(['code', 'institution', 'academic_year',
+                             'semester', 'section'])
             constrained = any(
                 sorted(c.get('column_names') or []) == wanted
                 for c in inspector.get_unique_constraints('course')
@@ -1524,6 +1529,7 @@ class TestOfferingUniquenessSurvivesUpgrade:
             # second worker effectively does when it interleaves.
             db.session.add(Course(code=existing.code, title='Racing',
                                   coordinator_id=existing.coordinator_id,
+                                  institution=existing.institution,
                                   academic_year=existing.academic_year,
                                   semester=existing.semester,
                                   section=existing.section))
@@ -1543,6 +1549,7 @@ class TestSectionsAreNotGuessed:
                           coordinator_id=original.coordinator_id,
                           department=original.department,
                           faculty=original.faculty,
+                          institution=original.institution,
                           academic_year=original.academic_year,
                           semester=original.semester, section=section)
             db.session.add(twin)

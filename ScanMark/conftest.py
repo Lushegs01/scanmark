@@ -138,9 +138,16 @@ def seed(appmod):
         db.session.add_all([coordinator, outsider, lecturer, student, other_student])
         db.session.commit()
 
+        # Everyone above holds a funaab.edu.ng address, so that is the
+        # institution the application derives for them. Setting it explicitly
+        # keeps the fixture honest about what a real row looks like.
+        for person in (coordinator, outsider, lecturer, student, other_student):
+            person.institution = 'funaab.edu.ng'
+        db.session.commit()
+
         course = Course(code='CSC201', title='Data Structures',
                         coordinator_id=coordinator.id, department='Computer Science',
-                        faculty='Physical Sciences')
+                        faculty='Physical Sciences', institution='funaab.edu.ng')
         db.session.add(course)
         db.session.commit()
 
@@ -168,6 +175,83 @@ def seed(appmod):
             'lecturer_email': lecturer.email,
             'student_email': student.email,
             'other_student_email': other_student.email,
+        }
+
+
+@pytest.fixture()
+def other_institution(appmod, seed):
+    """
+    A whole second university on the same instance: its own coordinator,
+    lecturer, student, course, session and attendance record.
+
+    Everything here is deliberately named so it cannot be confused with the
+    `seed` institution's rows — the isolation tests assert these strings never
+    appear in a page rendered for somebody at the first one. Department and
+    faculty match `seed` exactly, because two universities really do both have
+    a Computer Science department, and that collision is the point.
+    """
+    from models import db, User, Course, ClassSession, Attendance
+    from werkzeug.security import generate_password_hash
+
+    def _hash(pw):
+        return generate_password_hash(pw, method='scrypt')
+
+    with appmod.app.app_context():
+        coordinator = User(full_name='Bola Unilag',
+                           email='bola@staff.unilag.edu.ng',
+                           password=_hash(VALID_PASSWORD),
+                           role='Course Coordinator',
+                           department='Computer Science',
+                           faculty='Physical Sciences',
+                           institution='unilag.edu.ng', email_verified=True)
+        lecturer = User(full_name='Chidi Unilag',
+                        email='chidi@staff.unilag.edu.ng',
+                        password=_hash(VALID_PASSWORD), role='Lecturer',
+                        department='Computer Science',
+                        faculty='Physical Sciences',
+                        institution='unilag.edu.ng', email_verified=True)
+        student = User(full_name='Ngozi Unilag',
+                       email='ngozi@student.unilag.edu.ng',
+                       password=_hash(VALID_PASSWORD), role='student',
+                       matric_no='UL20200001', level='300',
+                       institution='unilag.edu.ng', email_verified=True)
+        db.session.add_all([coordinator, lecturer, student])
+        db.session.commit()
+
+        # The SAME course code as the seed institution runs: the case the old
+        # global uniqueness key made impossible.
+        course = Course(code='CSC201', title='Unilag Data Structures',
+                        coordinator_id=coordinator.id,
+                        department='Computer Science',
+                        faculty='Physical Sciences',
+                        institution='unilag.edu.ng')
+        db.session.add(course)
+        db.session.commit()
+
+        student.enrolled_courses.append(course)
+        db.session.commit()
+
+        class_session = ClassSession(course_id=course.id, title='Unilag Week 1')
+        db.session.add(class_session)
+        db.session.flush()
+        appmod._snapshot_roster(class_session)
+        db.session.add(Attendance(student_id=student.id, course_id=course.id,
+                                  session_id=class_session.id))
+        db.session.commit()
+
+        return {
+            'coordinator_id': coordinator.id,
+            'lecturer_id': lecturer.id,
+            'student_id': student.id,
+            'course_id': course.id,
+            'session_id': class_session.id,
+            'coordinator_email': coordinator.email,
+            'lecturer_email': lecturer.email,
+            'student_email': student.email,
+            #: Strings that must never surface on the other institution's pages.
+            'fingerprints': ('Bola Unilag', 'Chidi Unilag', 'Ngozi Unilag',
+                             'Unilag Data Structures', 'Unilag Week 1',
+                             'UL20200001', 'unilag.edu.ng'),
         }
 
 
