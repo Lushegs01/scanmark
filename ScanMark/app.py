@@ -65,7 +65,8 @@ from models import (
     course_instructors, enrollments,
 )
 from mailconfig import BREVO, resolve_mail_settings
-from mailer import MailSendError, describe_key_shape, send_via_brevo
+from mailer import (MailSendError, check_sender_validated, describe_key_shape,
+                    send_via_brevo)
 from performance import BoundedExecutor, InstrumentedQueuePool, runtime_metrics
 from campos_integration import (
     CamposIntegrationError,
@@ -679,6 +680,30 @@ campos_executor = BoundedExecutor(
 )
 
 
+def _warn_if_sender_is_not_validated():
+    """
+    Say at boot what Brevo would otherwise only say hours later, in its own
+    dashboard: the send endpoint answers 201 and rejects the message
+    afterwards when the sender is not validated, so an unvalidated address
+    logs as a successful send and reaches nobody.
+    """
+    verdict, note = check_sender_validated(MAIL_SETTINGS)
+    if verdict is False:
+        app.logger.warning('Brevo sender problem: %s', note)
+    elif verdict is None:
+        app.logger.info('Brevo sender not checked: %s', note)
+    else:
+        app.logger.info('Brevo sender: %s', note)
+
+
+if MAIL_SETTINGS.provider == BREVO and MAIL_SETTINGS.is_configured:
+    # On the pool, never inline: a boot that waits on somebody else's API is
+    # a boot that a slow API can stall.
+    if os.environ.get('BREVO_SKIP_SENDER_CHECK', '').strip().lower() not in (
+            'true', '1', 'yes', 'on'):
+        account_email_executor.submit(_warn_if_sender_is_not_validated)
+
+
 @atexit.register
 def _shutdown_background_executors():
     # Do not hold process shutdown open for optional outbound work.
@@ -746,9 +771,14 @@ def deliver_message(msg):
 
     Every caller builds a Flask-Mail Message and hands it to the background
     pool; only this function knows there is more than one way out.
+
+    Returns the provider's own reference for the message where there is one.
+    Accepted is not delivered: when a message is missing from an inbox, the
+    next question is always what the provider did with it, and that is a
+    search in their dashboard that needs this id.
     """
     if MAIL_SETTINGS.provider == BREVO:
-        send_via_brevo(
+        response = send_via_brevo(
             MAIL_SETTINGS,
             subject=msg.subject,
             recipients=msg.recipients,
@@ -756,17 +786,23 @@ def deliver_message(msg):
             html=msg.html,
             sender=msg.sender,
         )
-    else:
-        mail.send(msg)
+        try:
+            return (response.json() or {}).get('messageId')
+        except ValueError:
+            return None
+    mail.send(msg)
+    return None
 
 
 def send_async_email(app_instance, msg):
     """Send email asynchronously to avoid blocking"""
     with app_instance.app_context():
         try:
-            deliver_message(msg)
+            reference = deliver_message(msg)
             # Recipients are student addresses — count them, don't print them.
-            app_instance.logger.info('Email sent to %d recipient(s)', len(msg.recipients))
+            app_instance.logger.info(
+                'Email accepted for %d recipient(s)%s', len(msg.recipients),
+                f' (brevo messageId={reference})' if reference else '')
             last_mail_failure['at'] = None
             last_mail_failure['error'] = None
         except Exception as exc:

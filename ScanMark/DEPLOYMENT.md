@@ -60,6 +60,12 @@ The three causes that account for almost all of it:
 | `sender ... refused` | `MAIL_DEFAULT_SENDER` must normally be the mailbox `MAIL_USERNAME` authenticates as. |
 | `Brevo rejected the API key (401)` | Brevo issues **two** credentials from Settings → SMTP & API: the v3 **API key** (`xkeysib-…`, API Keys tab) and the **SMTP key** (`xsmtpsib-…`, SMTP tab). This API only accepts the first; the second gets the same 401 as a key that does not exist. The message names which one is configured. |
 | `Brevo has not activated this account for sending` | An account state, not configuration — finish the account details in the dashboard or ask Brevo support to enable transactional sending. |
+| `Brevo sender problem: ... does not list ... as a validated sender` (at boot) | The send API answers `201` and rejects the message **afterwards** when the sender is not validated, so this never appears as a send failure. Add the address under Senders, Domains & Dedicated IPs → Senders and open the confirmation mail Brevo sends to it. Set `BREVO_SKIP_SENDER_CHECK=true` to skip the check. |
+
+Note the wording in the log: a send is reported as **accepted**, not delivered,
+and carries Brevo's `messageId`. Anything after acceptance — rejection,
+bounce, spam filing — is visible only in Brevo's Transactional → Logs, and
+that id is how you find the message there.
 | `Brevo refused the sender ...` | That exact address is not verified in the Brevo dashboard. |
 | `Brevo returned 429 / 402` | The account's sending limit, not a configuration problem. |
 

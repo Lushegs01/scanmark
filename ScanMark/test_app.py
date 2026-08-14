@@ -527,14 +527,104 @@ class TestBrevoDelivery:
         finally:
             appmod.last_mail_failure['error'] = None
 
+    def _sender_list(self, monkeypatch, status=200, payload=None, boom=None):
+        import mailer
+
+        def fake_get(url, headers=None, timeout=None):
+            if boom:
+                raise boom
+            return _FakeResponse(status, payload if payload is not None
+                                 else {'senders': []})
+
+        monkeypatch.setattr(mailer.requests, 'get', fake_get)
+        return mailer
+
+    def test_a_validated_sender_passes(self, monkeypatch):
+        mailer = self._sender_list(monkeypatch, payload={'senders': [
+            {'email': 'scanmark@example.test', 'active': True}]})
+        verdict, note = mailer.check_sender_validated(self._settings())
+        assert verdict is True
+        assert 'validated' in note
+
+    def test_an_unvalidated_sender_is_caught_before_it_is_sent(self, monkeypatch):
+        """
+        The send endpoint answers 201 and rejects the message afterwards
+        ("Sending has been rejected because the sender you used ... is not
+        valid"), so a successful-looking send reaches nobody.
+        """
+        mailer = self._sender_list(monkeypatch, payload={'senders': [
+            {'email': 'someone.else@example.test', 'active': True}]})
+        verdict, note = mailer.check_sender_validated(self._settings())
+        assert verdict is False
+        assert 'scanmark@example.test' in note
+        assert 'accepted and then rejected' in note
+
+    def test_a_sender_awaiting_its_confirmation_mail_is_caught(self, monkeypatch):
+        mailer = self._sender_list(monkeypatch, payload={'senders': [
+            {'email': 'scanmark@example.test', 'active': False}]})
+        verdict, note = mailer.check_sender_validated(self._settings())
+        assert verdict is False
+        assert 'not active' in note
+
+    def test_a_check_that_cannot_reach_brevo_accuses_nobody(self, monkeypatch):
+        """Unknown must not be reported as a configuration problem."""
+        import requests as requests_module
+
+        mailer = self._sender_list(
+            monkeypatch, boom=requests_module.ConnectionError('down'))
+        verdict, _ = mailer.check_sender_validated(self._settings())
+        assert verdict is None
+
+        mailer = self._sender_list(monkeypatch, status=500, payload={})
+        verdict, _ = mailer.check_sender_validated(self._settings())
+        assert verdict is None
+
+    def test_the_sender_list_is_read_from_the_same_host_as_the_send(self):
+        import mailer
+
+        settings = self._settings(
+            BREVO_API_URL='http://127.0.0.1:2532/v3/smtp/email')
+        assert mailer._senders_endpoint(settings) == \
+            'http://127.0.0.1:2532/v3/senders'
+        assert mailer._senders_endpoint(self._settings()) == \
+            'https://api.brevo.com/v3/senders'
+
+    def test_the_provider_reference_reaches_the_log(self, appmod, monkeypatch,
+                                                    caplog):
+        """
+        'Accepted' is not 'delivered'. When a message is missing from an
+        inbox the next step is Brevo's own log, and finding it there needs
+        the messageId.
+        """
+        import logging
+
+        from flask_mail import Message
+
+        monkeypatch.setattr(appmod, 'MAIL_SETTINGS', self._settings())
+        monkeypatch.setattr(appmod, 'send_via_brevo',
+                            lambda settings, **kwargs: _FakeResponse(
+                                201, {'messageId': '<202608@brevo>'}))
+
+        message = Message('Confirm', recipients=['kemi@student.funaab.edu.ng'],
+                          sender='ScanMark <scanmark@example.test>')
+        message.body = 'link'
+        with caplog.at_level(logging.INFO):
+            appmod.send_async_email(appmod.app, message)
+
+        assert '<202608@brevo>' in caplog.text
+
     def test_a_message_is_routed_by_the_configured_provider(self, appmod,
                                                             monkeypatch):
         from flask_mail import Message
 
         sent = []
+
+        def record(settings, **kwargs):
+            sent.append(kwargs)
+            return _FakeResponse(201, {'messageId': '<x@brevo>'})
+
         monkeypatch.setattr(appmod, 'MAIL_SETTINGS', self._settings())
-        monkeypatch.setattr(appmod, 'send_via_brevo',
-                            lambda settings, **kwargs: sent.append(kwargs))
+        monkeypatch.setattr(appmod, 'send_via_brevo', record)
         monkeypatch.setattr(appmod.mail, 'send', lambda msg: (_ for _ in ()).throw(
             AssertionError('went out over SMTP under brevo')))
 
