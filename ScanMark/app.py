@@ -65,7 +65,7 @@ from models import (
     course_instructors, enrollments,
 )
 from mailconfig import BREVO, resolve_mail_settings
-from mailer import MailSendError, send_via_brevo
+from mailer import MailSendError, describe_key_shape, send_via_brevo
 from performance import BoundedExecutor, InstrumentedQueuePool, runtime_metrics
 from campos_integration import (
     CamposIntegrationError,
@@ -634,6 +634,11 @@ if not MAIL_SETTINGS.is_configured:
     app.logger.warning(
         'Mail is not fully configured (%s) — signup confirmation and '
         'password-reset mail cannot be sent.', mail_config_summary())
+if MAIL_SETTINGS.provider == BREVO:
+    # At boot, rather than at the first signup an hour later.
+    _key_note = describe_key_shape(MAIL_SETTINGS.brevo_api_key)
+    if _key_note:
+        app.logger.warning('BREVO_API_KEY looks wrong.%s', _key_note)
 if MAIL_SETTINGS.password_had_spaces:
     app.logger.warning(
         'MAIL_PASSWORD contained spaces; they were stripped. A Gmail App '
