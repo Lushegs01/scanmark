@@ -58,7 +58,8 @@ The three causes that account for almost all of it:
 | `could not reach ...:587 at all (OSError: [Errno 101] Network is unreachable)` | The host has no route out on that port. Switch to Brevo (above); no SMTP setting will help. |
 | `could not reach ...:587 within 15s` | Reachable but silently dropped. Try 465, or switch to Brevo. |
 | `sender ... refused` | `MAIL_DEFAULT_SENDER` must normally be the mailbox `MAIL_USERNAME` authenticates as. |
-| `Brevo rejected the API key (401)` | `BREVO_API_KEY` is not a valid v3 key, or was truncated when it was pasted. |
+| `Brevo rejected the API key (401)` | Brevo issues **two** credentials from Settings → SMTP & API: the v3 **API key** (`xkeysib-…`, API Keys tab) and the **SMTP key** (`xsmtpsib-…`, SMTP tab). This API only accepts the first; the second gets the same 401 as a key that does not exist. The message names which one is configured. |
+| `Brevo has not activated this account for sending` | An account state, not configuration — finish the account details in the dashboard or ask Brevo support to enable transactional sending. |
 | `Brevo refused the sender ...` | That exact address is not verified in the Brevo dashboard. |
 | `Brevo returned 429 / 402` | The account's sending limit, not a configuration problem. |
 

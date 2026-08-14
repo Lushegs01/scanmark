@@ -438,6 +438,37 @@ class TestBrevoDelivery:
             mailer.send_via_brevo(self._settings(), subject='Hi',
                                   recipients=['a@b.test'], text='body')
         assert 'BREVO_API_KEY' in str(caught.value)
+        # Brevo's own words, not just ours: they separate a key that does not
+        # exist from an account that has not been activated.
+        assert 'Key not found' in str(caught.value)
+
+    def test_an_smtp_key_is_named_as_the_wrong_credential(self, monkeypatch):
+        """Both come off one settings page and only one works on this API."""
+        import mailer
+
+        monkeypatch.setattr(mailer.requests, 'post', lambda *a, **k: _FakeResponse(
+            401, {'message': 'Key not found'}))
+        settings = self._settings(BREVO_API_KEY='xsmtpsib-abc123')
+        with pytest.raises(mailer.MailSendError) as caught:
+            mailer.send_via_brevo(settings, subject='Hi',
+                                  recipients=['a@b.test'], text='body')
+        assert 'SMTP relay key' in str(caught.value)
+
+    def test_an_unactivated_account_is_not_blamed_on_the_key(self, monkeypatch):
+        import mailer
+
+        monkeypatch.setattr(mailer.requests, 'post', lambda *a, **k: _FakeResponse(
+            401, {'message': 'Your account is not yet activated'}))
+        with pytest.raises(mailer.MailSendError) as caught:
+            mailer.send_via_brevo(self._settings(), subject='Hi',
+                                  recipients=['a@b.test'], text='body')
+        assert 'not a configuration problem' in str(caught.value)
+
+    def test_a_v3_key_draws_no_complaint(self):
+        import mailer
+
+        assert mailer.describe_key_shape('xkeysib-abc') == ''
+        assert 'not a v3 API key' in mailer.describe_key_shape('random-string')
 
     def test_an_unverified_sender_says_to_verify_it(self, monkeypatch):
         import mailer

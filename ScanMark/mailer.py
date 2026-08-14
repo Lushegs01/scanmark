@@ -16,6 +16,12 @@ import requests
 #: Overridable only so the tests can point at a local stand-in.
 DEFAULT_BREVO_ENDPOINT = 'https://api.brevo.com/v3/smtp/email'
 
+#: Brevo issues two credentials from one settings page and only one works
+#: here. The SMTP key is for its SMTP relay; this endpoint refuses it with the
+#: same 401 it gives a key that does not exist, so say which one is configured.
+V3_KEY_PREFIX = 'xkeysib-'
+SMTP_KEY_PREFIX = 'xsmtpsib-'
+
 
 class MailSendError(Exception):
     """A send that failed, carrying the one line worth logging."""
@@ -27,15 +33,38 @@ def split_sender(sender):
     return (name or None), (address or None)
 
 
-def _describe_http_failure(status, payload, sender_address):
+def describe_key_shape(api_key):
+    """Say which of Brevo's two credentials BREVO_API_KEY actually holds."""
+    if not api_key or api_key.startswith(V3_KEY_PREFIX):
+        return ''
+    if api_key.startswith(SMTP_KEY_PREFIX):
+        return (f' The configured key starts "{SMTP_KEY_PREFIX}", which is the '
+                f'SMTP relay key — this API needs the v3 key starting '
+                f'"{V3_KEY_PREFIX}" from the API Keys tab.')
+    return (f' The configured key does not start "{V3_KEY_PREFIX}", so it is '
+            f'probably not a v3 API key.')
+
+
+def _describe_http_failure(status, payload, sender_address, api_key=None):
     """Turn Brevo's reply into the sentence that says what to change."""
     message = ''
     if isinstance(payload, dict):
         message = str(payload.get('message') or payload.get('code') or '')
 
-    if status == 401:
-        return ('Brevo rejected the API key (401) — check BREVO_API_KEY is a '
-                'v3 API key from Settings → SMTP & API → API Keys, copied whole')
+    if status in (401, 403):
+        # Brevo's own words separate "this key is not real" from "this account
+        # has not been activated yet", and only the first is worth re-copying
+        # a key over.
+        if 'activat' in message.lower():
+            return (f'Brevo has not activated this account for sending '
+                    f'({status}: {message}) — that is an account state, not a '
+                    f'configuration problem: finish the account details in the '
+                    f'dashboard, or ask Brevo support to enable transactional '
+                    f'sending')
+        return (f'Brevo rejected the API key ({status}: '
+                f'{message or "no message"}).{describe_key_shape(api_key)} '
+                f'Take a v3 key from Settings → SMTP & API → API Keys and set '
+                f'it whole as BREVO_API_KEY')
     if status == 400 and 'sender' in message.lower():
         return (f'Brevo refused the sender {sender_address!r} (400: {message}) '
                 f'— verify that exact address under Senders, Domains & '
@@ -92,7 +121,8 @@ def send_via_brevo(settings, *, subject, recipients, text, html=None,
             body = response.json()
         except ValueError:
             body = {'message': response.text[:200]}
-        raise MailSendError(
-            _describe_http_failure(response.status_code, body, sender_address))
+        raise MailSendError(_describe_http_failure(
+            response.status_code, body, sender_address,
+            api_key=settings.brevo_api_key))
 
     return response
