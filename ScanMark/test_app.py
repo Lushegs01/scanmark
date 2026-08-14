@@ -236,6 +236,140 @@ class TestSignupCannotMintPrivilege:
             appmod.limiter.reset()
 
 
+class _FakeSMTP:
+    """Enough of smtplib.SMTP to see how the connection was opened."""
+
+    opened = {}
+
+    def __init__(self, host, port, timeout=None):
+        type(self).opened = {'host': host, 'port': port, 'timeout': timeout}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def set_debuglevel(self, level):
+        pass
+
+    def ehlo(self):
+        pass
+
+    def starttls(self):
+        pass
+
+    def login(self, username, password):
+        pass
+
+
+class TestMailDelivery:
+    """
+    Mail was configured and nothing arrived, with nothing in the log either
+    way: Flask-Mail passes no timeout, so a filtered SMTP port parks a worker
+    thread on connect forever, and every app.logger.info() was below the
+    inherited WARNING level anyway.
+    """
+
+    def test_port_465_is_implicit_ssl_not_starttls(self):
+        from mailconfig import resolve_mail_settings
+
+        settings = resolve_mail_settings({'MAIL_PORT': '465'})
+        assert settings.use_ssl is True
+        assert settings.use_tls is False, \
+            'STARTTLS on 465 talks plaintext at a server that never answers'
+
+    def test_port_587_negotiates_starttls(self):
+        from mailconfig import resolve_mail_settings
+
+        settings = resolve_mail_settings({'MAIL_PORT': '587'})
+        assert (settings.use_ssl, settings.use_tls) == (False, True)
+
+    def test_an_explicit_setting_beats_the_port(self):
+        from mailconfig import resolve_mail_settings
+
+        settings = resolve_mail_settings({'MAIL_PORT': '465', 'MAIL_USE_SSL': 'false'})
+        assert settings.use_ssl is False
+
+    def test_a_pasted_gmail_app_password_loses_its_spaces(self):
+        from mailconfig import resolve_mail_settings
+
+        settings = resolve_mail_settings({'MAIL_PASSWORD': 'abcd efgh ijkl mnop'})
+        assert settings.password == 'abcdefghijklmnop'
+        assert settings.password_had_spaces is True
+
+    def test_the_config_summary_never_carries_the_password(self):
+        from mailconfig import resolve_mail_settings
+
+        settings = resolve_mail_settings({'MAIL_USERNAME': 'a@b.test',
+                                          'MAIL_PASSWORD': 'sup3rsecret-value'})
+        assert 'sup3rsecret-value' not in repr(settings.summary)
+        assert settings.summary['password_set'] is True
+
+    def test_the_connection_carries_a_timeout(self, appmod, monkeypatch):
+        monkeypatch.setattr(appmod.smtplib, 'SMTP', _FakeSMTP)
+        connection = appmod._TimeoutConnection(appmod.app.extensions['mail'])
+        connection.configure_host()
+        assert _FakeSMTP.opened['timeout'] == appmod.MAIL_TIMEOUT, \
+            'without a timeout an unreachable mail server hangs a worker'
+
+    def test_an_auth_failure_says_what_to_change(self, appmod):
+        import smtplib
+
+        described = appmod._describe_smtp_error(
+            smtplib.SMTPAuthenticationError(535, b'5.7.8 not accepted'))
+        assert 'App Password' in described
+
+    def test_an_unreachable_server_says_what_that_looks_like(self, appmod):
+        described = appmod._describe_smtp_error(TimeoutError('timed out'))
+        assert 'blocks outbound SMTP' in described
+
+    def test_a_failed_send_is_recorded_and_logged_at_error(self, appmod, caplog):
+        import logging
+
+        from flask_mail import Message
+
+        message = Message('Subject', recipients=['someone@example.test'],
+                          sender='scanmark@example.test')
+        message.body = 'body'
+
+        def explode(_msg):
+            raise TimeoutError('timed out')
+
+        original = appmod.mail.send
+        appmod.mail.send = explode
+        try:
+            with caplog.at_level(logging.ERROR):
+                appmod.send_async_email(appmod.app, message)
+        finally:
+            appmod.mail.send = original
+
+        assert 'Email NOT sent' in caplog.text
+        assert appmod.last_mail_failure['error']
+        appmod.last_mail_failure['error'] = None
+        appmod.last_mail_failure['at'] = None
+
+    def test_the_readiness_check_stops_saying_ok_after_a_failure(self, appmod,
+                                                                 monkeypatch):
+        """It reported 'ok' on a reachable server while every send bounced."""
+        monkeypatch.setattr(appmod.smtplib, 'SMTP', _FakeSMTP)
+        monkeypatch.setitem(appmod.app.config, 'MAIL_USERNAME', 'a@b.test')
+        monkeypatch.setitem(appmod.app.config, 'MAIL_USE_SSL', False)
+
+        assert appmod._check_smtp() == 'ok'
+        appmod.last_mail_failure['error'] = 'authentication rejected (535)'
+        try:
+            assert 'last send failed' in appmod._check_smtp()
+        finally:
+            appmod.last_mail_failure['error'] = None
+
+    def test_the_app_logger_actually_emits_info(self, appmod):
+        """Every audit line and 'email sent' line was below the level."""
+        import logging
+
+        assert appmod.app.logger.getEffectiveLevel() <= logging.INFO
+
+
 class TestStaticAssetVersioning:
     """
     A deploy shipped new markup against the previously cached stylesheet, so
