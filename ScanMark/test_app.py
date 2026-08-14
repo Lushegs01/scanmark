@@ -1975,7 +1975,7 @@ class TestInstitutionIsolation:
         the second university to create CSC301 this term was told it already
         existed.
         """
-        from models import db, Course
+        from models import Course
 
         for email in (seed['coordinator_email'],
                       other_institution['coordinator_email']):
