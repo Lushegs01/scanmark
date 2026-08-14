@@ -65,7 +65,8 @@ from models import (
     course_instructors, enrollments,
 )
 from mailconfig import BREVO, resolve_mail_settings
-from mailer import MailSendError, describe_key_shape, send_via_brevo
+from mailer import (MailSendError, check_sender_validated, describe_key_shape,
+                    send_via_brevo)
 from performance import BoundedExecutor, InstrumentedQueuePool, runtime_metrics
 from campos_integration import (
     CamposIntegrationError,
@@ -679,6 +680,30 @@ campos_executor = BoundedExecutor(
 )
 
 
+def _warn_if_sender_is_not_validated():
+    """
+    Say at boot what Brevo would otherwise only say hours later, in its own
+    dashboard: the send endpoint answers 201 and rejects the message
+    afterwards when the sender is not validated, so an unvalidated address
+    logs as a successful send and reaches nobody.
+    """
+    verdict, note = check_sender_validated(MAIL_SETTINGS)
+    if verdict is False:
+        app.logger.warning('Brevo sender problem: %s', note)
+    elif verdict is None:
+        app.logger.info('Brevo sender not checked: %s', note)
+    else:
+        app.logger.info('Brevo sender: %s', note)
+
+
+if MAIL_SETTINGS.provider == BREVO and MAIL_SETTINGS.is_configured:
+    # On the pool, never inline: a boot that waits on somebody else's API is
+    # a boot that a slow API can stall.
+    if os.environ.get('BREVO_SKIP_SENDER_CHECK', '').strip().lower() not in (
+            'true', '1', 'yes', 'on'):
+        account_email_executor.submit(_warn_if_sender_is_not_validated)
+
+
 @atexit.register
 def _shutdown_background_executors():
     # Do not hold process shutdown open for optional outbound work.
@@ -746,9 +771,14 @@ def deliver_message(msg):
 
     Every caller builds a Flask-Mail Message and hands it to the background
     pool; only this function knows there is more than one way out.
+
+    Returns the provider's own reference for the message where there is one.
+    Accepted is not delivered: when a message is missing from an inbox, the
+    next question is always what the provider did with it, and that is a
+    search in their dashboard that needs this id.
     """
     if MAIL_SETTINGS.provider == BREVO:
-        send_via_brevo(
+        response = send_via_brevo(
             MAIL_SETTINGS,
             subject=msg.subject,
             recipients=msg.recipients,
@@ -756,17 +786,23 @@ def deliver_message(msg):
             html=msg.html,
             sender=msg.sender,
         )
-    else:
-        mail.send(msg)
+        try:
+            return (response.json() or {}).get('messageId')
+        except ValueError:
+            return None
+    mail.send(msg)
+    return None
 
 
 def send_async_email(app_instance, msg):
     """Send email asynchronously to avoid blocking"""
     with app_instance.app_context():
         try:
-            deliver_message(msg)
+            reference = deliver_message(msg)
             # Recipients are student addresses — count them, don't print them.
-            app_instance.logger.info('Email sent to %d recipient(s)', len(msg.recipients))
+            app_instance.logger.info(
+                'Email accepted for %d recipient(s)%s', len(msg.recipients),
+                f' (brevo messageId={reference})' if reference else '')
             last_mail_failure['at'] = None
             last_mail_failure['error'] = None
         except Exception as exc:
@@ -798,7 +834,7 @@ def send_email(subject, recipients, text_body, html_body, sender=None):
 def send_welcome_email(user_email, user_name, user_role='student'):
     """
     🚨 SECURITY FIX: Send welcome email WITHOUT password
-    Send welcome email to new FUNAAB user
+    Send welcome email to a new user
     """
     subject = "Welcome to ScanMark!"
 
@@ -842,12 +878,11 @@ Here are your account details:
   Role:        {role_display}
   Signed up:   {signup_date}
 
-You can now log in to ScanMark using your FUNAAB email and the password you created during signup.
+You can now log in to ScanMark using your email address and the password you created during signup.
 
 If you didn't create this account, contact IT support immediately.
 
 — The ScanMark Team
-Federal University of Agriculture, Abeokuta (FUNAAB)
     """.strip()
 
     # HTML version
@@ -960,7 +995,7 @@ Federal University of Agriculture, Abeokuta (FUNAAB)
           <tr>
             <td style="padding:20px 40px;border-top:1px solid #e2e8e2;text-align:center;">
               <p style="margin:0;font-size:12px;color:#999;">
-                <strong>Federal University of Agriculture, Abeokuta (FUNAAB)</strong><br/>
+                <strong>ScanMark</strong><br/>
                 © {local_now().year} ScanMark Attendance System · This is an automated message.
               </p>
             </td>
@@ -1120,11 +1155,46 @@ app.config['REMEMBER_COOKIE_HTTPONLY'] = True
 
 
 # ============================================================
-# FUNAAB EMAIL VALIDATION
+# INSTITUTION EMAIL VALIDATION
 # ============================================================
 
-FUNAAB_DOMAIN = 'funaab.edu.ng'
-STAFF_DOMAIN = '@staff.' + FUNAAB_DOMAIN
+
+def _domain_list(name, default=''):
+    """Read a comma-separated domain list, tolerating '@' and stray dots."""
+    raw = os.environ.get(name)
+    raw = default if raw is None or not raw.strip() else raw
+    return tuple(part.strip().lower().lstrip('@').strip('.')
+                 for part in raw.split(',') if part.strip())
+
+
+#: The institutions this deployment serves, e.g.
+#: "funaab.edu.ng,unilag.edu.ng". EMPTY BY DEFAULT, which accepts any address
+#: under an academic suffix below — a lecturer at another university can sign
+#: up without anyone editing configuration first.
+#:
+#: Set it to lock the deployment to named institutions. That also restores
+#: exact-institution matching, which is what keeps a lookalike domain
+#: ("evilfunaab.edu.ng") out; with no allowlist a lookalike is simply a
+#: different institution, and only the registry restrictions below stand
+#: between it and an account.
+INSTITUTION_DOMAINS = _domain_list('INSTITUTION_DOMAINS')
+
+#: What counts as academic when no allowlist is set. These second-level
+#: domains are registry-restricted to accredited institutions (NiRA vets
+#: .edu.ng, EDUCAUSE vets .edu, Jisc vets .ac.uk), which is the only reason
+#: "any university" can be reasonable rather than "any domain at all".
+ACADEMIC_DOMAIN_SUFFIXES = _domain_list(
+    'ACADEMIC_DOMAIN_SUFFIXES',
+    'edu.ng,edu,ac.ng,ac.uk,ac.za,edu.gh,ac.ke,edu.au,ac.in')
+
+#: The subdomain that marks a staff mailbox: lecturer@staff.<institution>.
+#: Everything else at an institution is a student.
+STAFF_SUBDOMAIN = (os.environ.get('STAFF_SUBDOMAIN') or 'staff').strip().lower()
+STUDENT_SUBDOMAIN = 'student'
+
+#: Accepted, but only ever as a student — a personal mailbox proves nothing
+#: about which institution somebody belongs to, let alone that they teach.
+PERSONAL_EMAIL_DOMAINS = _domain_list('PERSONAL_EMAIL_DOMAINS', 'gmail.com')
 
 # Roles a stranger may hand themselves by filling in the public signup form.
 # The keys are the normalised form the form may submit; the values are the
@@ -1177,6 +1247,29 @@ def validate_password_strength(password):
 
 
 @app.context_processor
+def inject_email_policy():
+    """
+    The signup page classifies an address as you type. It gets the rules from
+    here rather than carrying its own copy, so adding an institution cannot
+    leave the page rejecting an address the server accepts.
+    """
+    return {
+        'accepted_email_text': accepted_email_text(),
+        'email_rules': {
+            'staffSubdomain': STAFF_SUBDOMAIN,
+            'studentSubdomain': STUDENT_SUBDOMAIN,
+            'institutions': list(INSTITUTION_DOMAINS),
+            'academicSuffixes': list(ACADEMIC_DOMAIN_SUFFIXES),
+            'personalDomains': list(PERSONAL_EMAIL_DOMAINS),
+        },
+        'email_placeholder': (
+            f'you@{STUDENT_SUBDOMAIN}.'
+            f'{INSTITUTION_DOMAINS[0] if INSTITUTION_DOMAINS else "yourschool.edu.ng"}'
+        ),
+    }
+
+
+@app.context_processor
 def inject_password_policy():
     """So the signup/reset forms advertise the same rule the server enforces."""
     return {'min_password_length': MIN_PASSWORD_LENGTH,
@@ -1199,9 +1292,63 @@ app.jinja_env.filters['local_time'] = local_time_only
 app.jinja_env.filters['local_date'] = local_date_only
 
 
-def is_valid_funaab_email(email):
+def _domain_matches(domain, allowed):
+    """The domain itself or something under it — never a lookalike.
+
+    'funaab.edu.ng' matches 'funaab.edu.ng' and 'cs.funaab.edu.ng', but not
+    'evilfunaab.edu.ng', which a bare endswith on the address would let past.
     """
-    Check if email is a valid FUNAAB email address OR a standard Gmail.
+    return any(domain == entry or domain.endswith('.' + entry)
+               for entry in allowed)
+
+
+def split_institution_domain(domain):
+    """'staff.gsu.edu.ng' -> ('staff', 'gsu.edu.ng'); 'unilag.edu.ng' -> ('', ...).
+
+    Only the role-bearing labels are stripped. Any other subdomain stays part
+    of the institution, so a department's mail domain still identifies its
+    university.
+    """
+    label, _, rest = domain.partition('.')
+    if rest and label in (STAFF_SUBDOMAIN, STUDENT_SUBDOMAIN):
+        return label, rest
+    return '', domain
+
+
+def institution_for_email(email):
+    """The institution an address belongs to, or None for a personal one.
+
+    Kept derivable rather than stored: an address cannot change institution
+    without becoming a different address.
+    """
+    domain = (email or '').lower().strip().rsplit('@', 1)[-1]
+    if not domain or domain in PERSONAL_EMAIL_DOMAINS:
+        return None
+    return split_institution_domain(domain)[1]
+
+
+def is_staff_email(email):
+    """True for anyone at @{STAFF_SUBDOMAIN}.<institution>, whichever one."""
+    domain = (email or '').lower().strip().rsplit('@', 1)[-1]
+    return split_institution_domain(domain)[0] == STAFF_SUBDOMAIN
+
+
+def accepted_email_text():
+    """The rule in the words the forms show, so page and server cannot drift."""
+    if INSTITUTION_DOMAINS:
+        institutions = ', '.join(f'@{entry}' for entry in INSTITUTION_DOMAINS)
+        return (f"Use your institution address ({institutions}) — staff at "
+                f"@{STAFF_SUBDOMAIN}.<institution> — or a personal "
+                f"{'/'.join(PERSONAL_EMAIL_DOMAINS)} address.")
+    suffixes = ', '.join(f'.{entry}' for entry in ACADEMIC_DOMAIN_SUFFIXES[:4])
+    return (f"Use your university address ({suffixes} and similar) — staff at "
+            f"@{STAFF_SUBDOMAIN}.<university> — or a personal "
+            f"{'/'.join(PERSONAL_EMAIL_DOMAINS)} address.")
+
+
+def is_valid_institution_email(email):
+    """
+    Check an address against the institutions this deployment serves.
 
     Returns (is_valid, message, default_role). The role here is only the
     STARTING point for a self-service signup: a staff address defaults to
@@ -1217,26 +1364,28 @@ def is_valid_funaab_email(email):
         return False, "Invalid email format", None
 
     email = email.lower().strip()
-
     domain = email.rsplit('@', 1)[-1]
 
-    if email.endswith(STAFF_DOMAIN):
-        return True, "Valid email", 'lecturer'
-    # The bare domain AND its subdomains — student.funaab.edu.ng is what most
-    # undergraduates actually hold. Matching on the parsed domain (not a bare
-    # endswith on the whole address) keeps a lookalike like
-    # "evilfunaab.edu.ng" out.
-    if domain == FUNAAB_DOMAIN or domain.endswith('.' + FUNAAB_DOMAIN):
-        return True, "Valid email", 'student'
-    # Gmail is allowed, but strictly as a student.
-    if domain == 'gmail.com':
+    # A personal mailbox says nothing about who somebody teaches, so it is
+    # accepted strictly as a student.
+    if domain in PERSONAL_EMAIL_DOMAINS:
         return True, "Valid email", 'student'
 
-    return False, "Only FUNAAB (@funaab.edu.ng) or Gmail (@gmail.com) addresses are allowed.", None
+    label, institution = split_institution_domain(domain)
 
-def extract_name_from_funaab_email(email):
+    served = (_domain_matches(institution, INSTITUTION_DOMAINS)
+              if INSTITUTION_DOMAINS
+              else _domain_matches(institution, ACADEMIC_DOMAIN_SUFFIXES))
+    if not served:
+        return False, accepted_email_text(), None
+
+    role = 'lecturer' if label == STAFF_SUBDOMAIN else 'student'
+    return True, "Valid email", role
+
+
+def extract_name_from_institution_email(email):
     """
-    Extract name from FUNAAB email (optional helper)
+    Extract name from an institution email (optional helper)
     Example: john.doe@student.funaab.edu.ng -> John Doe
     """
     try:
@@ -2358,8 +2507,8 @@ def authorize_google():
         flash('Google sign-in failed: no confirmed email address.', 'error')
         return redirect(url_for('login'))
 
-    # Validate FUNAAB email
-    is_valid, message, auto_role = is_valid_funaab_email(email)
+    # Validate the address against the institutions we serve
+    is_valid, message, auto_role = is_valid_institution_email(email)
     if not is_valid:
         flash(f'Access Denied: {message}', 'error')
         return redirect(url_for('login'))
@@ -2806,7 +2955,7 @@ def signup():
         if not password:
             return reject('Please enter a password!')
 
-        is_valid, message, auto_role = is_valid_funaab_email(email)
+        is_valid, message, auto_role = is_valid_institution_email(email)
         if not is_valid:
             return reject(message)
 
@@ -2817,7 +2966,7 @@ def signup():
         # Stored in its canonical spelling so nothing downstream has to guess
         # whether this row says 'lecturer' or 'Lecturer'.
         final_role = CANONICAL_ROLE_NAMES.get(normalize_role(auto_role), auto_role)
-        if email.endswith(STAFF_DOMAIN):
+        if is_staff_email(email):
             if not staff_role:
                 return reject('Please select your role (Lecturer or Course Coordinator)')
             final_role = SELF_SERVICE_STAFF_ROLES.get(staff_role.lower())
@@ -2832,7 +2981,7 @@ def signup():
             return reject(password_problem)
 
         if User.query.filter_by(email=email).first():
-            flash('This FUNAAB email is already registered!', 'warning')
+            flash('This email address is already registered!', 'warning')
             return redirect(url_for('login'))
 
         new_user = User(
@@ -2853,7 +3002,7 @@ def signup():
             # Two simultaneous signups for the same address, or a matric number
             # already spoken for by another account.
             db.session.rollback()
-            flash('This FUNAAB email is already registered!', 'warning')
+            flash('This email address is already registered!', 'warning')
             return redirect(url_for('login'))
         except Exception:
             db.session.rollback()
@@ -5708,7 +5857,7 @@ if __name__ == '__main__':
         )
 
     print("\n" + "=" * 60)
-    print("🎓 FUNAAB ATTENDANCE SYSTEM STARTING (development server)")
+    print("🎓 SCANMARK ATTENDANCE SYSTEM STARTING (development server)")
     print("=" * 60)
     print(f"📧 Mail Server: {app.config['MAIL_SERVER']}")
     print("🔐 CSRF Protection: Enabled")

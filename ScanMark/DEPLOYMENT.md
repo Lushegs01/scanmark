@@ -11,6 +11,40 @@ Capacity is accepted only from the staging matrix below.
 | **Redis** (`REDIS_URL`) | Sessions, rate limits, class locations, QR token + attendee-feed + QR-image caches. Production **refuses to boot** without it, and pings it at startup so a broken URL fails immediately rather than on the first request (override: `ALLOW_MISSING_REDIS=true`). Without Redis the pinned classroom lives in one worker's memory, so a scan is geofenced only if it happens to land on the same worker. Provision enough memory and prefer eviction policy `volatile-lru` (or `noeviction`) — arbitrary eviction of session keys logs people out mid-class. |
 | **SMTP** (`MAIL_*`) | Signup confirmation links and password resets. That is all ScanMark sends — nothing goes out during a class, so provider quotas are no longer a capacity concern. Verify the settings with `python mail_selftest.py` (below) rather than by signing up and waiting. |
 
+### Which universities can sign up
+
+ScanMark is not tied to one university. An address is classified from its
+domain:
+
+| Address | Role |
+|---|---|
+| `x@staff.unilag.edu.ng` | staff — then chooses Lecturer or Course Coordinator |
+| `x@student.gsu.edu.ng`, `x@ui.edu.ng`, `x@cs.unn.edu.ng` | student |
+| `x@gmail.com` | student, always — a personal mailbox says nothing about who teaches |
+| `x@staff.example.com` | refused — the `staff.` label alone proves nothing |
+
+By default any domain under an academic suffix is served. Those suffixes are
+registry-restricted to accredited institutions (NiRA vets `.edu.ng`, EDUCAUSE
+vets `.edu`, Jisc vets `.ac.uk`), which is the only reason "any university" is
+reasonable rather than "any domain at all".
+
+**Two things follow from running one instance for several universities, and
+neither is solved by the domain rules:**
+
+1. **A staff address is self-asserted.** Anyone who can receive mail at a
+   `staff.` address of any served institution can create a Lecturer or Course
+   Coordinator account — and staff accounts are not gated on email
+   confirmation (see `REQUIRE_EMAIL_VERIFICATION`). Set `INSTITUTION_DOMAINS`
+   to the universities you actually serve to bound who that can be.
+2. **There is no data isolation between institutions.** Courses, departments
+   and faculties are one shared namespace. A coordinator only ever sees their
+   own courses, but the supervisory roles scope by a free-text department or
+   faculty string — so an HOD of "Computer Science" at one university would
+   see courses filed under "Computer Science" at another. Those roles cannot
+   be self-registered (they come from CampOS or a deliberate database change),
+   so this is latent rather than open, but it needs solving before two
+   universities share an instance in earnest.
+
 ### Choosing how mail leaves
 
 `MAIL_PROVIDER` is `smtp` or `brevo`; unset, it is `brevo` when `BREVO_API_KEY`
@@ -60,6 +94,12 @@ The three causes that account for almost all of it:
 | `sender ... refused` | `MAIL_DEFAULT_SENDER` must normally be the mailbox `MAIL_USERNAME` authenticates as. |
 | `Brevo rejected the API key (401)` | Brevo issues **two** credentials from Settings → SMTP & API: the v3 **API key** (`xkeysib-…`, API Keys tab) and the **SMTP key** (`xsmtpsib-…`, SMTP tab). This API only accepts the first; the second gets the same 401 as a key that does not exist. The message names which one is configured. |
 | `Brevo has not activated this account for sending` | An account state, not configuration — finish the account details in the dashboard or ask Brevo support to enable transactional sending. |
+| `Brevo sender problem: ... does not list ... as a validated sender` (at boot) | The send API answers `201` and rejects the message **afterwards** when the sender is not validated, so this never appears as a send failure. Add the address under Senders, Domains & Dedicated IPs → Senders and open the confirmation mail Brevo sends to it. Set `BREVO_SKIP_SENDER_CHECK=true` to skip the check. |
+
+Note the wording in the log: a send is reported as **accepted**, not delivered,
+and carries Brevo's `messageId`. Anything after acceptance — rejection,
+bounce, spam filing — is visible only in Brevo's Transactional → Logs, and
+that id is how you find the message there.
 | `Brevo refused the sender ...` | That exact address is not verified in the Brevo dashboard. |
 | `Brevo returned 429 / 402` | The account's sending limit, not a configuration problem. |
 
@@ -99,6 +139,10 @@ The three causes that account for almost all of it:
 | `CAMPOS_SSO_REQUIRE_STATE` | true | CampOS callbacks must carry a `state` value this browser was issued (set by `/sso/start`), so a hand-off code cannot be fed to somebody else's browser to sign it into the attacker's account. Turn off only for a CampOS that predates state support. |
 | `REQUIRE_EMAIL_VERIFICATION` | on in production | Self-service **student** signups must click an emailed link before their password works. Lecturers and Course Coordinators are not gated — their account works as soon as it is created (they are still sent the link, but nothing waits on it), because a `@staff` signup is a handful of people known to their department who are needed in front of a class today, while a class is hundreds of self-registered strangers. **Do not turn this off in production** — the link is what stops one of those strangers registering in another student's name. CampOS SSO and Google sign-ins are pre-verified and unaffected. |
 | `MIN_PASSWORD_LENGTH` | 10 | Enforced identically at signup and at password reset. |
+| `INSTITUTION_DOMAINS` | — (any academic domain) | Comma-separated institutions this deployment serves, e.g. `funaab.edu.ng,unilag.edu.ng`. Empty accepts any address under `ACADEMIC_DOMAIN_SUFFIXES`, so another university's staff can sign up with no config change. Setting it also restores exact-institution matching — see "Which universities can sign up" below. |
+| `ACADEMIC_DOMAIN_SUFFIXES` | `edu.ng,edu,ac.ng,ac.uk,ac.za,edu.gh,ac.ke,edu.au,ac.in` | What counts as academic when there is no allowlist. |
+| `STAFF_SUBDOMAIN` | `staff` | The subdomain that makes an address a staff address: `lecturer@staff.<institution>`. Everyone else at an institution signs up as a student. |
+| `PERSONAL_EMAIL_DOMAINS` | `gmail.com` | Accepted, but only ever as a student. |
 | `MAIL_PROVIDER` | `brevo` when `BREVO_API_KEY` is set, else `smtp` | How mail leaves the process. See "Choosing how mail leaves" above — a host that blocks outbound SMTP cannot use `smtp` at any port. |
 | `BREVO_API_KEY` | — | v3 API key. Its presence is what selects Brevo unless `MAIL_PROVIDER` says otherwise. The sender in `MAIL_DEFAULT_SENDER` must be verified in the Brevo dashboard. |
 | `MAIL_PORT` | 587 | 587 negotiates STARTTLS, 465 is implicit SSL. The TLS mode follows the port, so 465 no longer opens a plaintext socket and then asks a server that only speaks TLS for STARTTLS. `MAIL_USE_TLS` / `MAIL_USE_SSL` override it. |

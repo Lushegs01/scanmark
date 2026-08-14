@@ -76,6 +76,62 @@ def _describe_http_failure(status, payload, sender_address, api_key=None):
     return f'Brevo returned {status}: {message or "no message"}'
 
 
+def _senders_endpoint(settings):
+    """The senders list lives beside the send endpoint on the same API."""
+    endpoint = settings.brevo_endpoint or DEFAULT_BREVO_ENDPOINT
+    return endpoint.rsplit('/v3/', 1)[0] + '/v3/senders'
+
+
+def check_sender_validated(settings):
+    """
+    Ask Brevo whether it will actually send from the configured address.
+
+    Worth a round trip because the send endpoint answers 201 and rejects the
+    message afterwards: "Sending has been rejected because the sender you used
+    ... is not valid." Nothing in the send response says so, so an unvalidated
+    sender looks like success in the log and never reaches anyone.
+
+    Returns (verdict, note) where verdict is True, False or None for
+    "could not tell" — a check that cannot reach Brevo must not be reported as
+    a configuration problem.
+    """
+    _, address = split_sender(settings.sender)
+    if not settings.brevo_api_key or not address:
+        return None, 'no API key or sender to check'
+
+    try:
+        response = requests.get(
+            _senders_endpoint(settings),
+            headers={'api-key': settings.brevo_api_key,
+                     'accept': 'application/json'},
+            timeout=settings.timeout,
+        )
+    except requests.RequestException as exc:
+        return None, f'could not ask Brevo ({type(exc).__name__})'
+
+    if response.status_code >= 400:
+        return None, f'Brevo returned {response.status_code} for the sender list'
+
+    try:
+        senders = (response.json() or {}).get('senders') or []
+    except ValueError:
+        return None, 'Brevo sent an unreadable sender list'
+
+    for sender in senders:
+        if str(sender.get('email', '')).lower() == address.lower():
+            if sender.get('active', True):
+                return True, f'{address} is validated'
+            return False, (f'{address} is listed but not active — open the '
+                           f'confirmation mail Brevo sent to it')
+
+    listed = ', '.join(str(s.get('email')) for s in senders[:3]) or 'none'
+    return False, (
+        f'Brevo does not list {address} as a validated sender (it lists: '
+        f'{listed}). Messages will be accepted and then rejected. Add it '
+        f'under Senders, Domains & Dedicated IPs → Senders and open the '
+        f'confirmation mail Brevo sends to that address')
+
+
 def send_via_brevo(settings, *, subject, recipients, text, html=None,
                    sender=None, endpoint=None):
     """

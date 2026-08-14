@@ -36,7 +36,8 @@ def fail(headline, *advice):
 
 def check_brevo(settings, recipient):
     """The HTTP path: no SMTP involved, so there is no port to be blocked."""
-    from mailer import MailSendError, send_via_brevo, split_sender
+    from mailer import (MailSendError, check_sender_validated, send_via_brevo,
+                        split_sender)
 
     if not settings.brevo_api_key:
         return fail("BREVO_API_KEY is not set.",
@@ -51,6 +52,18 @@ def check_brevo(settings, recipient):
     line('sender name', sender_name or '(none)')
     line('sender address', sender_address)
     print()
+
+    # Ask before sending: the send endpoint answers 201 and rejects the
+    # message afterwards, so an unvalidated sender otherwise looks like a
+    # clean pass here and still reaches nobody.
+    print("Checking the sender against Brevo's validated list...")
+    verdict, note = check_sender_validated(settings)
+    if verdict is False:
+        return fail(note,
+                    "Until that is done every message is accepted by the API "
+                    "and then dropped, which is visible only in Brevo's "
+                    "Transactional → Logs.")
+    print(f"   {note}.")
 
     if not recipient:
         print("Pass an address to send a real test message — this provider "

@@ -527,14 +527,104 @@ class TestBrevoDelivery:
         finally:
             appmod.last_mail_failure['error'] = None
 
+    def _sender_list(self, monkeypatch, status=200, payload=None, boom=None):
+        import mailer
+
+        def fake_get(url, headers=None, timeout=None):
+            if boom:
+                raise boom
+            return _FakeResponse(status, payload if payload is not None
+                                 else {'senders': []})
+
+        monkeypatch.setattr(mailer.requests, 'get', fake_get)
+        return mailer
+
+    def test_a_validated_sender_passes(self, monkeypatch):
+        mailer = self._sender_list(monkeypatch, payload={'senders': [
+            {'email': 'scanmark@example.test', 'active': True}]})
+        verdict, note = mailer.check_sender_validated(self._settings())
+        assert verdict is True
+        assert 'validated' in note
+
+    def test_an_unvalidated_sender_is_caught_before_it_is_sent(self, monkeypatch):
+        """
+        The send endpoint answers 201 and rejects the message afterwards
+        ("Sending has been rejected because the sender you used ... is not
+        valid"), so a successful-looking send reaches nobody.
+        """
+        mailer = self._sender_list(monkeypatch, payload={'senders': [
+            {'email': 'someone.else@example.test', 'active': True}]})
+        verdict, note = mailer.check_sender_validated(self._settings())
+        assert verdict is False
+        assert 'scanmark@example.test' in note
+        assert 'accepted and then rejected' in note
+
+    def test_a_sender_awaiting_its_confirmation_mail_is_caught(self, monkeypatch):
+        mailer = self._sender_list(monkeypatch, payload={'senders': [
+            {'email': 'scanmark@example.test', 'active': False}]})
+        verdict, note = mailer.check_sender_validated(self._settings())
+        assert verdict is False
+        assert 'not active' in note
+
+    def test_a_check_that_cannot_reach_brevo_accuses_nobody(self, monkeypatch):
+        """Unknown must not be reported as a configuration problem."""
+        import requests as requests_module
+
+        mailer = self._sender_list(
+            monkeypatch, boom=requests_module.ConnectionError('down'))
+        verdict, _ = mailer.check_sender_validated(self._settings())
+        assert verdict is None
+
+        mailer = self._sender_list(monkeypatch, status=500, payload={})
+        verdict, _ = mailer.check_sender_validated(self._settings())
+        assert verdict is None
+
+    def test_the_sender_list_is_read_from_the_same_host_as_the_send(self):
+        import mailer
+
+        settings = self._settings(
+            BREVO_API_URL='http://127.0.0.1:2532/v3/smtp/email')
+        assert mailer._senders_endpoint(settings) == \
+            'http://127.0.0.1:2532/v3/senders'
+        assert mailer._senders_endpoint(self._settings()) == \
+            'https://api.brevo.com/v3/senders'
+
+    def test_the_provider_reference_reaches_the_log(self, appmod, monkeypatch,
+                                                    caplog):
+        """
+        'Accepted' is not 'delivered'. When a message is missing from an
+        inbox the next step is Brevo's own log, and finding it there needs
+        the messageId.
+        """
+        import logging
+
+        from flask_mail import Message
+
+        monkeypatch.setattr(appmod, 'MAIL_SETTINGS', self._settings())
+        monkeypatch.setattr(appmod, 'send_via_brevo',
+                            lambda settings, **kwargs: _FakeResponse(
+                                201, {'messageId': '<202608@brevo>'}))
+
+        message = Message('Confirm', recipients=['kemi@student.funaab.edu.ng'],
+                          sender='ScanMark <scanmark@example.test>')
+        message.body = 'link'
+        with caplog.at_level(logging.INFO):
+            appmod.send_async_email(appmod.app, message)
+
+        assert '<202608@brevo>' in caplog.text
+
     def test_a_message_is_routed_by_the_configured_provider(self, appmod,
                                                             monkeypatch):
         from flask_mail import Message
 
         sent = []
+
+        def record(settings, **kwargs):
+            sent.append(kwargs)
+            return _FakeResponse(201, {'messageId': '<x@brevo>'})
+
         monkeypatch.setattr(appmod, 'MAIL_SETTINGS', self._settings())
-        monkeypatch.setattr(appmod, 'send_via_brevo',
-                            lambda settings, **kwargs: sent.append(kwargs))
+        monkeypatch.setattr(appmod, 'send_via_brevo', record)
         monkeypatch.setattr(appmod.mail, 'send', lambda msg: (_ for _ in ()).throw(
             AssertionError('went out over SMTP under brevo')))
 
@@ -844,22 +934,82 @@ class TestEmailDomainRules:
         ('b@student.funaab.edu.ng', 'student'),      # the address most students hold
         ('c@gmail.com', 'student'),
         ('d@staff.funaab.edu.ng', 'lecturer'),
+        # ScanMark is not one university's. Another institution's addresses
+        # are accepted on the same rules, with no configuration to edit.
+        ('e@staff.unilag.edu.ng', 'lecturer'),
+        ('f@student.gsu.edu.ng', 'student'),
+        ('g@ui.edu.ng', 'student'),
+        ('h@staff.cs.unn.edu.ng', 'lecturer'),       # a department's mail domain
+        ('i@staff.ox.ac.uk', 'lecturer'),
     ])
     def test_accepted_domains(self, appmod, email, role):
-        valid, _message, default_role = appmod.is_valid_funaab_email(email)
+        valid, _message, default_role = appmod.is_valid_institution_email(email)
         assert valid is True
         assert default_role == role
 
     @pytest.mark.parametrize('email', [
-        'e@evilfunaab.edu.ng',        # lookalike domain
-        'f@funaab.edu.ng.attacker.com',
+        'f@funaab.edu.ng.attacker.com',   # the university name in a domain someone else owns
         'g@example.com',
+        'h@staff.example.com',            # the staff label alone proves nothing
+        'i@gmail.com.attacker.net',
         'not-an-email',
         '',
     ])
     def test_rejected_domains(self, appmod, email):
-        valid, _message, _role = appmod.is_valid_funaab_email(email)
+        valid, _message, _role = appmod.is_valid_institution_email(email)
         assert valid is False
+
+    def test_a_personal_address_can_never_be_staff(self, appmod):
+        """Anyone can hold one, so it carries no claim about teaching."""
+        valid, _message, role = appmod.is_valid_institution_email('x@gmail.com')
+        assert (valid, role) == (True, 'student')
+
+    def test_the_institution_is_derived_from_the_address(self, appmod):
+        assert appmod.institution_for_email('a@staff.unilag.edu.ng') == 'unilag.edu.ng'
+        assert appmod.institution_for_email('b@student.funaab.edu.ng') == 'funaab.edu.ng'
+        assert appmod.institution_for_email('c@cs.unn.edu.ng') == 'cs.unn.edu.ng'
+        assert appmod.institution_for_email('d@gmail.com') is None
+
+
+class TestInstitutionAllowlist:
+    """
+    A deployment that serves named universities sets INSTITUTION_DOMAINS, and
+    that is what restores exact-institution matching: with no allowlist a
+    lookalike domain is simply a different institution.
+    """
+
+    def _validate(self, appmod, monkeypatch, email, allowlist):
+        monkeypatch.setattr(appmod, 'INSTITUTION_DOMAINS', allowlist)
+        return appmod.is_valid_institution_email(email)
+
+    @pytest.mark.parametrize('email,role', [
+        ('a@funaab.edu.ng', 'student'),
+        ('b@staff.funaab.edu.ng', 'lecturer'),
+        ('c@cs.funaab.edu.ng', 'student'),     # a subdomain of a served institution
+        ('d@staff.unilag.edu.ng', 'lecturer'),
+    ])
+    def test_a_served_institution_is_accepted(self, appmod, monkeypatch, email, role):
+        valid, _message, default_role = self._validate(
+            appmod, monkeypatch, email, ('funaab.edu.ng', 'unilag.edu.ng'))
+        assert valid is True
+        assert default_role == role
+
+    @pytest.mark.parametrize('email', [
+        'e@evilfunaab.edu.ng',            # the lookalike the allowlist exists to stop
+        'f@staff.evilfunaab.edu.ng',
+        'g@ui.edu.ng',                    # academic, but not a university we serve
+    ])
+    def test_everything_else_is_refused(self, appmod, monkeypatch, email):
+        valid, message, _role = self._validate(
+            appmod, monkeypatch, email, ('funaab.edu.ng', 'unilag.edu.ng'))
+        assert valid is False
+        assert message
+
+    def test_a_personal_address_still_works(self, appmod, monkeypatch):
+        """Locking to institutions must not lock out the Gmail signups."""
+        valid, _message, role = self._validate(
+            appmod, monkeypatch, 'h@gmail.com', ('funaab.edu.ng',))
+        assert (valid, role) == (True, 'student')
 
 
 # ============================================================
