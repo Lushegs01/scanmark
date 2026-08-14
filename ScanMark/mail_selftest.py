@@ -34,6 +34,49 @@ def fail(headline, *advice):
     return 1
 
 
+def check_brevo(settings, recipient):
+    """The HTTP path: no SMTP involved, so there is no port to be blocked."""
+    from mailer import MailSendError, send_via_brevo, split_sender
+
+    if not settings.brevo_api_key:
+        return fail("BREVO_API_KEY is not set.",
+                    "MAIL_PROVIDER=brevo needs the v3 API key from "
+                    "Settings → SMTP & API → API Keys.")
+
+    sender_name, sender_address = split_sender(settings.sender)
+    if not sender_address:
+        return fail("MAIL_DEFAULT_SENDER has no address in it.",
+                    'Use either "you@example.com" or "ScanMark '
+                    '<you@example.com>".')
+    line('sender name', sender_name or '(none)')
+    line('sender address', sender_address)
+    print()
+
+    if not recipient:
+        print("Pass an address to send a real test message — this provider "
+              "is only\nproved by sending, since there is no connection to "
+              "open first:")
+        print("    python mail_selftest.py you@example.com")
+        return 0
+
+    print(f"Sending through Brevo to {recipient}...")
+    try:
+        send_via_brevo(
+            settings,
+            subject='ScanMark mail self-test',
+            recipients=[recipient],
+            text=('If you are reading this, ScanMark can send mail: '
+                  'confirmation links and password resets will arrive the '
+                  'same way.'),
+        )
+    except MailSendError as exc:
+        return fail(str(exc))
+
+    print("\n✓ Accepted by Brevo. Check that inbox (and its spam folder).")
+    print("  Delivery is also visible in the Brevo dashboard under Logs.")
+    return 0
+
+
 def main(argv):
     recipient = argv[1] if len(argv) > 1 else None
     settings = resolve_mail_settings()
@@ -44,9 +87,12 @@ def main(argv):
         line(label, value)
     if settings.password_had_spaces:
         line('note', 'MAIL_PASSWORD had spaces; they were stripped')
-    if settings.password:
+    if settings.password and settings.uses_smtp:
         line('password length', f'{len(settings.password)} characters')
     print()
+
+    if not settings.uses_smtp:
+        return check_brevo(settings, recipient)
 
     if not settings.username or not settings.password:
         return fail(

@@ -11,6 +11,30 @@ Capacity is accepted only from the staging matrix below.
 | **Redis** (`REDIS_URL`) | Sessions, rate limits, class locations, QR token + attendee-feed + QR-image caches. Production **refuses to boot** without it, and pings it at startup so a broken URL fails immediately rather than on the first request (override: `ALLOW_MISSING_REDIS=true`). Without Redis the pinned classroom lives in one worker's memory, so a scan is geofenced only if it happens to land on the same worker. Provision enough memory and prefer eviction policy `volatile-lru` (or `noeviction`) — arbitrary eviction of session keys logs people out mid-class. |
 | **SMTP** (`MAIL_*`) | Signup confirmation links and password resets. That is all ScanMark sends — nothing goes out during a class, so provider quotas are no longer a capacity concern. Verify the settings with `python mail_selftest.py` (below) rather than by signing up and waiting. |
 
+### Choosing how mail leaves
+
+`MAIL_PROVIDER` is `smtp` or `brevo`; unset, it is `brevo` when `BREVO_API_KEY`
+is set and `smtp` otherwise.
+
+**Some hosts do not let SMTP out at all.** On Render's free instances the
+connection to `smtp.gmail.com:587` fails with `[Errno 101] Network is
+unreachable` — there is no route, so nothing about the credentials matters and
+no SMTP setting can fix it. Brevo's HTTP API goes over HTTPS on 443, which a
+PaaS always leaves open.
+
+To use it: create a Brevo account, verify the sender address under **Senders,
+Domains & Dedicated IPs**, take a v3 key from **Settings → SMTP & API → API
+Keys**, and set
+
+```
+BREVO_API_KEY=xkeysib-...
+MAIL_DEFAULT_SENDER="ScanMark <the-verified-address>"
+```
+
+`MAIL_*` SMTP settings can stay; they are simply not used. Nothing else in the
+app changes — every message still goes through the same background pool, so
+sending stays off the request path.
+
 ### When mail does not arrive
 
 Configured is not the same as working, and a send fails in the background
@@ -31,8 +55,12 @@ The three causes that account for almost all of it:
 | What you see | Cause |
 |---|---|
 | `authentication rejected (535)` | Gmail needs a 16-character **App Password** from an account with 2-Step Verification on; the account password has not worked since 2022. |
-| `could not reach ...:587 within 15s` | Something between the app and the server drops outbound SMTP — many hosting plans do. Try 465, or send through an HTTP email API instead. |
+| `could not reach ...:587 at all (OSError: [Errno 101] Network is unreachable)` | The host has no route out on that port. Switch to Brevo (above); no SMTP setting will help. |
+| `could not reach ...:587 within 15s` | Reachable but silently dropped. Try 465, or switch to Brevo. |
 | `sender ... refused` | `MAIL_DEFAULT_SENDER` must normally be the mailbox `MAIL_USERNAME` authenticates as. |
+| `Brevo rejected the API key (401)` | `BREVO_API_KEY` is not a valid v3 key, or was truncated when it was pasted. |
+| `Brevo refused the sender ...` | That exact address is not verified in the Brevo dashboard. |
+| `Brevo returned 429 / 402` | The account's sending limit, not a configuration problem. |
 
 ## Environment variables
 
@@ -70,6 +98,8 @@ The three causes that account for almost all of it:
 | `CAMPOS_SSO_REQUIRE_STATE` | true | CampOS callbacks must carry a `state` value this browser was issued (set by `/sso/start`), so a hand-off code cannot be fed to somebody else's browser to sign it into the attacker's account. Turn off only for a CampOS that predates state support. |
 | `REQUIRE_EMAIL_VERIFICATION` | on in production | Self-service **student** signups must click an emailed link before their password works. Lecturers and Course Coordinators are not gated — their account works as soon as it is created (they are still sent the link, but nothing waits on it), because a `@staff` signup is a handful of people known to their department who are needed in front of a class today, while a class is hundreds of self-registered strangers. **Do not turn this off in production** — the link is what stops one of those strangers registering in another student's name. CampOS SSO and Google sign-ins are pre-verified and unaffected. |
 | `MIN_PASSWORD_LENGTH` | 10 | Enforced identically at signup and at password reset. |
+| `MAIL_PROVIDER` | `brevo` when `BREVO_API_KEY` is set, else `smtp` | How mail leaves the process. See "Choosing how mail leaves" above — a host that blocks outbound SMTP cannot use `smtp` at any port. |
+| `BREVO_API_KEY` | — | v3 API key. Its presence is what selects Brevo unless `MAIL_PROVIDER` says otherwise. The sender in `MAIL_DEFAULT_SENDER` must be verified in the Brevo dashboard. |
 | `MAIL_PORT` | 587 | 587 negotiates STARTTLS, 465 is implicit SSL. The TLS mode follows the port, so 465 no longer opens a plaintext socket and then asks a server that only speaks TLS for STARTTLS. `MAIL_USE_TLS` / `MAIL_USE_SSL` override it. |
 | `MAIL_TIMEOUT` | 15 | Seconds to wait on the mail server. Flask-Mail passes no timeout to smtplib, so without this a host that filters outbound SMTP parks a worker thread on connect indefinitely; four of those and every later message queues and then drops, with nothing in the log because nothing ever failed. |
 | `LOG_LEVEL` | INFO | Level for the app logger. Flask inherits WARNING from the root logger unless something sets it, which silenced the audit trail, the sampled scan telemetry, and every "email sent" line. |

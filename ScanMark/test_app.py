@@ -352,9 +352,12 @@ class TestMailDelivery:
     def test_the_readiness_check_stops_saying_ok_after_a_failure(self, appmod,
                                                                  monkeypatch):
         """It reported 'ok' on a reachable server while every send bounced."""
+        from mailconfig import resolve_mail_settings
+
         monkeypatch.setattr(appmod.smtplib, 'SMTP', _FakeSMTP)
-        monkeypatch.setitem(appmod.app.config, 'MAIL_USERNAME', 'a@b.test')
-        monkeypatch.setitem(appmod.app.config, 'MAIL_USE_SSL', False)
+        monkeypatch.setattr(appmod, 'MAIL_SETTINGS', resolve_mail_settings({
+            'MAIL_SERVER': '127.0.0.1', 'MAIL_PORT': '2525',
+            'MAIL_USERNAME': 'a@b.test', 'MAIL_PASSWORD': 'secret-1234'}))
 
         assert appmod._check_smtp() == 'ok'
         appmod.last_mail_failure['error'] = 'authentication rejected (535)'
@@ -368,6 +371,149 @@ class TestMailDelivery:
         import logging
 
         assert appmod.app.logger.getEffectiveLevel() <= logging.INFO
+
+
+class _FakeResponse:
+    def __init__(self, status_code, payload):
+        self.status_code = status_code
+        self._payload = payload
+        self.text = str(payload)
+
+    def json(self):
+        return self._payload
+
+
+class TestBrevoDelivery:
+    """
+    Render has no route to smtp.gmail.com at all — the connection dies with
+    ENETUNREACH before a single SMTP verb — so mail leaves over HTTPS instead.
+    """
+
+    def _settings(self, **overrides):
+        from mailconfig import resolve_mail_settings
+
+        environ = {'BREVO_API_KEY': 'xkeysib-test',
+                   'MAIL_DEFAULT_SENDER': 'ScanMark <scanmark@example.test>'}
+        environ.update(overrides)
+        return resolve_mail_settings(environ)
+
+    def test_a_configured_key_selects_brevo(self):
+        assert self._settings().provider == 'brevo'
+        assert self._settings().uses_smtp is False
+
+    def test_smtp_stays_the_default_without_a_key(self):
+        from mailconfig import resolve_mail_settings
+
+        assert resolve_mail_settings({}).provider == 'smtp'
+
+    def test_the_provider_can_be_named_outright(self):
+        assert self._settings(MAIL_PROVIDER='smtp').provider == 'smtp'
+
+    def test_a_display_name_sender_is_split_for_the_api(self, monkeypatch):
+        import mailer
+
+        captured = {}
+
+        def fake_post(url, json=None, headers=None, timeout=None):
+            captured.update(url=url, body=json, headers=headers)
+            return _FakeResponse(201, {'messageId': '<x@brevo>'})
+
+        monkeypatch.setattr(mailer.requests, 'post', fake_post)
+        mailer.send_via_brevo(self._settings(), subject='Hi',
+                              recipients=['kemi@student.funaab.edu.ng'],
+                              text='body', html='<p>body</p>')
+
+        assert captured['body']['sender'] == {'email': 'scanmark@example.test',
+                                              'name': 'ScanMark'}
+        assert captured['body']['to'] == [{'email': 'kemi@student.funaab.edu.ng'}]
+        assert captured['body']['htmlContent'] == '<p>body</p>'
+        assert captured['headers']['api-key'] == 'xkeysib-test'
+
+    def test_a_rejected_key_says_which_key(self, monkeypatch):
+        import mailer
+
+        monkeypatch.setattr(mailer.requests, 'post', lambda *a, **k: _FakeResponse(
+            401, {'message': 'Key not found'}))
+        with pytest.raises(mailer.MailSendError) as caught:
+            mailer.send_via_brevo(self._settings(), subject='Hi',
+                                  recipients=['a@b.test'], text='body')
+        assert 'BREVO_API_KEY' in str(caught.value)
+
+    def test_an_unverified_sender_says_to_verify_it(self, monkeypatch):
+        import mailer
+
+        monkeypatch.setattr(mailer.requests, 'post', lambda *a, **k: _FakeResponse(
+            400, {'message': 'sender email is not valid or not verified'}))
+        with pytest.raises(mailer.MailSendError) as caught:
+            mailer.send_via_brevo(self._settings(), subject='Hi',
+                                  recipients=['a@b.test'], text='body')
+        assert 'scanmark@example.test' in str(caught.value)
+
+    def test_a_quota_refusal_is_not_blamed_on_configuration(self, monkeypatch):
+        import mailer
+
+        monkeypatch.setattr(mailer.requests, 'post', lambda *a, **k: _FakeResponse(
+            429, {'message': 'daily limit reached'}))
+        with pytest.raises(mailer.MailSendError) as caught:
+            mailer.send_via_brevo(self._settings(), subject='Hi',
+                                  recipients=['a@b.test'], text='body')
+        assert 'not a configuration problem' in str(caught.value)
+
+    def test_the_send_carries_a_timeout(self, monkeypatch):
+        """The reason SMTP hung a worker; not repeating it over HTTP."""
+        import mailer
+
+        captured = {}
+
+        def fake_post(url, json=None, headers=None, timeout=None):
+            captured['timeout'] = timeout
+            return _FakeResponse(201, {})
+
+        monkeypatch.setattr(mailer.requests, 'post', fake_post)
+        settings = self._settings(MAIL_TIMEOUT='9')
+        mailer.send_via_brevo(settings, subject='Hi', recipients=['a@b.test'],
+                              text='body')
+        assert captured['timeout'] == 9.0
+
+    def test_the_summary_never_carries_the_api_key(self):
+        summary = self._settings().summary
+        assert 'xkeysib-test' not in repr(summary)
+        assert summary['api_key_set'] is True
+
+    def test_the_readiness_check_opens_no_smtp_socket(self, appmod, monkeypatch):
+        """There is no SMTP server to reach; probing one would be a lie."""
+        def explode(*args, **kwargs):
+            raise AssertionError('opened an SMTP connection under brevo')
+
+        monkeypatch.setattr(appmod.smtplib, 'SMTP', explode)
+        monkeypatch.setattr(appmod.smtplib, 'SMTP_SSL', explode)
+        monkeypatch.setattr(appmod, 'MAIL_SETTINGS', self._settings())
+
+        assert appmod._check_smtp() == 'ok (brevo)'
+        appmod.last_mail_failure['error'] = 'Brevo rejected the API key (401)'
+        try:
+            assert 'last send failed' in appmod._check_smtp()
+        finally:
+            appmod.last_mail_failure['error'] = None
+
+    def test_a_message_is_routed_by_the_configured_provider(self, appmod,
+                                                            monkeypatch):
+        from flask_mail import Message
+
+        sent = []
+        monkeypatch.setattr(appmod, 'MAIL_SETTINGS', self._settings())
+        monkeypatch.setattr(appmod, 'send_via_brevo',
+                            lambda settings, **kwargs: sent.append(kwargs))
+        monkeypatch.setattr(appmod.mail, 'send', lambda msg: (_ for _ in ()).throw(
+            AssertionError('went out over SMTP under brevo')))
+
+        message = Message('Confirm', recipients=['kemi@student.funaab.edu.ng'],
+                          sender='ScanMark <scanmark@example.test>')
+        message.body = 'link'
+        appmod.deliver_message(message)
+
+        assert sent and sent[0]['recipients'] == ['kemi@student.funaab.edu.ng']
+        assert sent[0]['subject'] == 'Confirm'
 
 
 class TestStaticAssetVersioning:
