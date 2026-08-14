@@ -934,22 +934,82 @@ class TestEmailDomainRules:
         ('b@student.funaab.edu.ng', 'student'),      # the address most students hold
         ('c@gmail.com', 'student'),
         ('d@staff.funaab.edu.ng', 'lecturer'),
+        # ScanMark is not one university's. Another institution's addresses
+        # are accepted on the same rules, with no configuration to edit.
+        ('e@staff.unilag.edu.ng', 'lecturer'),
+        ('f@student.gsu.edu.ng', 'student'),
+        ('g@ui.edu.ng', 'student'),
+        ('h@staff.cs.unn.edu.ng', 'lecturer'),       # a department's mail domain
+        ('i@staff.ox.ac.uk', 'lecturer'),
     ])
     def test_accepted_domains(self, appmod, email, role):
-        valid, _message, default_role = appmod.is_valid_funaab_email(email)
+        valid, _message, default_role = appmod.is_valid_institution_email(email)
         assert valid is True
         assert default_role == role
 
     @pytest.mark.parametrize('email', [
-        'e@evilfunaab.edu.ng',        # lookalike domain
-        'f@funaab.edu.ng.attacker.com',
+        'f@funaab.edu.ng.attacker.com',   # the university name in a domain someone else owns
         'g@example.com',
+        'h@staff.example.com',            # the staff label alone proves nothing
+        'i@gmail.com.attacker.net',
         'not-an-email',
         '',
     ])
     def test_rejected_domains(self, appmod, email):
-        valid, _message, _role = appmod.is_valid_funaab_email(email)
+        valid, _message, _role = appmod.is_valid_institution_email(email)
         assert valid is False
+
+    def test_a_personal_address_can_never_be_staff(self, appmod):
+        """Anyone can hold one, so it carries no claim about teaching."""
+        valid, _message, role = appmod.is_valid_institution_email('x@gmail.com')
+        assert (valid, role) == (True, 'student')
+
+    def test_the_institution_is_derived_from_the_address(self, appmod):
+        assert appmod.institution_for_email('a@staff.unilag.edu.ng') == 'unilag.edu.ng'
+        assert appmod.institution_for_email('b@student.funaab.edu.ng') == 'funaab.edu.ng'
+        assert appmod.institution_for_email('c@cs.unn.edu.ng') == 'cs.unn.edu.ng'
+        assert appmod.institution_for_email('d@gmail.com') is None
+
+
+class TestInstitutionAllowlist:
+    """
+    A deployment that serves named universities sets INSTITUTION_DOMAINS, and
+    that is what restores exact-institution matching: with no allowlist a
+    lookalike domain is simply a different institution.
+    """
+
+    def _validate(self, appmod, monkeypatch, email, allowlist):
+        monkeypatch.setattr(appmod, 'INSTITUTION_DOMAINS', allowlist)
+        return appmod.is_valid_institution_email(email)
+
+    @pytest.mark.parametrize('email,role', [
+        ('a@funaab.edu.ng', 'student'),
+        ('b@staff.funaab.edu.ng', 'lecturer'),
+        ('c@cs.funaab.edu.ng', 'student'),     # a subdomain of a served institution
+        ('d@staff.unilag.edu.ng', 'lecturer'),
+    ])
+    def test_a_served_institution_is_accepted(self, appmod, monkeypatch, email, role):
+        valid, _message, default_role = self._validate(
+            appmod, monkeypatch, email, ('funaab.edu.ng', 'unilag.edu.ng'))
+        assert valid is True
+        assert default_role == role
+
+    @pytest.mark.parametrize('email', [
+        'e@evilfunaab.edu.ng',            # the lookalike the allowlist exists to stop
+        'f@staff.evilfunaab.edu.ng',
+        'g@ui.edu.ng',                    # academic, but not a university we serve
+    ])
+    def test_everything_else_is_refused(self, appmod, monkeypatch, email):
+        valid, message, _role = self._validate(
+            appmod, monkeypatch, email, ('funaab.edu.ng', 'unilag.edu.ng'))
+        assert valid is False
+        assert message
+
+    def test_a_personal_address_still_works(self, appmod, monkeypatch):
+        """Locking to institutions must not lock out the Gmail signups."""
+        valid, _message, role = self._validate(
+            appmod, monkeypatch, 'h@gmail.com', ('funaab.edu.ng',))
+        assert (valid, role) == (True, 'student')
 
 
 # ============================================================

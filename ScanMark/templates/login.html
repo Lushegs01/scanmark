@@ -9,7 +9,7 @@
             <div class="auth-hero d-none d-lg-block">
                 <div class="accent-line"></div>
                 <h1 class="page-title auth-title">
-                    Smart Attendance<br>for <span style="color: var(--gold);">FUNAAB</span>
+                    Smart Attendance<br>for <span style="color: var(--gold);">campus</span>
                 </h1>
                 <p class="page-subtitle auth-lede">
                     No more paper lists. No more queueing. Secure,
@@ -76,7 +76,7 @@
                         <div class="auth-field">
                             <label class="form-label" for="emailInput">Email Address</label>
                             <input type="email" name="email" id="emailInput" class="form-control"
-                                placeholder="student@funaab.edu.ng or @gmail.com"
+                                placeholder="{{ email_placeholder }}"
                                 value="{{ unverified_email or '' }}" autocomplete="email" required>
                         </div>
 

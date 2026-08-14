@@ -22,8 +22,8 @@
                             <i class="fas fa-envelope"></i>
                         </span>
                         <div>
-                            <p class="auth-feature-title">FUNAAB or Gmail required</p>
-                            <p class="auth-feature-text">Use @student, @staff, @funaab.edu.ng, or @gmail.com</p>
+                            <p class="auth-feature-title">University or Gmail address</p>
+                            <p class="auth-feature-text">{{ accepted_email_text }}</p>
                         </div>
                     </li>
                     <li class="auth-feature">
@@ -54,7 +54,7 @@
                     <div class="auth-card-head">
                         <i class="fas fa-user-plus auth-card-icon"></i>
                         <h2 class="page-title auth-card-title">Create Account</h2>
-                        <p class="page-subtitle">Fill in your FUNAAB or Gmail details to get started</p>
+                        <p class="page-subtitle">Fill in your university or Gmail details to get started</p>
                     </div>
 
                     <!-- Google Sign-Up -->
@@ -83,7 +83,7 @@
                         <div class="auth-field">
                             <label class="form-label" for="emailInput">Email Address</label>
                             <input type="email" name="email" id="emailInput" class="form-control"
-                                placeholder="student@funaab.edu.ng or @gmail.com" autocomplete="email" required>
+                                placeholder="{{ email_placeholder }}" autocomplete="email" required>
                             <small class="field-hint" id="emailHelp">
                                 Your role is detected from your email domain.
                             </small>
@@ -210,40 +210,80 @@
         confirmNoteText.textContent = STUDENT_NOTE;
     }
 
+    // The server's rules, rendered in rather than restated here: adding an
+    // institution must not leave this page rejecting an address the server
+    // takes. Mirrors is_valid_institution_email().
+    const EMAIL_RULES = {{ email_rules | tojson }};
+    const ACCEPTED_EMAIL_TEXT = {{ accepted_email_text | tojson }};
+
+    function underOneOf(domain, entries) {
+        return entries.some(entry => domain === entry || domain.endsWith('.' + entry));
+    }
+
+    /** null when there is nothing to judge yet; otherwise {role, institution}. */
+    function classify(email) {
+        const at = email.lastIndexOf('@');
+        if (at < 0) return null;
+        const domain = email.slice(at + 1);
+        if (!domain.includes('.')) return null;   // still typing the domain
+
+        if (EMAIL_RULES.personalDomains.includes(domain)) {
+            return { role: 'student', personal: true };
+        }
+
+        const dot = domain.indexOf('.');
+        const label = domain.slice(0, dot);
+        const isRoleLabel = label === EMAIL_RULES.staffSubdomain ||
+                            label === EMAIL_RULES.studentSubdomain;
+        const institution = isRoleLabel ? domain.slice(dot + 1) : domain;
+
+        const served = EMAIL_RULES.institutions.length
+            ? underOneOf(institution, EMAIL_RULES.institutions)
+            : underOneOf(institution, EMAIL_RULES.academicSuffixes);
+        if (!served) return { role: null, institution: institution };
+
+        return {
+            role: label === EMAIL_RULES.staffSubdomain ? 'staff' : 'student',
+            institution: institution
+        };
+    }
+
     emailInput.addEventListener('input', function () {
         const email = this.value.toLowerCase().trim();
+        const verdict = classify(email);
 
-        if (email.includes('@student.funaab.edu.ng')) {
-            applyStudent('<span class="badge bg-primary">Student</span>',
-                         '✓ Valid FUNAAB student email');
-        } else if (email.includes('@staff.funaab.edu.ng')) {
-            detectedRoleDiv.innerHTML = '<span class="badge bg-warning text-dark">Staff Member</span>';
-            roleField.value = 'lecturer';
-            studentFields.hidden = true;
-            staffRoleSelector.hidden = false;
-            staffRoleInput.required = true;
-            setHint('✓ Valid FUNAAB staff email — please select your role below', 'is-valid');
-            confirmNoteText.textContent = STAFF_NOTE;
-        } else if (email.endsWith('@funaab.edu.ng')) {
-            applyStudent('<span class="badge bg-info text-dark">Student (General)</span>',
-                         '✓ Valid FUNAAB email');
-        } else if (email.endsWith('@gmail.com')) {
-            applyStudent('<span class="badge bg-info text-dark">Student (Gmail)</span>',
-                         '✓ Valid Gmail account');
-        } else if (email.includes('@')) {
-            detectedRoleDiv.innerHTML = '<span class="badge bg-danger">Invalid — must use FUNAAB or Gmail</span>';
-            roleField.value = '';
-            studentFields.hidden = true;
-            staffRoleSelector.hidden = true;
-            staffRoleInput.required = false;
-            setHint('✗ Only FUNAAB or Gmail emails are allowed', 'is-invalid');
-            confirmNoteText.textContent = DEFAULT_NOTE;
-        } else {
+        if (verdict === null) {
             detectedRoleDiv.textContent = '';
             studentFields.hidden = true;
             staffRoleSelector.hidden = true;
             staffRoleInput.required = false;
             setHint('Your role is detected from your email domain.');
+            confirmNoteText.textContent = DEFAULT_NOTE;
+        } else if (verdict.role === 'staff') {
+            detectedRoleDiv.innerHTML = '<span class="badge bg-warning text-dark">Staff Member</span>';
+            roleField.value = 'lecturer';
+            studentFields.hidden = true;
+            staffRoleSelector.hidden = false;
+            staffRoleInput.required = true;
+            setHint(`✓ Staff address at ${verdict.institution} — please select your role below`,
+                    'is-valid');
+            confirmNoteText.textContent = STAFF_NOTE;
+        } else if (verdict.role === 'student') {
+            applyStudent(
+                verdict.personal
+                    ? '<span class="badge bg-info text-dark">Student (personal email)</span>'
+                    : '<span class="badge bg-primary">Student</span>',
+                verdict.personal
+                    ? '✓ Valid personal email address'
+                    : `✓ Student address at ${verdict.institution}`);
+        } else {
+            detectedRoleDiv.innerHTML =
+                '<span class="badge bg-danger">Not a recognised university address</span>';
+            roleField.value = '';
+            studentFields.hidden = true;
+            staffRoleSelector.hidden = true;
+            staffRoleInput.required = false;
+            setHint('✗ ' + ACCEPTED_EMAIL_TEXT, 'is-invalid');
             confirmNoteText.textContent = DEFAULT_NOTE;
         }
     });
