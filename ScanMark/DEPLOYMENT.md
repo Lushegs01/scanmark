@@ -28,22 +28,44 @@ registry-restricted to accredited institutions (NiRA vets `.edu.ng`, EDUCAUSE
 vets `.edu`, Jisc vets `.ac.uk`), which is the only reason "any university" is
 reasonable rather than "any domain at all".
 
-**Two things follow from running one instance for several universities, and
-neither is solved by the domain rules:**
+**A staff address is still self-asserted.** Anyone who can receive mail at a
+`staff.` address of any served institution can create a Lecturer or Course
+Coordinator account — and staff accounts are not gated on email confirmation
+(see `REQUIRE_EMAIL_VERIFICATION`). Set `INSTITUTION_DOMAINS` to the
+universities you actually serve to bound who that can be.
 
-1. **A staff address is self-asserted.** Anyone who can receive mail at a
-   `staff.` address of any served institution can create a Lecturer or Course
-   Coordinator account — and staff accounts are not gated on email
-   confirmation (see `REQUIRE_EMAIL_VERIFICATION`). Set `INSTITUTION_DOMAINS`
-   to the universities you actually serve to bound who that can be.
-2. **There is no data isolation between institutions.** Courses, departments
-   and faculties are one shared namespace. A coordinator only ever sees their
-   own courses, but the supervisory roles scope by a free-text department or
-   faculty string — so an HOD of "Computer Science" at one university would
-   see courses filed under "Computer Science" at another. Those roles cannot
-   be self-registered (they come from CampOS or a deliberate database change),
-   so this is latent rather than open, but it needs solving before two
-   universities share an instance in earnest.
+### How institutions are kept apart
+
+Every account and every course carries an **institution** — the domain its
+address sits under (`funaab.edu.ng`). Users get it at signup, derived from the
+address; courses inherit their coordinator's. Rows that predate the column are
+backfilled at boot: accounts from their address, courses from their
+coordinator. A personal-email account (`@gmail.com`) has none until it
+registers for its first course, and is bound to that course's institution from
+then on — clearing `User.institution` is what undoes it.
+
+It is enforced at every point where rows meet somebody who did not create
+them:
+
+| Place | Rule |
+|---|---|
+| Registering for a course | Only offerings at the student's own institution. Both universities can run CSC201; a student sees theirs. |
+| Course uniqueness | The offering key is (code, **institution**, year, semester, section), so two universities can each run CSC201 this term. |
+| Adding an instructor | Must be a colleague at the same institution — an instructor gets the roster, the register and the live QR. |
+| HOD dashboard and analytics | Department **and** institution. "Computer Science" names one at every university on the instance. |
+| Dean dashboard | Faculty **and** institution, for both courses and the lecturer count. |
+| DAP dashboard and analytics | "Institution-wide" means one institution, not every row on the instance. |
+
+A test sweeps every GET route as each role at one institution and asserts no
+row belonging to another appears in the response — including by guessing an
+id. That is the test to extend when a route is added; it is what catches the
+one place an author forgets.
+
+**Known gap:** `matric_no` is unique across the whole instance, not per
+institution. Two universities whose numbering formats overlap would collide,
+and the second student to register that number is refused. Fixing it means
+dropping a column-level UNIQUE, which on SQLite requires rebuilding the `user`
+table, so it is deliberately left until it is needed.
 
 ### Choosing how mail leaves
 

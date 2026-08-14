@@ -1327,6 +1327,30 @@ def institution_for_email(email):
     return split_institution_domain(domain)[1]
 
 
+#: What an unassigned institution reads as. Empty string, not NULL: it is part
+#: of the course uniqueness key, and SQL treats NULLs as distinct.
+NO_INSTITUTION = ''
+
+
+def institution_of(user):
+    """
+    Which university a person belongs to, as a domain.
+
+    Stored on the row, but derived from the address when it is not, so a row
+    the boot backfill has not reached is still scoped correctly instead of
+    silently landing in the unassigned bucket with everybody else's.
+    """
+    stored = (getattr(user, 'institution', None) or '').strip().lower()
+    if stored:
+        return stored
+    return institution_for_email(getattr(user, 'email', '') or '') or NO_INSTITUTION
+
+
+def institution_matches(column, institution):
+    """Predicate for 'belongs to this institution', unassigned included."""
+    return column == (institution or NO_INSTITUTION)
+
+
 def is_staff_email(email):
     """True for anyone at @{STAFF_SUBDOMAIN}.<institution>, whichever one."""
     domain = (email or '').lower().strip().rsplit('@', 1)[-1]
@@ -1745,7 +1769,8 @@ def verify_signed_qr(qr_text: str):
 # builds its per-session series inline. Removed rather than left to rot.)
 
 
-def get_department_analytics(dept_name, academic_year=None, semester=None):
+def get_department_analytics(dept_name, academic_year=None, semester=None,
+                             institution=None):
     """
     Comparative attendance for an HOD, as the PERCENTAGE the chart claims to
     show.
@@ -1766,6 +1791,7 @@ def get_department_analytics(dept_name, academic_year=None, semester=None):
 
     courses = (Course.query
                .filter(Course.department == dept_name,
+                       institution_matches(Course.institution, institution),
                        Course.archived.is_(False))
                .filter(*_term_filters(academic_year, semester))
                .order_by(Course.code.asc())
@@ -2526,6 +2552,9 @@ def authorize_google():
             # Google sign-in never mints a staff role.
             role='student' if (auto_role or 'student') != 'lecturer' else auto_role,
             email_verified=True,
+            # '' for a personal address: bound to a university when they
+            # register for their first course.
+            institution=institution_for_email(email) or NO_INSTITUTION,
         )
         db.session.add(user)
         db.session.commit()
@@ -2736,6 +2765,9 @@ def campos_sso_callback():
             # CampOS is the identity provider; the address arrives inside a
             # signed token, so there is nothing left for ScanMark to confirm.
             email_verified=True,
+            # campos_institution_id is CampOS's own key for the school; this
+            # is the domain form every ScanMark query scopes on.
+            institution=institution_for_email(email) or NO_INSTITUTION,
         )
         # CampOS is the source of truth for matric number (guard uniqueness).
         if matric_no and not User.query.filter_by(matric_no=matric_no).first():
@@ -2993,6 +3025,7 @@ def signup():
             level=level or None,
             # Nobody proved they own this address yet.
             email_verified=False,
+            institution=institution_for_email(email) or NO_INSTITUTION,
         )
 
         try:
@@ -3217,8 +3250,13 @@ def hod_dashboard():
         courses, pagination = [], None
     else:
         page = max(1, request.args.get('page', default=1, type=int) or 1)
+        # Department is a free-text string, so "Computer Science" names one
+        # at every university on the instance. The institution is what makes
+        # it this HOD's department.
         pagination = (Course.query
                       .filter(Course.department == current_user.department,
+                              institution_matches(Course.institution,
+                                                  institution_of(current_user)),
                               Course.archived.is_(False))
                       .filter(*_term_filters(academic_year, semester))
                       .order_by(Course.code.asc())
@@ -3245,7 +3283,8 @@ def hod_analytics():
         flash("Your account is not linked to a department yet.", "warning")
 
     data = get_department_analytics(current_user.department,
-                                    academic_year, semester)
+                                    academic_year, semester,
+                                    institution=institution_of(current_user))
     return render_template('analytics_hod.html', dept=current_user.department,
                            data=data, terms=_known_terms(),
                            academic_year=academic_year, semester=semester,
@@ -3271,8 +3310,11 @@ def dean_dashboard():
                                academic_year=academic_year, semester=semester,
                                term_label='—')
 
-    course_query = Course.query.filter(Course.faculty == current_user.faculty,
-                                       Course.archived.is_(False))
+    dean_institution = institution_of(current_user)
+    course_query = Course.query.filter(
+        Course.faculty == current_user.faculty,
+        institution_matches(Course.institution, dean_institution),
+        Course.archived.is_(False))
     course_count = course_query.filter(*_term_filters(academic_year, semester)).count()
 
     # `role='lecturer'` counted only the accounts CampOS created: self-signup
@@ -3280,12 +3322,15 @@ def dean_dashboard():
     # the normalised role, and count coordinators too — they teach.
     lecturer_count = (User.query
                       .filter(role_is(LECTURER_ROLE, COORDINATOR_ROLE),
-                              User.faculty == current_user.faculty)
+                              User.faculty == current_user.faculty,
+                              institution_matches(User.institution,
+                                                  dean_institution))
                       .count())
 
     # Per-department attendance so the page says something a dean can act on.
     department_rows = _faculty_department_summary(current_user.faculty,
-                                                  academic_year, semester)
+                                                  academic_year, semester,
+                                                  institution=dean_institution)
 
     return render_template('dean_dashboard.html',
                            faculty=current_user.faculty,
@@ -3298,10 +3343,13 @@ def dean_dashboard():
                            if academic_year else 'All terms')
 
 
-def _faculty_department_summary(faculty, academic_year=None, semester=None):
+def _faculty_department_summary(faculty, academic_year=None, semester=None,
+                                institution=None):
     """Attendance percentage per department inside one faculty."""
     courses = (Course.query
-               .filter(Course.faculty == faculty, Course.archived.is_(False))
+               .filter(Course.faculty == faculty,
+                       institution_matches(Course.institution, institution),
+                       Course.archived.is_(False))
                .filter(*_term_filters(academic_year, semester))
                .all())
     if not courses:
@@ -3347,11 +3395,22 @@ def dap_dashboard():
     # Same casing bug as the dean's lecturer count: self-signup students are
     # stored as 'Student' by the canonical-role mapping, CampOS sends
     # 'student', and `filter_by(role='student')` sees only one of them.
-    total_students = User.query.filter(role_is(STUDENT_ROLE)).count()
-    total_staff = User.query.filter(
-        role_is(LECTURER_ROLE, COORDINATOR_ROLE, HOD_ROLE, DEAN_ROLE)).count()
+    # "Institution-wide" counted every row on the instance, which is every
+    # university on it. A DAP presides over one.
+    dap_institution = institution_of(current_user)
+    total_students = (User.query
+                      .filter(role_is(STUDENT_ROLE),
+                              institution_matches(User.institution, dap_institution))
+                      .count())
+    total_staff = (User.query
+                   .filter(role_is(LECTURER_ROLE, COORDINATOR_ROLE, HOD_ROLE,
+                                   DEAN_ROLE),
+                           institution_matches(User.institution, dap_institution))
+                   .count())
     total_courses = (Course.query
-                     .filter(Course.archived.is_(False))
+                     .filter(Course.archived.is_(False),
+                             institution_matches(Course.institution,
+                                                 dap_institution))
                      .filter(*_term_filters(academic_year, semester))
                      .count())
     return render_template('dap_dashboard.html',
@@ -3374,7 +3433,9 @@ def dap_analytics():
     academic_year, semester = _requested_term()
 
     courses = (Course.query
-               .filter(Course.archived.is_(False))
+               .filter(Course.archived.is_(False),
+                       institution_matches(Course.institution,
+                                           institution_of(current_user)))
                .filter(*_term_filters(academic_year, semester))
                .all())
     course_ids = [course.id for course in courses]
@@ -3502,8 +3563,12 @@ def add_course():
     semester = normalize_semester(request.form.get('semester')) or default_semester
     section = _clean_text(request.form.get('section'), 20).upper()
 
+    # Scoped to this coordinator's university: CSC101 at FUNAAB and CSC101 at
+    # UNILAG are different courses, and the unqualified check told the second
+    # one it already existed.
     existing = Course.query.filter_by(code=code, academic_year=academic_year,
-                                      semester=semester, section=section).first()
+                                      semester=semester, section=section,
+                                      institution=institution_of(current_user)).first()
     if existing:
         flash(f"{code} already exists for "
               f"{describe_term(academic_year, semester, section)}.", "error")
@@ -3516,6 +3581,7 @@ def add_course():
         semester=semester,
         section=section,
         coordinator_id=current_user.id,
+        institution=institution_of(current_user),
         department=getattr(current_user, 'department', None),
         faculty=getattr(current_user, 'faculty', None),
     )
@@ -3769,6 +3835,15 @@ def add_instructor():
         flash("Only staff accounts can be added as instructors.", "error")
         return redirect(url_for('dashboard'))
 
+    # An instructor gets the roster, the register and the live QR token. One
+    # deployment serves several universities, so that has to stay inside one:
+    # the address is a colleague's or it is a stranger's.
+    if institution_of(lecturer) != institution_of(current_user):
+        app.logger.warning(
+            'Refused a cross-institution instructor invite (course %s)', course.id)
+        flash("That account belongs to another institution.", "error")
+        return redirect(url_for('dashboard'))
+
     if course.instructors.filter(User.id == lecturer.id).first():
         flash("User is already an instructor.", "info")
         return redirect(url_for('dashboard'))
@@ -3797,8 +3872,20 @@ def register_course():
     academic_year, semester = academic_term_of()
     section = _clean_text(request.form.get('section'), 20).upper()
 
+    # CSC101 exists at more than one university. A student registers within
+    # their own: without this a student anywhere lands on another school's
+    # roster, and turns up in that lecturer's register and CSV.
+    #
+    # A personal-email student has no institution yet, so their first
+    # registration is what binds them to one (below) and every later one is
+    # scoped like everybody else's.
+    student_institution = institution_of(current_user)
+    scope = ([institution_matches(Course.institution, student_institution)]
+             if student_institution else [])
+
     offerings = (Course.query
                  .filter(Course.code == course_code, Course.archived.is_(False))
+                 .filter(*scope)
                  .filter(*_term_filters(academic_year, semester))
                  .order_by(Course.section.asc())
                  .all())
@@ -3808,6 +3895,7 @@ def register_course():
         offerings = (Course.query
                      .filter(Course.code == course_code,
                              Course.archived.is_(False))
+                     .filter(*scope)
                      .order_by(Course.academic_year.desc(),
                                Course.semester.desc(),
                                Course.section.asc())
@@ -3815,6 +3903,15 @@ def register_course():
 
     if not offerings:
         flash("Course not found!", "error")
+        return redirect(url_for('student_dashboard'))
+
+    # An unbound student typing a code that several universities use: we
+    # cannot pick for them, and picking wrong puts them on a register they
+    # will never attend.
+    if not student_institution and len({row.institution for row in offerings}) > 1:
+        flash("More than one university runs a course with that code. Sign up "
+              "with your university email address so we can tell which one "
+              "you mean.", "warning")
         return redirect(url_for('student_dashboard'))
 
     if section:
@@ -3839,6 +3936,13 @@ def register_course():
         flash(f"You are already registered for {course.code}.", "info")
     else:
         current_user.enrolled_courses.append(course)
+        # A personal-email account belongs to whichever university it first
+        # registers at, and to that one only from here on. Clearing
+        # User.institution is what undoes it if somebody joined the wrong one.
+        if not student_institution and course.institution:
+            current_user.institution = course.institution
+            app.logger.info('Bound user id=%s to institution %s on first '
+                            'registration', current_user.id, course.institution)
         try:
             db.session.commit()
             flash(f"✅ Successfully registered for {course.code} "
@@ -5462,6 +5566,13 @@ with app.app_context():
         # Stable CampOS identity binding; email is not an identity key.
         ("user", "campos_user_id", "VARCHAR(100)"),
         ("user", "campos_institution_id", "VARCHAR(100)"),
+        # Which university a row belongs to. Backfilled from the address
+        # below; a personal-email account stays NULL until it registers for
+        # its first course.
+        ("user", "institution", "VARCHAR(120)"),
+        # Empty string, not NULL: it joins the offering uniqueness key, and
+        # SQL treats NULLs as distinct.
+        ("course", "institution", "VARCHAR(120) DEFAULT ''"),
         # Self-service signups must confirm their address. Existing rows are
         # backfilled TRUE by this DDL default so nobody who could sign in
         # yesterday is locked out today; only rows inserted after this point
@@ -5554,7 +5665,11 @@ with app.app_context():
         # constraint; do not add a redundant second index over it.
         _course_uniques = database_inspector.get_unique_constraints('course')
         _course_indexes = database_inspector.get_indexes('course')
-        _offering_columns = ['code', 'academic_year', 'semester', 'section']
+        # Institution is part of the offering key now, so the replacement
+        # invariant has to carry it too — recreating the old four-column one
+        # here would quietly re-impose "only one university may run CSC101".
+        _offering_columns = ['code', 'institution', 'academic_year',
+                             'semester', 'section']
         _has_offering_unique = any(
             sorted(c.get('column_names') or []) == sorted(_offering_columns)
             for c in _course_uniques
@@ -5566,7 +5681,7 @@ with app.app_context():
             try:
                 conn.execute(db.text(
                     'CREATE UNIQUE INDEX IF NOT EXISTS uq_course_offering '
-                    'ON course (code, academic_year, semester, section)'))
+                    'ON course (code, institution, academic_year, semester, section)'))
                 conn.commit()
                 print('[MIGRATION] Added the per-offering unique index on course')
             except Exception as _error:
@@ -5631,10 +5746,49 @@ with app.app_context():
                 "UPDATE class_session SET kind = 'Lecture' WHERE kind IS NULL"))
             conn.execute(db.text(
                 "UPDATE class_session SET sequence = 1 WHERE sequence IS NULL"))
+            conn.execute(db.text(
+                "UPDATE course SET institution = '' WHERE institution IS NULL"))
             conn.commit()
         except Exception as _error:
             conn.rollback()
             _fatal_migration('backfill the academic-term columns', _error)
+
+    # ── Backfill: which university each row belongs to ──
+    # Rows that predate the column. Users come from their address, which is
+    # the same derivation signup uses; courses inherit their coordinator's,
+    # because a course belongs to the school whose staff member runs it.
+    # Idempotent: only rows that still have no institution are touched, and a
+    # personal-email account resolves to nothing and is left for its first
+    # registration to bind.
+    try:
+        _pending = (db.session.query(User.id, User.email)
+                    .filter((User.institution.is_(None)) | (User.institution == ''))
+                    .all())
+        _assigned = 0
+        for _user_id, _user_email in _pending:
+            _derived = institution_for_email(_user_email or '')
+            if _derived:
+                db.session.query(User).filter(User.id == _user_id).update(
+                    {'institution': _derived}, synchronize_session=False)
+                _assigned += 1
+        if _assigned:
+            db.session.commit()
+            print(f"[MIGRATION] Recorded the institution for {_assigned} account(s)")
+        else:
+            db.session.rollback()
+
+        _orphan_courses = db.session.execute(db.text(
+            'UPDATE course SET institution = COALESCE('
+            '  (SELECT u.institution FROM "user" u WHERE u.id = course.coordinator_id),'
+            "  '') "
+            "WHERE institution IS NULL OR institution = ''")).rowcount
+        db.session.commit()
+        if _orphan_courses:
+            print(f"[MIGRATION] Adopted {_orphan_courses} course(s) into their "
+                  f"coordinator's institution")
+    except Exception as _error:
+        db.session.rollback()
+        _fatal_migration('backfill the institution columns', _error)
 
     if db.engine.dialect.name == 'sqlite':
         # SQLite bakes a column-level UNIQUE into the table definition, where
@@ -5654,10 +5808,17 @@ with app.app_context():
                 if _columns == ['code']:
                     _rebuild_needed = True
                     break
+                # The offering key predates multi-institution: without the
+                # institution in it, the second university to run CSC101 this
+                # term is refused as a duplicate. Same remedy — SQLite cannot
+                # ALTER a constraint out of a table definition.
+                if (set(_columns) == {'code', 'academic_year', 'semester', 'section'}):
+                    _rebuild_needed = True
+                    break
 
         if _rebuild_needed:
-            print("[MIGRATION] Rebuilding `course` to drop the legacy global "
-                  "UNIQUE on code (it blocks a course recurring next term)")
+            print("[MIGRATION] Rebuilding `course` so its offering key carries "
+                  "the institution (two universities can run the same code)")
             _columns = ', '.join(Course.__table__.columns.keys())
             # Pragmas cannot run inside a transaction, and legacy_alter_table
             # stops the RENAME from rewriting child tables' references to
@@ -5682,12 +5843,33 @@ with app.app_context():
                 _cursor.execute("PRAGMA legacy_alter_table=OFF")
                 _cursor.execute("PRAGMA foreign_keys=ON")
                 print("[MIGRATION] `course` rebuilt; offerings are now unique "
-                      "per (code, year, semester, section)")
+                      "per (code, institution, year, semester, section)")
             except Exception as _error:
                 _raw.rollback()
                 _fatal_migration('rebuild the course table', _error)
             finally:
                 _raw.close()
+    else:
+        # Postgres names its constraints, so the same upgrade is two
+        # statements rather than a table rebuild.
+        _existing = next(
+            (constraint for constraint
+             in db.inspect(db.engine).get_unique_constraints('course')
+             if constraint.get('name') == 'uq_course_offering'), None)
+        if _existing and 'institution' not in (_existing.get('column_names') or []):
+            print("[MIGRATION] Widening the offering key to include the "
+                  "institution (two universities can run the same code)")
+            with db.engine.connect() as conn:
+                try:
+                    conn.execute(db.text(
+                        'ALTER TABLE course DROP CONSTRAINT uq_course_offering'))
+                    conn.execute(db.text(
+                        'ALTER TABLE course ADD CONSTRAINT uq_course_offering '
+                        'UNIQUE (code, institution, academic_year, semester, section)'))
+                    conn.commit()
+                except Exception as _error:
+                    conn.rollback()
+                    _fatal_migration('widen the course offering key', _error)
 
     # ── Backfill: adopt legacy attendance rows into per-day class sessions ──
     # Before sessions were wired up, scans were saved with session_id NULL.

@@ -1815,3 +1815,263 @@ class TestLegacyNotificationTables:
 
         # The worker stopped asking for it, so the next delete is untouched.
         assert appmod.LEGACY_COURSE_REF_TABLES == ()
+
+
+# ============================================================
+# INSTITUTION ISOLATION
+# ============================================================
+
+class TestInstitutionIsolation:
+    """
+    One deployment serves several universities. Nothing belonging to one may
+    reach anybody at another — not through a listing, not through a dashboard,
+    and not by guessing an id.
+
+    The `other_institution` fixture seeds a whole second university whose rows
+    carry recognisable names, and these tests assert those names never appear
+    where they should not. Its department and faculty are deliberately
+    identical to the first institution's, because that collision is what the
+    free-text scoping used to merge.
+    """
+
+    def _promote(self, appmod, user_id, role, department=None, faculty=None):
+        from models import db, User
+        with appmod.app.app_context():
+            user = db.session.get(User, user_id)
+            user.role = role
+            user.department = department
+            user.faculty = faculty
+            db.session.commit()
+
+    def _leaked(self, response, fingerprints):
+        """Search raw bytes: one route answers with a PNG, and a leak in a
+        binary body is still a leak."""
+        body = response.get_data(as_text=False)
+        return [mark for mark in fingerprints if mark.encode() in body]
+
+    def test_no_page_shows_another_institutions_rows(self, appmod, seed,
+                                                     other_institution, login):
+        """
+        The sweep: walk every GET route as each role at institution A and
+        assert institution B never appears. This is the test that catches the
+        endpoint an author forgets, which is the only way a change this broad
+        can be trusted.
+        """
+        from flask import url_for
+
+        # Give institution A a full set of supervisory roles, all with the
+        # same department and faculty strings institution B uses.
+        self._promote(appmod, seed['outsider_id'], 'hod',
+                      department='Computer Science', faculty='Physical Sciences')
+        self._promote(appmod, seed['lecturer_id'], 'dean',
+                      department='Computer Science', faculty='Physical Sciences')
+
+        skip = {'static', 'serve_sw', 'logout'}
+        findings = []
+
+        for email in (seed['coordinator_email'], seed['outsider_email'],
+                      seed['lecturer_email'], seed['student_email']):
+            client = login(email)
+            for rule in appmod.app.url_map.iter_rules():
+                if rule.endpoint in skip or 'GET' not in rule.methods:
+                    continue
+                args = {}
+                for arg in rule.arguments:
+                    if arg.endswith('course_id'):
+                        args[arg] = seed['course_id']
+                    elif arg.endswith('session_id'):
+                        args[arg] = seed['session_id']
+                    elif arg == 'token':
+                        args[arg] = 'not-a-real-token'
+                    else:
+                        args[arg] = 1
+                with appmod.app.test_request_context():
+                    path = url_for(rule.endpoint, **args)
+                try:
+                    response = client.get(path, follow_redirects=True)
+                except RuntimeError:
+                    continue        # redirects off-site: no page of ours
+                leaked = self._leaked(response,
+                                      other_institution['fingerprints'])
+                if leaked:
+                    findings.append(f'{email} GET {path} leaked {leaked}')
+
+        assert not findings, '\n'.join(findings)
+
+    def test_another_institutions_ids_are_not_reachable_by_guessing(
+            self, appmod, seed, other_institution, login):
+        """Scoping a listing means nothing if the id still opens the page."""
+        from flask import url_for
+
+        coordinator = login(seed['coordinator_email'])
+        findings = []
+
+        for rule in appmod.app.url_map.iter_rules():
+            if 'GET' not in rule.methods or not rule.arguments:
+                continue
+            if not any(arg.endswith(('course_id', 'session_id'))
+                       for arg in rule.arguments):
+                continue
+            args = {}
+            for arg in rule.arguments:
+                if arg.endswith('course_id'):
+                    args[arg] = other_institution['course_id']
+                elif arg.endswith('session_id'):
+                    args[arg] = other_institution['session_id']
+                else:
+                    args[arg] = 1
+            with appmod.app.test_request_context():
+                path = url_for(rule.endpoint, **args)
+            try:
+                response = coordinator.get(path, follow_redirects=True)
+            except RuntimeError:
+                continue            # redirects off-site: no page of ours
+            leaked = self._leaked(response,
+                                  other_institution['fingerprints'])
+            if leaked:
+                findings.append(f'GET {path} leaked {leaked}')
+
+        assert not findings, '\n'.join(findings)
+
+    def test_a_student_cannot_register_for_another_institutions_course(
+            self, appmod, seed, other_institution, login):
+        """
+        Both universities run CSC201. Registering by code used to take
+        whichever row the query found first, putting a student on a register
+        they will never attend and in a lecturer's CSV at another school.
+        """
+        from models import db, User
+
+        kemi = login(seed['student_email'])
+        kemi.post('/register_course', data={'course_code': 'CSC201'},
+                  follow_redirects=True)
+
+        with appmod.app.app_context():
+            student = db.session.get(User, seed['student_id'])
+            enrolled = {course.id for course in student.enrolled_courses}
+        assert other_institution['course_id'] not in enrolled
+        assert enrolled == {seed['course_id']}
+
+    def test_a_coordinator_cannot_add_another_institutions_lecturer(
+            self, appmod, seed, other_institution, login):
+        """An instructor gets the roster, the register and the live QR."""
+        from models import db, Course
+
+        coordinator = login(seed['coordinator_email'])
+        coordinator.post('/add_instructor',
+                         data={'course_id': seed['course_id'],
+                               'lecturer_email': other_institution['lecturer_email']},
+                         follow_redirects=True)
+
+        with appmod.app.app_context():
+            course = db.session.get(Course, seed['course_id'])
+            instructor_ids = {user.id for user in course.instructors}
+        assert other_institution['lecturer_id'] not in instructor_ids
+
+    def test_both_universities_can_run_the_same_course_code(
+            self, appmod, seed, other_institution, login):
+        """
+        The other side of isolation: the offering key used to be global, so
+        the second university to create CSC301 this term was told it already
+        existed.
+        """
+        from models import Course
+
+        for email in (seed['coordinator_email'],
+                      other_institution['coordinator_email']):
+            client = login(email)
+            client.post('/add_course', data={'code': 'CSC301',
+                                             'title': 'Algorithms'},
+                        follow_redirects=True)
+
+        with appmod.app.app_context():
+            institutions = {course.institution for course
+                            in Course.query.filter_by(code='CSC301').all()}
+        assert institutions == {'funaab.edu.ng', 'unilag.edu.ng'}
+
+    def test_an_hod_sees_only_their_own_departments_courses(
+            self, appmod, seed, other_institution, login):
+        """Both universities have a Computer Science department."""
+        self._promote(appmod, seed['outsider_id'], 'hod',
+                      department='Computer Science', faculty='Physical Sciences')
+        hod = login(seed['outsider_email'])
+        body = hod.get('/hod_dashboard', follow_redirects=True).get_data(as_text=True)
+
+        assert 'Unilag Data Structures' not in body
+        assert 'CSC201' in body          # its own department's course is there
+
+    def test_a_dap_counts_only_their_own_institution(
+            self, appmod, seed, other_institution, login):
+        """'Institution-wide' counted every row on the instance."""
+        self._promote(appmod, seed['outsider_id'], 'dap')
+        dap = login(seed['outsider_email'])
+        body = dap.get('/dap_dashboard', follow_redirects=True).get_data(as_text=True)
+
+        with appmod.app.app_context():
+            expected_courses = appmod.Course.query.filter_by(
+                institution='funaab.edu.ng', archived=False).count()
+        # The other university's course must not be in the total.
+        assert f'>{expected_courses}<' in body.replace(' ', '').replace('\n', '')
+
+    def test_department_analytics_do_not_merge_two_universities(
+            self, appmod, seed, other_institution):
+        with appmod.app.app_context():
+            ours = appmod.get_department_analytics(
+                'Computer Science', institution='funaab.edu.ng')
+            theirs = appmod.get_department_analytics(
+                'Computer Science', institution='unilag.edu.ng')
+
+        assert ours['labels'] == ['CSC201']
+        assert theirs['labels'] == ['CSC201']
+        # Same code, different rows: the meta identifies which course it is.
+        assert ours['meta'][0]['expected'] == 1     # kemi is on our roster
+        assert theirs['meta'][0]['present'] == 1    # ngozi scanned at theirs
+
+    def test_a_personal_email_student_is_bound_by_their_first_registration(
+            self, appmod, seed, other_institution, login):
+        """
+        A gmail account belongs to no university until it registers, then to
+        that one only. This is the rule chosen for personal addresses —
+        clearing User.institution is what undoes it.
+        """
+        from models import db, User
+
+        with appmod.app.app_context():
+            gmail_student = User(
+                full_name='Free Agent', email='free.agent@gmail.com',
+                password=appmod.generate_password_hash(VALID_PASSWORD,
+                                                       method='scrypt'),
+                role='student', email_verified=True)
+            db.session.add(gmail_student)
+            db.session.commit()
+            student_id = gmail_student.id
+            assert appmod.institution_of(gmail_student) == ''
+
+        # Both universities run CSC201, so we cannot pick for them.
+        client = login('free.agent@gmail.com')
+        response = client.post('/register_course', data={'course_code': 'CSC201'},
+                               follow_redirects=True)
+        assert 'More than one university' in response.get_data(as_text=True)
+        with appmod.app.app_context():
+            assert not db.session.get(User, student_id).enrolled_courses
+
+        # A code only one of them runs binds them to that one.
+        coordinator = login(seed['coordinator_email'])
+        coordinator.post('/add_course', data={'code': 'CSC401',
+                                              'title': 'Compilers'},
+                         follow_redirects=True)
+        client.post('/register_course', data={'course_code': 'CSC401'},
+                    follow_redirects=True)
+
+        with appmod.app.app_context():
+            bound = db.session.get(User, student_id)
+            assert bound.institution == 'funaab.edu.ng'
+            assert [course.code for course in bound.enrolled_courses] == ['CSC401']
+
+        # And from then on they are scoped like everybody else.
+        client.post('/register_course', data={'course_code': 'CSC201'},
+                    follow_redirects=True)
+        with appmod.app.app_context():
+            enrolled = {course.id for course
+                        in db.session.get(User, student_id).enrolled_courses}
+        assert other_institution['course_id'] not in enrolled
