@@ -64,7 +64,8 @@ from models import (
     db, User, Course, Attendance, AuditLog, ClassSession, SessionRoster,
     course_instructors, enrollments,
 )
-from mailconfig import resolve_mail_settings
+from mailconfig import BREVO, resolve_mail_settings
+from mailer import MailSendError, send_via_brevo
 from performance import BoundedExecutor, InstrumentedQueuePool, runtime_metrics
 from campos_integration import (
     CamposIntegrationError,
@@ -708,7 +709,9 @@ last_mail_failure = {'at': None, 'error': None}
 
 
 def _describe_smtp_error(exc):
-    """Turn an smtplib exception into the one line that identifies the cause."""
+    """Turn a send failure into the one line that identifies the cause."""
+    if isinstance(exc, MailSendError):
+        return str(exc)
     if isinstance(exc, smtplib.SMTPAuthenticationError):
         return (f'authentication rejected ({exc.smtp_code}) — for Gmail the '
                 f'password must be a 16-character App Password from an account '
@@ -721,18 +724,42 @@ def _describe_smtp_error(exc):
         return f'every recipient was refused: {list(exc.recipients)[:1]}'
     if isinstance(exc, (TimeoutError, OSError)) and not isinstance(
             exc, smtplib.SMTPException):
+        # ENETUNREACH comes back immediately, so don't claim a timeout elapsed.
+        waited = (f'within {MAIL_TIMEOUT}s' if isinstance(exc, TimeoutError)
+                  else 'at all')
         return (f'could not reach {app.config["MAIL_SERVER"]}:'
-                f'{app.config["MAIL_PORT"]} within {MAIL_TIMEOUT}s '
+                f'{app.config["MAIL_PORT"]} {waited} '
                 f'({type(exc).__name__}: {exc}) — a host that blocks outbound '
-                f'SMTP looks exactly like this')
+                f'SMTP looks exactly like this. Set BREVO_API_KEY to send over '
+                f'HTTPS instead')
     return f'{type(exc).__name__}: {exc}'
+
+
+def deliver_message(msg):
+    """
+    Put one message on the wire, whichever way this deployment sends.
+
+    Every caller builds a Flask-Mail Message and hands it to the background
+    pool; only this function knows there is more than one way out.
+    """
+    if MAIL_SETTINGS.provider == BREVO:
+        send_via_brevo(
+            MAIL_SETTINGS,
+            subject=msg.subject,
+            recipients=msg.recipients,
+            text=msg.body,
+            html=msg.html,
+            sender=msg.sender,
+        )
+    else:
+        mail.send(msg)
 
 
 def send_async_email(app_instance, msg):
     """Send email asynchronously to avoid blocking"""
     with app_instance.app_context():
         try:
-            mail.send(msg)
+            deliver_message(msg)
             # Recipients are student addresses — count them, don't print them.
             app_instance.logger.info('Email sent to %d recipient(s)', len(msg.recipients))
             last_mail_failure['at'] = None
@@ -2182,14 +2209,22 @@ def _check_smtp():
     failed is reported here instead: the old check said 'ok' while every
     message was being refused, which is the worst thing it could have said.
     """
-    if not app.config.get('MAIL_SERVER') or not app.config.get('MAIL_USERNAME'):
+    if not MAIL_SETTINGS.is_configured:
         return 'not configured'
-    if app.config.get('MAIL_USE_SSL'):
-        opener = smtplib.SMTP_SSL
-    else:
-        opener = smtplib.SMTP
-    with opener(app.config['MAIL_SERVER'], app.config['MAIL_PORT'],
-                timeout=3) as smtp:
+
+    if MAIL_SETTINGS.provider == BREVO:
+        # Nothing to open a socket to: mail leaves over HTTPS at send time,
+        # and probing the API on every readiness check would spend quota to
+        # learn nothing the last real send has not already told us.
+        if last_mail_failure['error']:
+            return f"brevo, last send failed: {last_mail_failure['error']}"
+        return 'ok (brevo)'
+
+    # Read from MAIL_SETTINGS throughout: app.config is populated from it at
+    # boot, and a probe that checks one and connects with the other is a probe
+    # that can pass against settings the sender is not using.
+    opener = smtplib.SMTP_SSL if MAIL_SETTINGS.use_ssl else smtplib.SMTP
+    with opener(MAIL_SETTINGS.server, MAIL_SETTINGS.port, timeout=3) as smtp:
         smtp.ehlo()
     if last_mail_failure['error']:
         return f"reachable, but last send failed: {last_mail_failure['error']}"

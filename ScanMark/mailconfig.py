@@ -27,6 +27,10 @@ def _flag(environ, name):
     return raw.strip().lower() not in FALSEY
 
 
+SMTP = 'smtp'
+BREVO = 'brevo'
+
+
 @dataclass(frozen=True)
 class MailSettings:
     server: str
@@ -37,6 +41,10 @@ class MailSettings:
     password: str | None
     sender: str | None
     timeout: float
+    #: 'smtp' or 'brevo' — how the message actually leaves the process.
+    provider: str = SMTP
+    brevo_api_key: str | None = None
+    brevo_endpoint: str | None = None
     #: True when MAIL_PASSWORD arrived with the spaces Gmail displays.
     password_had_spaces: bool = False
 
@@ -45,13 +53,29 @@ class MailSettings:
         return 'SSL' if self.use_ssl else 'STARTTLS' if self.use_tls else 'none'
 
     @property
+    def uses_smtp(self):
+        return self.provider == SMTP
+
+    @property
     def is_configured(self):
+        """Whether this provider has what it needs to send anything."""
+        if self.provider == BREVO:
+            return bool(self.brevo_api_key and self.sender)
         return bool(self.server and self.username and self.password)
 
     @property
     def summary(self):
         """Safe to log: says whether the secrets exist, never what they are."""
+        if self.provider == BREVO:
+            return {
+                'provider': BREVO,
+                'endpoint': self.brevo_endpoint or '(default)',
+                'api_key_set': bool(self.brevo_api_key),
+                'sender': self.sender or '(unset)',
+                'timeout': self.timeout,
+            }
         return {
+            'provider': SMTP,
             'server': self.server,
             'port': self.port,
             'security': self.security,
@@ -84,6 +108,14 @@ def resolve_mail_settings(environ=None):
     raw_password = environ.get('MAIL_PASSWORD') or ''
     password = raw_password.replace(' ', '') or None
 
+    # Which way the mail leaves. Named explicitly by MAIL_PROVIDER, otherwise
+    # inferred: a host that blocks outbound SMTP is why the key is there at
+    # all, so a configured key means it is meant to be used.
+    brevo_api_key = (environ.get('BREVO_API_KEY') or '').strip() or None
+    provider = (environ.get('MAIL_PROVIDER') or '').strip().lower()
+    if not provider:
+        provider = BREVO if brevo_api_key else SMTP
+
     return MailSettings(
         server=environ.get('MAIL_SERVER') or DEFAULT_SERVER,
         port=port,
@@ -93,5 +125,8 @@ def resolve_mail_settings(environ=None):
         password=password,
         sender=environ.get('MAIL_DEFAULT_SENDER') or username,
         timeout=float(environ.get('MAIL_TIMEOUT') or DEFAULT_TIMEOUT),
+        provider=provider,
+        brevo_api_key=brevo_api_key,
+        brevo_endpoint=(environ.get('BREVO_API_URL') or '').strip() or None,
         password_had_spaces=' ' in raw_password.strip(),
     )
