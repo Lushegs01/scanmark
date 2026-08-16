@@ -4597,26 +4597,67 @@ def pin_session_to_classroom(session_row, room):
     set_class_location(session_row.id, room.latitude, room.longitude)
 
 
+#: Where a latitude/longitude hides inside a pasted map link. Tried in order:
+#: an explicit query point beats the `@` viewport centre, which is only where
+#: the map happened to be scrolled to. `!3d…!4d…` is the place marker Google
+#: puts in a /maps/place/ URL, and is the exact point of the pin.
+_MAP_LINK_PATTERNS = (
+    re.compile(r'[?&](?:q|ll|daddr|sll|center)=(-?\d+\.\d+),\s*(-?\d+\.\d+)'),
+    re.compile(r'!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)'),
+    re.compile(r'@(-?\d+\.\d+),(-?\d+\.\d+)'),
+    re.compile(r'#map=\d+/(-?\d+\.\d+)/(-?\d+\.\d+)'),
+)
+
+#: Link shorteners a maps app hands out from its Share button. The
+#: coordinates are not in the URL at all — only the server it redirects to
+#: knows them — so say that rather than failing as "not two numbers".
+_SHORTENED_MAP_LINKS = ('goo.gl', 'maps.app.goo.gl', 'bit.ly', 'tinyurl.com',
+                        'maps.apple/p/')
+
+
+def _coordinates_from_map_link(text):
+    """(lat, lon) out of a pasted map URL, or None if it is not one."""
+    for pattern in _MAP_LINK_PATTERNS:
+        found = pattern.search(text)
+        if found:
+            return found.group(1), found.group(2)
+    return None
+
+
 def _read_coordinates(form):
     """
     Coordinates from the add-a-classroom form, however they were supplied.
 
-    Either a captured fix (separate lat/lon fields, filled in by the browser)
-    or one pasted string — which is how coordinates leave a maps app, and
-    typing them into two boxes is an opportunity to swap them.
+    Three ways in, because three things are plausibly on the clipboard:
+    a captured fix (the separate lat/lon fields the browser fills in), two
+    numbers pasted as one string, or a link — which is what a maps app's
+    Share button gives you, and what somebody told to "paste the coordinates
+    from a map" will very reasonably paste.
 
     Returns (latitude, longitude, accuracy_m) or raises ValueError.
     """
-    pasted = _clean_text(form.get('coordinates', ''), 80)
+    # Long enough for a maps URL. Bare coordinates need ~24 characters; the
+    # 80 this used to allow truncated a link into an unparseable fragment.
+    pasted = _clean_text(form.get('coordinates', ''), 500)
     latitude_text = _clean_text(form.get('lat', ''), 40)
     longitude_text = _clean_text(form.get('lon', ''), 40)
 
     if pasted and not (latitude_text and longitude_text):
-        parts = [part for part in pasted.replace(',', ' ').split() if part]
-        if len(parts) != 2:
-            raise ValueError(
-                'Paste coordinates as two numbers, like "7.22609, 3.44156".')
-        latitude_text, longitude_text = parts
+        from_link = _coordinates_from_map_link(pasted)
+        if from_link:
+            latitude_text, longitude_text = from_link
+        else:
+            parts = [part for part in pasted.replace(',', ' ').split() if part]
+            if len(parts) != 2:
+                if any(host in pasted.lower() for host in _SHORTENED_MAP_LINKS):
+                    raise ValueError(
+                        'That is a shortened link, and the coordinates are not '
+                        'in it. Open it, long-press the spot, and copy the two '
+                        'numbers the map shows you.')
+                raise ValueError(
+                    'Paste coordinates as two numbers, like "7.22609, 3.44156" '
+                    '— or paste the full map link for the spot.')
+            latitude_text, longitude_text = parts
 
     if not latitude_text or not longitude_text:
         raise ValueError('Coordinates are required. Paste them from a map, or '

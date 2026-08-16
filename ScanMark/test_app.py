@@ -1484,6 +1484,64 @@ class TestSavedClassrooms:
         with appmod.app.app_context():
             assert Classroom.query.count() == 0
 
+    @pytest.mark.parametrize('pasted', [
+        # Long-press → the card shows bare numbers.
+        '7.22609, 3.44156',
+        '7.22609,3.44156',
+        # Share → a link. This is what somebody told to "paste the
+        # coordinates from a map" will very reasonably paste.
+        'https://maps.google.com/?q=7.22609,3.44156',
+        'https://www.google.com/maps/@7.22609,3.44156,17z',
+        'https://maps.apple.com/?ll=7.22609,3.44156&q=Dropped%20Pin',
+        'https://www.openstreetmap.org/#map=19/7.22609/3.44156',
+    ])
+    def test_coordinates_are_taken_however_a_map_hands_them_over(
+            self, appmod, seed, login, pasted):
+        ada = login(seed['coordinator_email'])
+        self._add(ada, coordinates=pasted)
+
+        from models import Classroom
+        with appmod.app.app_context():
+            room = Classroom.query.one()
+            assert (round(room.latitude, 5), round(room.longitude, 5)) == \
+                (7.22609, 3.44156)
+
+    def test_the_place_marker_beats_the_viewport_the_map_was_scrolled_to(
+            self, appmod, seed, login):
+        """
+        A Google /maps/place/ link carries both: `@` is wherever the map
+        happened to be centred, `!3d…!4d…` is the pin itself. Taking the
+        first one that appears in the string would take the wrong one.
+        """
+        ada = login(seed['coordinator_email'])
+        self._add(ada, coordinates=(
+            'https://www.google.com/maps/place/Lecture+Theatre+1/'
+            '@7.30000,3.50000,17z/data=!3m1!4b1!4m6!3m5!1s0x0:0x0'
+            '!8m2!3d7.22609!4d3.44156'))
+
+        from models import Classroom
+        with appmod.app.app_context():
+            room = Classroom.query.one()
+            assert (round(room.latitude, 5), round(room.longitude, 5)) == \
+                (7.22609, 3.44156)
+
+    def test_a_shortened_link_says_why_it_cannot_work(
+            self, appmod, seed, login):
+        """
+        The coordinates genuinely are not in the URL — only the server it
+        redirects to knows them. "Not two numbers" would be a true but
+        useless thing to say about it.
+        """
+        ada = login(seed['coordinator_email'])
+        page = self._add(ada, coordinates='https://maps.app.goo.gl/xTf9QaB2mNp')
+        body = page.get_data(as_text=True)
+        assert 'shortened link' in body
+        assert 'long-press' in body
+
+        from models import Classroom
+        with appmod.app.app_context():
+            assert Classroom.query.count() == 0
+
     @pytest.mark.parametrize('coordinates', [
         '', 'somewhere in the science block', '7.22609', '7.22609, 3.44156, 12',
         '200, 3.44156', '7.22609, 400',
