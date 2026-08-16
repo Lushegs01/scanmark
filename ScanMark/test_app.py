@@ -2075,3 +2075,111 @@ class TestInstitutionIsolation:
             enrolled = {course.id for course
                         in db.session.get(User, student_id).enrolled_courses}
         assert other_institution['course_id'] not in enrolled
+
+
+class TestMatricNumbersAreScopedToTheirUniversity:
+    """
+    A matric number identifies a student within their own university. It was
+    unique across the whole instance, so the second university to enrol a
+    student numbered 20200001 was simply refused.
+    """
+
+    def _signup(self, client, email, matric):
+        return client.post('/signup', data={
+            'full_name': 'A Student', 'email': email,
+            'password': VALID_PASSWORD, 'matric_no': matric, 'level': '300',
+        }, follow_redirects=True)
+
+    def test_two_universities_can_each_have_a_student_20200001(
+            self, appmod, client):
+        from models import User
+
+        self._signup(client, 'one@student.funaab.edu.ng', '20200001')
+        self._signup(appmod.app.test_client(), 'two@student.unilag.edu.ng',
+                     '20200001')
+
+        with appmod.app.app_context():
+            holders = {user.institution for user
+                       in User.query.filter_by(matric_no='20200001').all()}
+        assert holders == {'funaab.edu.ng', 'unilag.edu.ng'}
+
+    def test_one_university_still_cannot_have_it_twice(self, appmod, client):
+        from models import User
+
+        self._signup(client, 'first@student.funaab.edu.ng', '20200002')
+        self._signup(appmod.app.test_client(), 'second@student.funaab.edu.ng',
+                     '20200002')
+
+        with appmod.app.app_context():
+            holders = User.query.filter_by(matric_no='20200002').all()
+        assert len(holders) == 1
+        assert holders[0].email == 'first@student.funaab.edu.ng'
+
+    def test_the_database_enforces_it_even_when_the_route_does_not(self, appmod,
+                                                                   seed):
+        """The route checks, but a second worker interleaving does not."""
+        from sqlalchemy.exc import IntegrityError
+        from models import db, User
+
+        with appmod.app.app_context():
+            db.session.add(User(
+                full_name='Racing', email='racing@student.funaab.edu.ng',
+                password=appmod.generate_password_hash(VALID_PASSWORD,
+                                                       method='scrypt'),
+                role='student', matric_no='20200001',
+                institution='funaab.edu.ng'))
+            with pytest.raises(IntegrityError):
+                db.session.commit()
+            db.session.rollback()
+
+    def test_staff_rows_without_a_number_are_exempt(self, appmod, seed):
+        """NULLs are distinct, so any number of staff coexist."""
+        from models import db, User
+
+        with appmod.app.app_context():
+            for name in ('No Matric One', 'No Matric Two'):
+                db.session.add(User(
+                    full_name=name,
+                    email=f"{name.replace(' ', '').lower()}@staff.funaab.edu.ng",
+                    password=appmod.generate_password_hash(VALID_PASSWORD,
+                                                           method='scrypt'),
+                    role='Lecturer', institution='funaab.edu.ng'))
+            db.session.commit()      # must not raise
+            assert User.query.filter_by(matric_no=None).count() >= 2
+
+    def test_binding_is_refused_when_the_number_is_taken_there(
+            self, appmod, seed, other_institution, login):
+        """
+        A personal-email student carries a matric but no university. If the
+        university they are about to join already has that number, the
+        database would refuse the enrolment with an error about nothing the
+        student can see — so the route says it in words instead.
+        """
+        from models import db, User
+
+        with appmod.app.app_context():
+            db.session.add(User(
+                full_name='Free Agent', email='clash@gmail.com',
+                password=appmod.generate_password_hash(VALID_PASSWORD,
+                                                       method='scrypt'),
+                role='student', matric_no='20200001',   # kemi's, at funaab
+                level='300', email_verified=True))
+            db.session.commit()
+
+        # A code only the seed institution runs, so binding is what is being
+        # tested rather than the ambiguity check.
+        coordinator = login(seed['coordinator_email'])
+        coordinator.post('/add_course', data={'code': 'CSC401',
+                                              'title': 'Compilers'},
+                         follow_redirects=True)
+
+        client = login('clash@gmail.com')
+        response = client.post('/register_course',
+                               data={'course_code': 'CSC401'},
+                               follow_redirects=True)
+
+        assert 'matric number is already registered' in response.get_data(as_text=True)
+        with appmod.app.app_context():
+            unbound = User.query.filter_by(email='clash@gmail.com').first()
+            assert unbound.institution == ''      # not half-bound
+            assert not unbound.enrolled_courses

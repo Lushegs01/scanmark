@@ -61,11 +61,12 @@ row belonging to another appears in the response — including by guessing an
 id. That is the test to extend when a route is added; it is what catches the
 one place an author forgets.
 
-**Known gap:** `matric_no` is unique across the whole instance, not per
-institution. Two universities whose numbering formats overlap would collide,
-and the second student to register that number is refused. Fixing it means
-dropping a column-level UNIQUE, which on SQLite requires rebuilding the `user`
-table, so it is deliberately left until it is needed.
+`matric_no` is unique **per institution**, not across the instance: it
+identifies a student within their own university, and two universities'
+numbering formats can overlap. Staff rows hold no number and are exempt. On an
+existing database the upgrade drops the old instance-wide UNIQUE — two
+statements on Postgres, a `user` table rebuild on SQLite, since a
+column-level UNIQUE is out of ALTER TABLE's reach there.
 
 ### Choosing how mail leaves
 
