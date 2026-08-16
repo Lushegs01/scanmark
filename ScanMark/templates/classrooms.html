@@ -26,7 +26,7 @@
 
     <!-- Add / re-pin a room -->
     <div class="card shadow-sm border-0 mb-4">
-        <div class="card-header bg-white py-3">
+        <div class="card-header py-3">
             <h5 class="mb-0 fw-bold text-success">
                 <i class="fas fa-plus me-1"></i> Add a classroom
             </h5>
@@ -49,10 +49,15 @@
                     </div>
                     <div class="col-12 col-md-7">
                         <label class="form-label small fw-bold" for="coordinates">Coordinates</label>
-                        <div class="input-group">
-                            <input type="text" class="form-control" id="coordinates" name="coordinates"
-                                maxlength="80" placeholder="7.22609, 3.44156" autocomplete="off">
-                            <button class="btn btn-outline-success" type="button" id="captureBtn">
+                        {# Deliberately NOT an input-group. Side by side, the
+                           button's label squeezed the field to about 90px on a
+                           phone — and a phone standing in the lecture hall is
+                           the device this page is designed for. #}
+                        <input type="text" class="form-control" id="coordinates" name="coordinates"
+                            maxlength="80" placeholder="7.22609, 3.44156" autocomplete="off"
+                            inputmode="decimal">
+                        <div class="d-grid d-sm-block mt-2">
+                            <button class="btn btn-outline-success btn-sm" type="button" id="captureBtn">
                                 <i class="fas fa-location-crosshairs me-1"></i> Use my current location
                             </button>
                         </div>
@@ -71,7 +76,7 @@
 
     <!-- Saved rooms -->
     <div class="card shadow-sm border-0">
-        <div class="card-header bg-white py-3">
+        <div class="card-header py-3">
             <h5 class="mb-0 fw-bold text-success">
                 <i class="fas fa-school me-1"></i> Saved classrooms
             </h5>
@@ -81,9 +86,14 @@
             <div class="table-responsive">
                 <table class="table table-hover align-middle mb-0">
                     <thead class="bg-light">
+                        {# Coordinates are reference information; Remove is an
+                           action. On a phone all four columns do not fit, and
+                           `table-responsive` hides the overflow behind a
+                           sideways scroll — which is where Remove ended up.
+                           The numbers stand down on small screens instead. #}
                         <tr>
                             <th class="ps-4">Room</th>
-                            <th>Coordinates</th>
+                            <th class="d-none d-md-table-cell">Coordinates</th>
                             <th class="text-center">Pinned to within</th>
                             <th class="text-end pe-4">&nbsp;</th>
                         </tr>
@@ -91,8 +101,14 @@
                     <tbody>
                         {% for room in classrooms %}
                         <tr>
-                            <td class="ps-4 fw-bold">{{ room.name }}</td>
-                            <td class="text-muted font-monospace small">
+                            <td class="ps-4 fw-bold">
+                                {{ room.name }}
+                                <div class="d-md-none text-muted font-monospace fw-normal"
+                                    style="font-size: 0.75rem;">
+                                    {{ '%.5f'|format(room.latitude) }}, {{ '%.5f'|format(room.longitude) }}
+                                </div>
+                            </td>
+                            <td class="d-none d-md-table-cell text-muted font-monospace small">
                                 {{ '%.5f'|format(room.latitude) }}, {{ '%.5f'|format(room.longitude) }}
                             </td>
                             <td class="text-center">
