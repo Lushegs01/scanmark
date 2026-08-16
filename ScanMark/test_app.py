@@ -1394,6 +1394,438 @@ class TestGeofence:
                         json=payload).status_code == 400
 
 
+class TestSavedClassrooms:
+    """
+    A lecture hall pinned once, from a device that can see satellites, and
+    reused every term.
+
+    The bug this replaces: the projector page asked the browser where it was,
+    and lecturers project from a laptop. A laptop has no GPS, so it locates
+    itself from Wi-Fi or its IP address — the reported answer was 36km out,
+    and every student sitting in the room was told THEY were too far away.
+    """
+
+    def _add(self, client, name='LT1 – Main Hall', **fields):
+        payload = {'name': name}
+        payload.setdefault('coordinates', '7.22000, 3.44000')
+        payload.update(fields)
+        return client.post('/classrooms/add', data=payload,
+                           follow_redirects=True)
+
+    def _room_id(self, appmod, name='LT1 – Main Hall'):
+        from models import Classroom
+        with appmod.app.app_context():
+            return Classroom.query.filter_by(name=name).one().id
+
+    def _scan_at_metres(self, appmod, session_id, client, metres,
+                        origin_lat=7.22, origin_lon=3.44):
+        return client.post('/mark_attendance', json=scan_body(
+            appmod, session_id,
+            lat=origin_lat + (metres / 111320.0), lon=origin_lon,
+            accuracy_m=10, location_age_ms=1000)).get_json()
+
+    # --- Saving a room -------------------------------------------------
+
+    def test_a_room_can_be_saved_by_pasting_coordinates_off_a_map(
+            self, appmod, seed, login):
+        """
+        Two numbers, the way they leave a maps app. Splitting them across two
+        boxes is an invitation to swap latitude and longitude.
+        """
+        ada = login(seed['coordinator_email'])
+        assert self._add(ada, coordinates='7.22609, 3.44156').status_code == 200
+
+        from models import Classroom
+        with appmod.app.app_context():
+            room = Classroom.query.one()
+            assert (round(room.latitude, 5), round(room.longitude, 5)) == \
+                (7.22609, 3.44156)
+            assert room.institution == 'funaab.edu.ng'
+            # Typed coordinates have no error radius to report.
+            assert room.accuracy_m is None
+
+    def test_a_captured_fix_records_how_precise_it_was(self, appmod, seed, login):
+        ada = login(seed['coordinator_email'])
+        self._add(ada, lat='7.22609', lon='3.44156', accuracy_m='12')
+
+        from models import Classroom
+        with appmod.app.app_context():
+            assert Classroom.query.one().accuracy_m == 12
+
+    @pytest.mark.parametrize('accuracy', ['nan', 'inf', 'not-a-number', '-5'])
+    def test_an_unusable_accuracy_is_recorded_as_unknown_not_as_precise(
+            self, appmod, seed, login, accuracy):
+        """
+        `float('nan')` compares False against the maximum, so a NaN accuracy
+        would read as "precise enough" and be stored as the room's error
+        radius. Unknown is the honest answer, and it is what a typed-in set of
+        coordinates already records.
+        """
+        ada = login(seed['coordinator_email'])
+        self._add(ada, lat='7.22609', lon='3.44156', accuracy_m=accuracy)
+
+        from models import Classroom
+        with appmod.app.app_context():
+            assert Classroom.query.one().accuracy_m is None
+
+    def test_a_fix_too_coarse_to_mark_a_room_is_refused(
+            self, appmod, seed, login):
+        """
+        The whole bug, caught at the point it is made. A laptop honestly
+        reports an accuracy of kilometres; saving that as the centre of a
+        100m fence refuses the entire class.
+        """
+        ada = login(seed['coordinator_email'])
+        page = self._add(ada, lat='7.22609', lon='3.44156',
+                         accuracy_m=str(appmod.GEOFENCE_MAX_PIN_ACCURACY_M + 1))
+        assert 'too imprecise' in page.get_data(as_text=True)
+
+        from models import Classroom
+        with appmod.app.app_context():
+            assert Classroom.query.count() == 0
+
+    @pytest.mark.parametrize('coordinates', [
+        '', 'somewhere in the science block', '7.22609', '7.22609, 3.44156, 12',
+        '200, 3.44156', '7.22609, 400',
+        # `float()` accepts both, and every range comparison against them is
+        # False — so a bare `if out_of_range` check waves them through.
+        'nan, 3.44156', '7.22609, inf',
+    ])
+    def test_coordinates_that_are_not_coordinates_are_refused(
+            self, appmod, seed, login, coordinates):
+        ada = login(seed['coordinator_email'])
+        self._add(ada, coordinates=coordinates)
+        from models import Classroom
+        with appmod.app.app_context():
+            assert Classroom.query.count() == 0
+
+    def test_a_room_needs_a_name_you_will_recognise_in_the_dropdown(
+            self, appmod, seed, login):
+        ada = login(seed['coordinator_email'])
+        self._add(ada, name='   ')
+        from models import Classroom
+        with appmod.app.app_context():
+            assert Classroom.query.count() == 0
+
+    def test_saving_the_same_room_again_re_pins_it_rather_than_duplicating(
+            self, appmod, seed, login):
+        """
+        The common second visit: somebody captured the hall from the doorway
+        and wants it right. Refusing as a duplicate would send them off to
+        delete it first, and two rooms called LT1 in one dropdown is worse —
+        picking the wrong one fails silently, at scan time.
+        """
+        ada = login(seed['coordinator_email'])
+        self._add(ada, coordinates='7.22000, 3.44000')
+        self._add(ada, name='lt1 – main hall', coordinates='7.30000, 3.50000')
+
+        from models import Classroom
+        with appmod.app.app_context():
+            room = Classroom.query.one()
+            assert round(room.latitude, 5) == 7.30000
+
+    def test_only_teaching_staff_reach_the_classrooms_page(
+            self, appmod, seed, login):
+        kemi = login(seed['student_email'])
+        assert kemi.get('/classrooms').status_code == 302
+        assert kemi.post('/classrooms/add', data={'name': 'LT1',
+                                                  'coordinates': '7.2, 3.4'}
+                         ).status_code == 302
+        from models import Classroom
+        with appmod.app.app_context():
+            assert Classroom.query.count() == 0
+
+    # --- Using a room --------------------------------------------------
+
+    def test_starting_a_class_in_a_saved_room_anchors_the_geofence_to_it(
+            self, appmod, seed, login):
+        ada = login(seed['coordinator_email'])
+        self._add(ada, coordinates='7.22000, 3.44000')
+        ada.post(f"/course/{seed['course_id']}/start_session",
+                 data={'kind': 'Lecture', 'new_session': '1',
+                       'classroom_id': self._room_id(appmod)})
+
+        from models import ClassSession
+        with appmod.app.app_context():
+            latest = (ClassSession.query
+                      .filter_by(course_id=seed['course_id'])
+                      .order_by(ClassSession.id.desc()).first())
+            session_id = latest.id
+            assert latest.classroom_id is not None
+            assert appmod.get_class_location(session_id) == \
+                {'lat': 7.22, 'lon': 3.44}
+
+        kemi = login(seed['student_email'])
+        assert self._scan_at_metres(appmod, session_id, kemi, 30)['status'] \
+            == 'success'
+
+    def test_a_student_outside_the_saved_room_is_still_refused(
+            self, appmod, seed, login):
+        """The room replaces where the pin comes from, not the distance rule."""
+        ada = login(seed['coordinator_email'])
+        self._add(ada, coordinates='7.22000, 3.44000')
+        ada.post(f"/session/{seed['session_id']}/classroom",
+                 data={'classroom_id': self._room_id(appmod)})
+
+        kemi = login(seed['student_email'])
+        result = self._scan_at_metres(appmod, seed['session_id'], kemi, 500)
+        assert result['status'] == 'error'
+        assert 'max 100m' in result['message']
+
+    def test_a_running_class_can_be_moved_into_a_room_without_losing_its_scans(
+            self, appmod, seed, login):
+        """
+        The fix for having forgotten to pick one, or having picked the wrong
+        one. Ending the meeting and starting again would discard everybody who
+        had already scanned.
+        """
+        from models import db, Attendance, ClassSession
+        with appmod.app.app_context():
+            db.session.add(Attendance(student_id=seed['student_id'],
+                                      course_id=seed['course_id'],
+                                      session_id=seed['session_id']))
+            db.session.commit()
+
+        ada = login(seed['coordinator_email'])
+        self._add(ada, coordinates='7.22000, 3.44000')
+        ada.post(f"/session/{seed['session_id']}/classroom",
+                 data={'classroom_id': self._room_id(appmod)})
+
+        with appmod.app.app_context():
+            assert Attendance.query.filter_by(
+                session_id=seed['session_id']).count() == 1
+            assert db.session.get(
+                ClassSession, seed['session_id']).classroom_id is not None
+
+    def test_a_pin_redis_has_lost_is_rebuilt_from_the_saved_room(
+            self, appmod, seed, login):
+        """
+        Redis is a cache. A restart or an eviction mid-lecture used to drop
+        the pin, and with GEOFENCE_REQUIRED on that refuses every remaining
+        scan in the room for the rest of the class.
+        """
+        ada = login(seed['coordinator_email'])
+        self._add(ada, coordinates='7.22000, 3.44000')
+        ada.post(f"/session/{seed['session_id']}/classroom",
+                 data={'classroom_id': self._room_id(appmod)})
+
+        # Whatever is holding the live pin, empty it.
+        if appmod.redis_client is None:
+            appmod._local_locations.clear()
+        else:
+            appmod.redis_client.flushdb()
+
+        appmod.GEOFENCE_REQUIRED = True
+        try:
+            kemi = login(seed['student_email'])
+            assert self._scan_at_metres(
+                appmod, seed['session_id'], kemi, 30)['status'] == 'success'
+        finally:
+            appmod.GEOFENCE_REQUIRED = False
+
+    def test_the_projector_page_stops_asking_the_laptop_where_it_is(
+            self, appmod, seed, login):
+        """
+        With a room chosen there is nothing to ask for, and the answer would
+        be worse than the one already on file.
+        """
+        ada = login(seed['coordinator_email'])
+        before = ada.get(f"/session/{seed['session_id']}/qr").get_data(as_text=True)
+        assert 'CLASSROOM_PINNED = false' in before
+
+        self._add(ada, coordinates='7.22000, 3.44000')
+        ada.post(f"/session/{seed['session_id']}/classroom",
+                 data={'classroom_id': self._room_id(appmod)})
+
+        after = ada.get(f"/session/{seed['session_id']}/qr").get_data(as_text=True)
+        assert 'CLASSROOM_PINNED = true' in after
+        assert 'LT1 – Main Hall' in after
+        # ...and with nowhere else to move the class to, the picker that would
+        # only offer the room it is already in is not rendered at all.
+        assert 'name="classroom_id"' not in after
+
+    def test_a_class_can_be_moved_to_a_different_room_mid_lecture(
+            self, appmod, seed, login):
+        """The room changed at the last minute; the scans so far still stand."""
+        ada = login(seed['coordinator_email'])
+        self._add(ada, name='LT1', coordinates='7.22000, 3.44000')
+        self._add(ada, name='LT2', coordinates='7.30000, 3.50000')
+        ada.post(f"/session/{seed['session_id']}/classroom",
+                 data={'classroom_id': self._room_id(appmod, 'LT1')})
+
+        page = ada.get(f"/session/{seed['session_id']}/qr").get_data(as_text=True)
+        # The room already in use is not offered back as a choice.
+        assert 'Move this class to another room' in page
+        assert '>LT2<' in page
+
+        ada.post(f"/session/{seed['session_id']}/classroom",
+                 data={'classroom_id': self._room_id(appmod, 'LT2')})
+        with appmod.app.app_context():
+            assert appmod.get_class_location(seed['session_id']) == \
+                {'lat': 7.3, 'lon': 3.5}
+
+        kemi = login(seed['student_email'])
+        assert self._scan_at_metres(appmod, seed['session_id'], kemi, 30,
+                                    origin_lat=7.30, origin_lon=3.50
+                                    )['status'] == 'success'
+
+    def test_a_browser_pin_cannot_drag_the_fence_off_a_saved_room(
+            self, appmod, seed, login):
+        """
+        The current page knows not to ask, but one left open across the deploy
+        that added rooms does not — and its Wi-Fi fix must not win.
+        """
+        ada = login(seed['coordinator_email'])
+        self._add(ada, coordinates='7.22000, 3.44000')
+        ada.post(f"/session/{seed['session_id']}/classroom",
+                 data={'classroom_id': self._room_id(appmod)})
+
+        for endpoint in (f"/session/{seed['session_id']}/set_location",
+                         f"/set_location/{seed['course_id']}"):
+            assert ada.post(endpoint, json={'lat': 9.9, 'lon': 9.9}
+                            ).status_code == 200
+            with appmod.app.app_context():
+                assert appmod.get_class_location(seed['session_id']) == \
+                    {'lat': 7.22, 'lon': 3.44}
+
+    # --- The browser pin, when there is no saved room ------------------
+
+    def test_an_imprecise_browser_pin_is_refused_with_something_to_do_about_it(
+            self, appmod, seed, login):
+        ada = login(seed['coordinator_email'])
+        response = ada.post(f"/session/{seed['session_id']}/set_location",
+                            json={'lat': 7.22, 'lon': 3.44,
+                                  'accuracy_m': appmod.GEOFENCE_MAX_PIN_ACCURACY_M + 1})
+        assert response.status_code == 400
+        message = response.get_json()['message']
+        assert 'too imprecise' in message
+        assert 'saved classroom' in message
+        with appmod.app.app_context():
+            assert appmod.get_class_location(seed['session_id']) is None
+
+    def test_an_accuracy_of_nan_does_not_slip_past_the_comparison(
+            self, appmod, seed, login):
+        """
+        Python's JSON parser accepts a bare NaN, and NaN fails every
+        comparison — including `> GEOFENCE_MAX_PIN_ACCURACY_M`. A pin claiming
+        it must not be read as "precise enough".
+        """
+        ada = login(seed['coordinator_email'])
+        response = ada.post(f"/session/{seed['session_id']}/set_location",
+                            data='{"lat": 7.22, "lon": 3.44, "accuracy_m": NaN}',
+                            content_type='application/json')
+        assert response.status_code == 400
+        with appmod.app.app_context():
+            assert appmod.get_class_location(seed['session_id']) is None
+
+    def test_a_precise_browser_pin_still_works(self, appmod, seed, login):
+        """Pinning from a phone in the room was never the broken case."""
+        ada = login(seed['coordinator_email'])
+        assert ada.post(f"/session/{seed['session_id']}/set_location",
+                        json={'lat': 7.22, 'lon': 3.44, 'accuracy_m': 15}
+                        ).status_code == 200
+        with appmod.app.app_context():
+            assert appmod.get_class_location(seed['session_id']) == \
+                {'lat': 7.22, 'lon': 3.44}
+
+    def test_a_page_that_reports_no_accuracy_is_still_accepted(
+            self, appmod, seed, login):
+        """
+        A projector page left open across this deploy does not send one.
+        Refusing it would un-pin a class that is running right now, which with
+        GEOFENCE_REQUIRED on refuses every scan — worse than the status quo it
+        is meant to improve on.
+        """
+        ada = login(seed['coordinator_email'])
+        assert ada.post(f"/session/{seed['session_id']}/set_location",
+                        json={'lat': 7.22, 'lon': 3.44}).status_code == 200
+
+    # --- Removing a room -----------------------------------------------
+
+    def test_removing_a_room_keeps_the_attendance_taken_in_it(
+            self, appmod, seed, login):
+        from models import db, Attendance, ClassSession
+        ada = login(seed['coordinator_email'])
+        self._add(ada, coordinates='7.22000, 3.44000')
+        room_id = self._room_id(appmod)
+        ada.post(f"/session/{seed['session_id']}/classroom",
+                 data={'classroom_id': room_id})
+        with appmod.app.app_context():
+            db.session.add(Attendance(student_id=seed['student_id'],
+                                      course_id=seed['course_id'],
+                                      session_id=seed['session_id']))
+            db.session.commit()
+
+        assert ada.post(f'/classrooms/{room_id}/delete',
+                        follow_redirects=True).status_code == 200
+        with appmod.app.app_context():
+            assert Attendance.query.count() == 1
+            assert db.session.get(
+                ClassSession, seed['session_id']).classroom_id is None
+
+    # --- One university's rooms are not another's ----------------------
+
+    def test_a_room_belongs_to_one_university(
+            self, appmod, seed, other_institution, login):
+        """
+        "LT1" exists at more or less every university. Two of them saving one
+        must not collide, and neither may see — or pin a class against — the
+        other's halls.
+        """
+        ada = login(seed['coordinator_email'])
+        bola = login(other_institution['coordinator_email'])
+        self._add(ada, name='LT1', coordinates='7.22000, 3.44000')
+        self._add(bola, name='LT1', coordinates='6.51000, 3.39000')
+
+        from models import db, Classroom
+        with appmod.app.app_context():
+            assert Classroom.query.count() == 2
+            funaab_id = Classroom.query.filter_by(
+                institution='funaab.edu.ng').one().id
+            unilag_id = Classroom.query.filter_by(
+                institution='unilag.edu.ng').one().id
+
+        page = ada.get('/classrooms').get_data(as_text=True)
+        assert '6.51000' not in page
+        assert '7.22000' in page
+
+        # An id is a guessable integer, so the scoping has to be enforced and
+        # not merely un-linked.
+        assert ada.post(f'/classrooms/{unilag_id}/delete',
+                        follow_redirects=True).status_code == 200
+        ada.post(f"/session/{seed['session_id']}/classroom",
+                 data={'classroom_id': unilag_id})
+        with appmod.app.app_context():
+            assert db.session.get(Classroom, unilag_id) is not None
+            assert appmod.get_class_location(seed['session_id']) is None
+
+        ada.post(f"/session/{seed['session_id']}/classroom",
+                 data={'classroom_id': funaab_id})
+        with appmod.app.app_context():
+            assert appmod.get_class_location(seed['session_id']) == \
+                {'lat': 7.22, 'lon': 3.44}
+
+    def test_starting_a_class_cannot_borrow_another_universitys_room(
+            self, appmod, seed, other_institution, login):
+        bola = login(other_institution['coordinator_email'])
+        self._add(bola, name='UNILAG LT1', coordinates='6.51000, 3.39000')
+        unilag_room = self._room_id(appmod, 'UNILAG LT1')
+
+        ada = login(seed['coordinator_email'])
+        ada.post(f"/course/{seed['course_id']}/start_session",
+                 data={'kind': 'Lecture', 'new_session': '1',
+                       'classroom_id': unilag_room})
+
+        from models import ClassSession
+        with appmod.app.app_context():
+            latest = (ClassSession.query
+                      .filter_by(course_id=seed['course_id'])
+                      .order_by(ClassSession.id.desc()).first())
+            # The meeting still opens — a dropdown that names nothing must not
+            # strand a class the lecturer has already started.
+            assert latest.classroom_id is None
+
+
 class TestQrTokens:
 
     def test_the_projector_and_the_json_endpoint_share_one_token(

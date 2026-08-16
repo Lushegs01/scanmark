@@ -61,8 +61,8 @@ from localtime import (
     utcnow_naive,
 )
 from models import (
-    db, User, Course, Attendance, AuditLog, ClassSession, SessionRoster,
-    course_instructors, enrollments,
+    db, User, Course, Attendance, AuditLog, ClassSession, Classroom,
+    SessionRoster, course_instructors, enrollments,
 )
 from mailconfig import BREVO, resolve_mail_settings
 from mailer import (MailSendError, check_sender_validated, describe_key_shape,
@@ -1528,30 +1528,46 @@ def _parse_location(raw):
         return None
 
 
-def get_class_location(session_id, course_id=None):
+def get_class_location(session_id, course_id=None, saved_room=None):
     """
     The pinned classroom for this meeting.
 
     Falls back to the old course-scoped key so a class already running through
     a rolling deploy keeps its pin instead of suddenly having none — which,
     with GEOFENCE_REQUIRED on, would refuse every remaining scan in the room.
+
+    `saved_room` is the (lat, lon) of the Classroom this meeting was started
+    in, for callers that already have it. Redis is a cache: it can be
+    restarted, or evict the key mid-lecture, and losing the pin that way
+    refuses every scan for the rest of the class. The room lives in the
+    database, so that failure is recoverable — and the scan path reads it in a
+    join it was already doing, which is why it arrives as an argument rather
+    than as another query on the hot path.
     """
-    if not redis_client:
+    if redis_client:
+        value = _redis_timed('get', redis_client.get,
+                             f"class_location:session:{session_id}")
+        if value:
+            return _parse_location(value)
+        if course_id is not None:
+            legacy = _redis_timed('get', redis_client.get,
+                                  f"class_location:{course_id}")
+            if legacy:
+                return _parse_location(legacy)
+    else:
         found = _local_locations.get(session_id)
         if found is None and course_id is not None:
             found = _local_locations.get(f"course:{course_id}")
-        return found
+        if found is not None:
+            return found
 
-    value = _redis_timed('get', redis_client.get,
-                         f"class_location:session:{session_id}")
-    if value:
-        return _parse_location(value)
-    if course_id is not None:
-        legacy = _redis_timed('get', redis_client.get,
-                              f"class_location:{course_id}")
-        if legacy:
-            return _parse_location(legacy)
-    return None
+    if saved_room is None:
+        return None
+    # Rebuild the lost pin, and write it back so one class pays for this once
+    # rather than once per remaining student.
+    latitude, longitude = saved_room
+    set_class_location(session_id, latitude, longitude)
+    return {'lat': latitude, 'lon': longitude}
 
 
 # Local-dev fallback only (never used when Redis is available)
@@ -1687,6 +1703,20 @@ GEOFENCE_MAX_ACCURACY_M = int(
 # cached fix from hours ago and somewhere else entirely.
 GEOFENCE_MAX_LOCATION_AGE_MS = int(
     os.environ.get('GEOFENCE_MAX_LOCATION_AGE_MS', 30000)
+)
+
+# Worst accuracy a CLASSROOM PIN may report. The pin is the centre of the
+# fence, so its error is added to every student's: a pin 36km off refuses the
+# entire room, and the message the students see ("you are 36073m away") blames
+# them for it.
+#
+# Lecturers project from a laptop, which has no GPS and locates itself from
+# Wi-Fi or its IP address — honestly reporting an accuracy in the thousands or
+# tens of thousands of metres. That is what this catches. Refusing such a pin
+# is only safe because there is somewhere else for the coordinates to come
+# from: a saved Classroom, pinned once from a phone or typed off a map.
+GEOFENCE_MAX_PIN_ACCURACY_M = int(
+    os.environ.get('GEOFENCE_MAX_PIN_ACCURACY_M') or GEOFENCE_RADIUS_M
 )
 
 
@@ -3235,6 +3265,7 @@ def lecturer_dashboard():
                            open_sessions=open_sessions,
                            show_archived=show_archived,
                            is_coordinator=can_create,
+                           classrooms=_my_classrooms(),
                            current_term=describe_term(*academic_term_of()))
 
 
@@ -4206,11 +4237,20 @@ def session_qr(session_id):
         return redirect(url_for('view_attendance', course_id=course.id))
 
     expected = _session_expected_counts([session_row.id]).get(session_row.id, 0)
+    # A saved room is the pin. The page must not then geolocate the projector
+    # laptop over the top of it — that browser fix is the thing the room
+    # exists to replace.
+    room = db.session.get(Classroom, session_row.classroom_id) \
+        if session_row.classroom_id else None
+    if room is not None:
+        set_class_location(session_row.id, room.latitude, room.longitude)
     return render_template('generate_qr.html', course=course, session=session_row,
                            qr_token_ttl=QR_TOKEN_TTL,
                            expected_total=expected,
                            projector_recent_rows=PROJECTOR_RECENT_ROWS,
-                           geofence_required=GEOFENCE_REQUIRED)
+                           geofence_required=GEOFENCE_REQUIRED,
+                           classroom=room, classrooms=_my_classrooms(),
+                           max_pin_accuracy_m=GEOFENCE_MAX_PIN_ACCURACY_M)
 
 
 @app.route('/session/<int:session_id>/end', methods=['POST'])
@@ -4393,7 +4433,18 @@ def scan_page():
 
 
 def _read_pin(data):
-    """Validate a posted classroom pin, returning (lat, lon) or an error."""
+    """
+    Validate a posted classroom pin, returning (lat, lon) or an error.
+
+    A pin that is merely in range is not good enough. The device sending it
+    also says how precise the fix is, and a laptop locating itself from Wi-Fi
+    or its IP address reports kilometres. Accepting that puts the centre of the
+    geofence in the wrong town and refuses every student in the room, blaming
+    them ("you are 36073m away") for the projector's guess.
+
+    Accuracy is optional in the payload — a page left open across the deploy
+    that added it does not send one — but when present it is enforced.
+    """
     try:
         latitude = float(data['lat'])
         longitude = float(data['lon'])
@@ -4401,6 +4452,24 @@ def _read_pin(data):
         return None, "Valid latitude and longitude are required."
     if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
         return None, "Latitude or longitude is out of range."
+
+    reported = data.get('accuracy_m')
+    if reported is not None:
+        try:
+            accuracy_m = float(reported)
+        except (TypeError, ValueError):
+            return None, "Reported accuracy must be a number of metres."
+        # NaN fails every comparison, so a bare `>` check would wave it
+        # through — and Python's JSON parser accepts a literal NaN.
+        if not math.isfinite(accuracy_m):
+            return None, "Reported accuracy must be a number of metres."
+        if accuracy_m < 0 or accuracy_m > GEOFENCE_MAX_PIN_ACCURACY_M:
+            return None, (
+                f"This device can only place itself to within "
+                f"{int(accuracy_m)}m, which is too imprecise to mark the "
+                f"centre of a {GEOFENCE_RADIUS_M}m classroom — every student "
+                f"would be refused. Choose a saved classroom instead."
+            )
     return (latitude, longitude), None
 
 
@@ -4418,6 +4487,16 @@ def set_session_location(session_id):
         return jsonify({"status": "error", "message": "Unauthorised"}), 403
     if not session_row.is_open:
         return jsonify({"status": "error", "message": "This class has ended."}), 409
+
+    # A room chosen for this meeting outranks whatever the browser thinks. The
+    # current page knows not to ask, but one left open across the deploy that
+    # added rooms does not, and a laptop's Wi-Fi fix must not be allowed to
+    # drag the fence off a hall somebody pinned properly.
+    if session_row.classroom_id:
+        room = db.session.get(Classroom, session_row.classroom_id)
+        if room is not None:
+            set_class_location(session_id, room.latitude, room.longitude)
+            return jsonify({"status": "ok", "classroom": room.name})
 
     pin, problem = _read_pin(request.get_json(silent=True) or {})
     if problem:
@@ -4444,19 +4523,252 @@ def set_location(course_id):
     if not _is_course_authorized(course):
         return jsonify({"status": "error", "message": "Unauthorised"}), 403
 
-    pin, problem = _read_pin(request.get_json(silent=True) or {})
-    if problem:
-        return jsonify({"status": "error", "message": problem}), 400
-
     session_row = open_session_for(course_id)
     if session_row is None:
         return jsonify({"status": "error",
                         "message": "No class is currently running."}), 409
 
+    # Checked before the payload is: a saved room settles the question, and an
+    # old page's imprecise fix should not be reported as a failure when the
+    # meeting is already anchored to somewhere better.
+    if session_row.classroom_id:
+        room = db.session.get(Classroom, session_row.classroom_id)
+        if room is not None:
+            set_class_location(session_row.id, room.latitude, room.longitude)
+            return jsonify({"status": "ok", "classroom": room.name})
+
+    pin, problem = _read_pin(request.get_json(silent=True) or {})
+    if problem:
+        return jsonify({"status": "error", "message": problem}), 400
+
     set_class_location(session_row.id, *pin)
     app.logger.info('Classroom pinned for session %s via the legacy '
                     'course-scoped endpoint', session_row.id)
     return jsonify({"status": "ok"})
+
+
+# ============================================================
+# SAVED CLASSROOMS
+# ============================================================
+# Pin a lecture hall once, from a device that can actually see satellites, and
+# pick it from a dropdown for the rest of the term. See the Classroom model for
+# why the alternative — the projector laptop pinning itself at the start of
+# every class — cannot work.
+
+def _my_classrooms():
+    """Every saved room at the current user's university, A-Z."""
+    return (Classroom.query
+            .filter(institution_matches(Classroom.institution,
+                                        institution_of(current_user)))
+            .order_by(Classroom.name.asc())
+            .all())
+
+
+def _my_classroom(classroom_id):
+    """
+    One saved room, or None.
+
+    Scoped to the caller's institution: an id is a guessable integer, and
+    without the check a lecturer at one university could pin their class to
+    another's lecture hall — or learn where it is.
+    """
+    if not classroom_id:
+        return None
+    try:
+        classroom_id = int(classroom_id)
+    except (TypeError, ValueError):
+        return None
+    return (Classroom.query
+            .filter(Classroom.id == classroom_id,
+                    institution_matches(Classroom.institution,
+                                        institution_of(current_user)))
+            .first())
+
+
+def pin_session_to_classroom(session_row, room):
+    """
+    Hold this meeting in a saved room: remember it, and pin it now.
+
+    Both halves matter. The Redis pin is what the geofence reads on the hot
+    path; the column is what rebuilds it if Redis loses the key mid-lecture.
+    """
+    session_row.classroom_id = room.id
+    db.session.commit()
+    set_class_location(session_row.id, room.latitude, room.longitude)
+
+
+def _read_coordinates(form):
+    """
+    Coordinates from the add-a-classroom form, however they were supplied.
+
+    Either a captured fix (separate lat/lon fields, filled in by the browser)
+    or one pasted string — which is how coordinates leave a maps app, and
+    typing them into two boxes is an opportunity to swap them.
+
+    Returns (latitude, longitude, accuracy_m) or raises ValueError.
+    """
+    pasted = _clean_text(form.get('coordinates', ''), 80)
+    latitude_text = _clean_text(form.get('lat', ''), 40)
+    longitude_text = _clean_text(form.get('lon', ''), 40)
+
+    if pasted and not (latitude_text and longitude_text):
+        parts = [part for part in pasted.replace(',', ' ').split() if part]
+        if len(parts) != 2:
+            raise ValueError(
+                'Paste coordinates as two numbers, like "7.22609, 3.44156".')
+        latitude_text, longitude_text = parts
+
+    if not latitude_text or not longitude_text:
+        raise ValueError('Coordinates are required. Paste them from a map, or '
+                         'use "Use my current location" on a phone in the room.')
+    try:
+        latitude = float(latitude_text)
+        longitude = float(longitude_text)
+    except ValueError:
+        raise ValueError('Coordinates must be numbers, like "7.22609, 3.44156".')
+    # NaN and inf parse as floats, but they fail every comparison, so the
+    # `not (in range)` form below rejects them without a separate check. The
+    # accuracy branch further down needs one because its test is the other way
+    # round: `> the maximum` is False for NaN, which would read as "fine".
+    if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+        raise ValueError('That latitude or longitude is out of range. '
+                         'Latitude comes first, and is between -90 and 90.')
+
+    accuracy_m = None
+    reported = _clean_text(form.get('accuracy_m', ''), 20)
+    if reported:
+        try:
+            accuracy_m = float(reported)
+        except ValueError:
+            accuracy_m = None
+        else:
+            if not math.isfinite(accuracy_m) or accuracy_m < 0:
+                accuracy_m = None
+            elif accuracy_m > GEOFENCE_MAX_PIN_ACCURACY_M:
+                raise ValueError(
+                    f'That fix is only accurate to within {int(accuracy_m)}m, '
+                    f'which is too imprecise to mark a {GEOFENCE_RADIUS_M}m '
+                    f'classroom. Capture it on a phone, outdoors or by a '
+                    f'window, or paste the coordinates from a map instead.')
+    return latitude, longitude, accuracy_m
+
+
+@app.route('/classrooms')
+@login_required
+def classrooms():
+    """Manage the lecture halls this university takes attendance in."""
+    denied = require_role(*TEACHING_ROLES)
+    if denied:
+        return denied
+    return render_template('classrooms.html', classrooms=_my_classrooms(),
+                           geofence_radius_m=GEOFENCE_RADIUS_M,
+                           max_pin_accuracy_m=GEOFENCE_MAX_PIN_ACCURACY_M)
+
+
+@app.route('/classrooms/add', methods=['POST'])
+@login_required
+def add_classroom():
+    denied = require_role(*TEACHING_ROLES)
+    if denied:
+        return denied
+
+    name = _clean_text(request.form.get('name', ''), 80)
+    if not name:
+        flash('Give the room a name you will recognise in the dropdown, '
+              'like "LT1 – Main Hall".', 'error')
+        return redirect(url_for('classrooms'))
+
+    try:
+        latitude, longitude, accuracy_m = _read_coordinates(request.form)
+    except ValueError as problem:
+        flash(str(problem), 'error')
+        return redirect(url_for('classrooms'))
+
+    institution = institution_of(current_user)
+    existing = (Classroom.query
+                .filter(institution_matches(Classroom.institution, institution),
+                        func.lower(Classroom.name) == name.lower())
+                .first())
+    if existing:
+        # Re-pinning an existing room is the common second visit: somebody
+        # captured it from the doorway and wants it right. Refusing as a
+        # duplicate would send them to delete it first.
+        existing.latitude = latitude
+        existing.longitude = longitude
+        existing.accuracy_m = accuracy_m
+        db.session.commit()
+        flash(f'Updated the coordinates for {existing.name}.', 'success')
+        return redirect(url_for('classrooms'))
+
+    room = Classroom(institution=institution, name=name, latitude=latitude,
+                     longitude=longitude, accuracy_m=accuracy_m,
+                     created_by_id=current_user.id)
+    db.session.add(room)
+    try:
+        db.session.commit()
+    except IntegrityError:
+        # Two lecturers adding the same hall at once. The unique key is the
+        # arbiter, and the loser's row is simply the other one.
+        db.session.rollback()
+        flash(f'{name} is already saved.', 'info')
+        return redirect(url_for('classrooms'))
+
+    flash(f'Saved {room.name}. Pick it when you start a class.', 'success')
+    return redirect(url_for('classrooms'))
+
+
+@app.route('/classrooms/<int:classroom_id>/delete', methods=['POST'])
+@login_required
+def delete_classroom(classroom_id):
+    denied = require_role(*TEACHING_ROLES)
+    if denied:
+        return denied
+
+    room = _my_classroom(classroom_id)
+    if room is None:
+        flash('That classroom no longer exists.', 'warning')
+        return redirect(url_for('classrooms'))
+
+    # Meetings held here keep their history; they just stop being able to
+    # rebuild a lost pin from a room that no longer exists.
+    (db.session.query(ClassSession)
+     .filter(ClassSession.classroom_id == room.id)
+     .update({'classroom_id': None}, synchronize_session=False))
+    name = room.name
+    db.session.delete(room)
+    db.session.commit()
+    flash(f'Removed {name}.', 'success')
+    return redirect(url_for('classrooms'))
+
+
+@app.route('/session/<int:session_id>/classroom', methods=['POST'])
+@login_required
+def set_session_classroom(session_id):
+    """
+    Move a running class into a saved room.
+
+    The room is normally chosen when the class is started; this is the fix for
+    having forgotten, or for having started in the wrong one — without ending
+    the meeting and losing the scans already in it.
+    """
+    session_row = db.get_or_404(ClassSession, session_id)
+    course = db.get_or_404(Course, session_row.course_id)
+    if not _is_course_authorized(course):
+        flash('Unauthorised Access', 'error')
+        return redirect(url_for('dashboard'))
+    if not session_row.is_open:
+        flash('This class has ended.', 'warning')
+        return redirect(url_for('view_attendance', course_id=course.id))
+
+    room = _my_classroom(request.form.get('classroom_id'))
+    if room is None:
+        flash('Pick one of your saved classrooms.', 'error')
+        return redirect(url_for('session_qr', session_id=session_id))
+
+    pin_session_to_classroom(session_row, room)
+    app.logger.info('Session %s pinned to saved classroom %s', session_id, room.id)
+    flash(f'Attendance is now anchored to {room.name}.', 'success')
+    return redirect(url_for('session_qr', session_id=session_id))
 
 
 # ============================================================
@@ -4805,8 +5117,13 @@ def mark_attendance():
                 Course.code.label('course_code'),
                 Course.title.label('course_title'),
                 Course.archived.label('course_archived'),
+                # The saved room, so a pin Redis has lost can be rebuilt
+                # without a second round trip on the scan path.
+                Classroom.latitude.label('room_lat'),
+                Classroom.longitude.label('room_lon'),
             )
             .join(Course, Course.id == ClassSession.course_id)
+            .outerjoin(Classroom, Classroom.id == ClassSession.classroom_id)
             .where(ClassSession.id == session_id)
         ).mappings().one_or_none()
         checkpoint('session_course')
@@ -4893,7 +5210,10 @@ def mark_attendance():
                                'Please scan the current code.',
                                400, 'capture_out_of_window')
 
-        class_loc = get_class_location(target['session_id'], target['course_id'])
+        saved_room = (None if target['room_lat'] is None
+                      else (target['room_lat'], target['room_lon']))
+        class_loc = get_class_location(target['session_id'], target['course_id'],
+                                       saved_room=saved_room)
         if class_loc:
             try:
                 student_lat = float(data['lat'])
@@ -4960,8 +5280,11 @@ def mark_attendance():
             )
             return respond(
                 'error',
-                'This class has no pinned location yet. Ask your lecturer to '
-                'allow location access on the QR screen.',
+                # Naming the remedy the lecturer can actually carry out. It
+                # used to say "allow location access", which on a projector
+                # laptop is the advice that produced a pin 36km away.
+                'This class has no classroom set yet. Ask your lecturer to '
+                'choose one on the QR screen.',
                 422,
                 'no_class_location',
             )
@@ -5445,6 +5768,15 @@ def start_session(course_id):
 
     session_row = resume_or_start_session(course, kind=kind,
                                                 force_new=force_new, title=title)
+
+    # Where the class is being held, chosen here rather than guessed by the
+    # projector laptop's browser. Silently ignored when it names nothing: the
+    # meeting is already open, and bouncing back to the dashboard over a
+    # dropdown would strand it.
+    room = _my_classroom(request.form.get('classroom_id'))
+    if room is not None:
+        pin_session_to_classroom(session_row, room)
+
     return redirect(url_for('session_qr', session_id=session_row.id))
 
 
@@ -5631,6 +5963,10 @@ with app.app_context():
         ("class_session", "ended_by_id", "INTEGER"),
         ("class_session", "kind", "VARCHAR(20) DEFAULT 'Lecture'"),
         ("class_session", "sequence", "INTEGER DEFAULT 1"),
+        # Which saved room a meeting is held in. NULL on every existing row,
+        # which is exactly right: they were pinned from a browser, and there
+        # is no room to attribute that pin to after the fact.
+        ("class_session", "classroom_id", "INTEGER"),
         # When a student joined a course.
         ("enrollments", "enrolled_at", "TIMESTAMP"),
     ]

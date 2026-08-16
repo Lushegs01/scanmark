@@ -438,6 +438,10 @@ h1, h2, h3, h4, h5, h6 { font-weight: 700; }
   color: var(--text);
   --bs-table-bg: transparent;
   --bs-table-hover-bg: rgba(0, 90, 43, 0.04);
+  /* Bootstrap colours each CELL from this variable, and a rule on the cell
+     beats `color` inherited from the table — so without it every table in the
+     app rendered near-black text on the dark background. */
+  --bs-table-color: var(--text);
 }
 [data-theme="dark"] .table { --bs-table-hover-bg: rgba(255,255,255,0.04); }
 
@@ -853,5 +857,17 @@ h1, h2, h3, h4, h5, h6 { font-weight: 700; }
 .text-success { color: var(--green) !important; }
 [data-theme="dark"] .text-success { color: #38c57a !important; }
 .bg-light { background: var(--surface) !important; }
+/* Bootstrap's literal white beats the theme-aware `.card-header` rule above,
+   so a card header carrying it stayed a white band across a dark page. */
+.bg-white { background: var(--surface) !important; }
+/* Bootstrap fixes `.form-text` at a mid grey chosen for a white page. Left
+   alone it is all but unreadable on the dark background, which is where the
+   "paste the coordinates from a map" instructions live.
+
+   No `!important`, deliberately: this file loads after Bootstrap, so equal
+   specificity is enough to win the default — while `.text-danger` and
+   `.text-success`, which ARE important, still colour the same element when a
+   capture succeeds or fails. */
+.form-text { color: var(--text-secondary); }
 .border-bottom { border-color: var(--divider) !important; }
 hr { border-color: var(--divider); opacity: 1; margin: 1rem 0; }

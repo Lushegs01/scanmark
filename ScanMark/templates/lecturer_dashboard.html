@@ -1,5 +1,33 @@
 {% extends "base.html" %}
 
+{#
+  Where the class is being held. This is what anchors the geofence: the
+  projector laptop has no GPS, so letting its browser guess put the centre of
+  the fence tens of kilometres away and refused everyone in the room.
+
+  Rendered only when there are rooms to choose from — a lecturer who has not
+  saved any yet gets a link to do it rather than an empty dropdown.
+#}
+{% macro classroom_picker(classrooms, size) %}
+{% if classrooms %}
+<div class="input-group {{ 'input-group-sm' if size == 'sm' else '' }} mb-2">
+    <span class="input-group-text"><i class="fas fa-location-dot"></i></span>
+    <select name="classroom_id" class="form-select" aria-label="Classroom">
+        <option value="">Choose the classroom…</option>
+        {% for room in classrooms %}
+        <option value="{{ room.id }}">{{ room.name }}</option>
+        {% endfor %}
+    </select>
+</div>
+{% else %}
+<p class="small text-muted mb-2">
+    <i class="fas fa-location-dot me-1"></i>
+    <a href="{{ url_for('classrooms') }}">Save a classroom</a>
+    so students' distance is measured from the room, not from this laptop.
+</p>
+{% endif %}
+{% endmacro %}
+
 {% block content %}
 <div class="container page-wrap">
 
@@ -12,6 +40,9 @@
             <p class="page-subtitle mb-0 small">{{ current_term }}</p>
         </div>
         <div class="d-flex align-items-center gap-2 align-self-start">
+            <a class="btn btn-glass btn-sm" href="{{ url_for('classrooms') }}">
+                <i class="fas fa-school me-1"></i>Classrooms
+            </a>
             <a class="btn btn-glass btn-sm"
                 href="{{ url_for('lecturer_dashboard', archived=0 if show_archived else 1) }}">
                 {{ 'Hide archived' if show_archived else 'Show archived' }}
@@ -95,6 +126,7 @@
                     <form action="{{ url_for('start_session', course_id=course.id) }}" method="POST" class="mb-3">
                         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                         <input type="hidden" name="new_session" value="1">
+                        {{ classroom_picker(classrooms, 'sm') }}
                         <div class="input-group input-group-sm">
                             <select name="kind" class="form-select">
                                 <option>Lecture</option>
@@ -112,6 +144,7 @@
                     {% elif not course.archived %}
                     <form action="{{ url_for('start_session', course_id=course.id) }}" method="POST" class="mb-3">
                         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        {{ classroom_picker(classrooms, '') }}
                         <div class="input-group">
                             <select name="kind" class="form-select">
                                 <option>Lecture</option>
