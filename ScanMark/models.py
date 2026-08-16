@@ -165,9 +165,58 @@ class Course(db.Model):
         base = f"{self.academic_year} {self.semester} Semester"
         return f"{base} · Section {self.section}" if self.section else base
 
+class Classroom(db.Model):
+    """
+    A lecture hall, pinned once and reused every term.
+
+    The alternative was pinning from the browser at the start of every class,
+    and the machine driving the projector is a laptop: no GPS, so the fix comes
+    from Wi-Fi or the IP address and can land tens of kilometres away. Every
+    student in the room is then told they are too far from it. A room's
+    coordinates do not change between Monday and Friday, so they belong in the
+    database, captured once from a device that can actually see satellites.
+
+    Institution-scoped like Course and User: "LT1" exists at more or less every
+    university, and one of them must not be able to see — or pin a class
+    against — another's rooms.
+    """
+    id = db.Column(db.Integer, primary_key=True)
+    institution = db.Column(db.String(120), nullable=False, default='',
+                            server_default='', index=True)
+    name = db.Column(db.String(80), nullable=False)
+    latitude = db.Column(db.Float, nullable=False)
+    longitude = db.Column(db.Float, nullable=False)
+
+    # How precise the fix was when the room was pinned, in metres, or NULL for
+    # a set of coordinates typed in by hand (a map has no error radius to
+    # report). Kept so the list can flag a room that was pinned badly, rather
+    # than leaving a lecturer to work that out from students being refused.
+    accuracy_m = db.Column(db.Float, nullable=True)
+
+    created_by_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=utcnow_naive)
+
+    __table_args__ = (
+        # One "LT1" per university. Two rooms with the same name are a mistake
+        # somebody will make at the start of term, and the wrong one being
+        # picked from the dropdown fails silently at scan time.
+        db.UniqueConstraint('institution', 'name',
+                            name='uq_classroom_name_per_institution'),
+    )
+
+
 class ClassSession(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     course_id = db.Column(db.Integer, db.ForeignKey('course.id'), nullable=False)
+
+    # Which saved room this meeting is being held in, when one was chosen.
+    # The live pin lives in Redis (it expires with the class), but Redis is a
+    # cache: a restart or an eviction mid-lecture would drop the pin and, with
+    # GEOFENCE_REQUIRED on, refuse every remaining scan. Recording the room
+    # here means the pin can always be rebuilt from the database.
+    classroom_id = db.Column(db.Integer, db.ForeignKey('classroom.id'),
+                             nullable=True)
+    classroom = db.relationship('Classroom')
     title = db.Column(db.String(100), nullable=False)  # e.g., "Week 1", "Makeup Class"
     # When the meeting was opened. Naive UTC, like every other timestamp here.
     date_created = db.Column(db.DateTime, default=utcnow_naive)

@@ -25,7 +25,20 @@
             Code refreshes in <span id="timer" class="fw-bold text-danger">{{ qr_token_ttl }}</span>s
         </p>
 
-        <!-- FIX #2: Only ONE location status block -->
+        {# Where the geofence is centred. A saved room is the authoritative
+           answer and the page must not re-derive one from this machine's
+           browser: a projector laptop has no GPS and locates itself from
+           Wi-Fi or its IP address, which is what put the fence 36km away and
+           refused everyone in the room. #}
+        {% if classroom %}
+        <div class="alert alert-success d-flex align-items-center justify-content-center gap-2"
+            id="locationAlert">
+            <span>
+                <strong>Classroom:</strong>
+                <span id="locationStatus">{{ classroom.name }} ✅</span>
+            </span>
+        </div>
+        {% else %}
         <div class="alert d-flex align-items-center justify-content-center gap-2" id="locationAlert">
             <span class="spinner-grow spinner-grow-sm text-warning" role="status"></span>
             <span>
@@ -33,6 +46,41 @@
                 <span id="locationStatus">Acquiring GPS...</span>
             </span>
         </div>
+        {% endif %}
+
+        {# Changing the room mid-class, or setting it for a class started
+           before any rooms were saved. Either way it must not cost the scans
+           already in this meeting, so it is not "end and start again".
+
+           The pinned room is left out of the list on purpose: this control
+           exists to CHANGE the room, and offering the current one back as an
+           option makes its button read as a no-op. Which also means there is
+           nothing to show when the only saved room is the one already in use. #}
+        {% set other_rooms = classrooms | rejectattr('id', 'equalto', classroom.id if classroom else None) | list %}
+        {% if other_rooms %}
+        <form method="POST" action="{{ url_for('set_session_classroom', session_id=session.id) }}"
+            class="mb-2">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <div class="input-group input-group-sm">
+                <span class="input-group-text"><i class="fas fa-location-dot"></i></span>
+                <select name="classroom_id" class="form-select" aria-label="Classroom">
+                    <option value="">{{ 'Move this class to another room…' if classroom else 'Anchor this class to a classroom…' }}</option>
+                    {% for room in other_rooms %}
+                    <option value="{{ room.id }}">{{ room.name }}</option>
+                    {% endfor %}
+                </select>
+                <button type="submit" class="btn btn-outline-success">
+                    {{ 'Move class' if classroom else 'Use this room' }}
+                </button>
+            </div>
+        </form>
+        {% elif not classroom %}
+        <p class="small text-muted mb-2">
+            No classrooms saved yet —
+            <a href="{{ url_for('classrooms') }}" target="_blank" rel="noopener">add one</a>
+            to measure students' distance from the room instead of from this machine.
+        </p>
+        {% endif %}
 
         <!-- Ending the class is a server-side action, not a navigation. This
              used to be a GET form pointing at the dashboard, so the class
@@ -241,6 +289,15 @@
     // FIX #6: Re-send location every 30 seconds so it stays fresh
     const CSRF_TOKEN = "{{ csrf_token() }}";
 
+    // A saved room already fixes the centre of the geofence, and it was
+    // captured somewhere that could see satellites. Asking this machine where
+    // it is would only overwrite a good pin with a worse one.
+    const CLASSROOM_PINNED = {{ 'true' if classroom else 'false' }};
+
+    // The server refuses a pin less precise than this, so the same number
+    // decides what the page bothers sending. A laptop reports thousands.
+    const MAX_PIN_ACCURACY_M = {{ max_pin_accuracy_m }};
+
     function setClassLocation() {
         if (!navigator.geolocation) {
             showLocationError("Geolocation is not supported by this browser.");
@@ -251,15 +308,26 @@
             function (position) {
                 const lat = position.coords.latitude;
                 const lon = position.coords.longitude;
+                const accuracy = Math.round(position.coords.accuracy);
 
                 // Update UI to show active status
                 const statusEl = document.getElementById('locationStatus');
                 const alertEl = document.getElementById('locationAlert');
 
-                statusEl.innerText = `Active ✅ (${lat.toFixed(5)}, ${lon.toFixed(5)})`;
+                if (accuracy > MAX_PIN_ACCURACY_M) {
+                    // The 36km case, caught here instead of by every student
+                    // in the room being told THEY are in the wrong place.
+                    showLocationError(
+                        `This machine only knows where it is to within ${accuracy}m, ` +
+                        `so it cannot mark the classroom. Pick a saved classroom below.`);
+                    return;
+                }
+
+                statusEl.innerText = `Active ✅ (${lat.toFixed(5)}, ${lon.toFixed(5)}, ±${accuracy}m)`;
                 alertEl.classList.remove('alert-warning', 'alert-danger');
                 alertEl.classList.add('alert-success');
-                alertEl.querySelector('.spinner-grow').classList.add('d-none'); // Hide spinner
+                const spinner = alertEl.querySelector('.spinner-grow');
+                if (spinner) spinner.classList.add('d-none'); // Hide spinner
 
                 // Pinned against THIS meeting, not the course: the lecture,
                 // the tutorial and the makeup class are legitimately in
@@ -270,10 +338,19 @@
                         'Content-Type': 'application/json',
                         'X-CSRFToken': CSRF_TOKEN
                     },
-                    body: JSON.stringify({ lat: lat, lon: lon })
+                    // Accuracy travels with the pin so the server can apply the
+                    // same rule; a page that lied by omission used to be taken
+                    // at its word.
+                    body: JSON.stringify({ lat: lat, lon: lon, accuracy_m: accuracy })
                 })
                     .then(res => res.json())
-                    .then(data => console.log("✅ Location updated:", data))
+                    .then(data => {
+                        if (data.status === 'error') {
+                            showLocationError(data.message);
+                            return;
+                        }
+                        console.log("✅ Location updated:", data);
+                    })
                     .catch(err => console.error("❌ Location send error:", err));
             },
 
@@ -308,10 +385,18 @@
         statusEl.innerText = "⚠️ " + msg + NO_LOCATION_CONSEQUENCE;
         alertEl.classList.remove('alert-success', 'alert-warning');
         alertEl.classList.add('alert-danger');
+        // Nothing is still in progress. A spinner left running under a
+        // finished error reads as "wait, it may yet sort itself out".
+        const spinner = alertEl.querySelector('.spinner-grow');
+        if (spinner) spinner.classList.add('d-none');
     }
 
-    // Run immediately on page load, then every 30 seconds (FIX #6)
-    setClassLocation();
-    setInterval(setClassLocation, 30000);
+    // Run immediately on page load, then every 30 seconds (FIX #6) — unless a
+    // saved room has already answered the question, in which case there is
+    // nothing to refresh and no permission prompt to inflict.
+    if (!CLASSROOM_PINNED) {
+        setClassLocation();
+        setInterval(setClassLocation, 30000);
+    }
 </script>
 {% endblock %}

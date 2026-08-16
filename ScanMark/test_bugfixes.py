@@ -1457,6 +1457,53 @@ class TestUpgradingAnExistingDatabase:
         finally:
             connection.close()
 
+    def test_saved_classrooms_arrive_with_somewhere_to_attach_them(
+            self, tmp_path):
+        """
+        The classroom table is new, so `create_all` makes it — but the column
+        on `class_session` that points at it is an addition to a table that
+        already exists, and `create_all` never alters one of those. Without
+        the migration step, every read of a session 500s on a column the
+        model declares and the database does not have.
+        """
+        import sqlite3
+
+        database, _output = self._boot_against(tmp_path)
+
+        connection = sqlite3.connect(database)
+        try:
+            columns = [row[1] for row in connection.execute(
+                'PRAGMA table_info(class_session)')]
+            assert 'classroom_id' in columns
+            # Meetings that predate saved rooms were pinned from a browser and
+            # there is no room to attribute that to after the fact.
+            assert connection.execute(
+                'SELECT classroom_id FROM class_session').fetchone()[0] is None
+
+            insert = ('INSERT INTO classroom (institution,name,latitude,'
+                      'longitude,created_at) VALUES (?,?,?,?,?)')
+            connection.execute(insert, ('funaab.edu.ng', 'LT1', 7.22, 3.44,
+                                        '2026-03-01 09:00:00'))
+            connection.commit()
+            # One LT1 per university, and the next university may have its own.
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(insert, ('funaab.edu.ng', 'LT1', 7.30, 3.50,
+                                            '2026-03-01 09:00:00'))
+                connection.commit()
+            connection.rollback()
+            connection.execute(insert, ('unilag.edu.ng', 'LT1', 6.51, 3.39,
+                                        '2026-03-01 09:00:00'))
+            connection.commit()
+
+            connection.execute(
+                'UPDATE class_session SET classroom_id = '
+                '(SELECT id FROM classroom WHERE institution = ?)',
+                ('funaab.edu.ng',))
+            connection.commit()
+            assert connection.execute('PRAGMA foreign_key_check').fetchall() == []
+        finally:
+            connection.close()
+
     def test_booting_twice_over_the_same_database_changes_nothing(self, tmp_path):
         import os
         import subprocess

@@ -1,0 +1,197 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container my-5" style="max-width: 900px;">
+
+    <div class="mb-4">
+        <h2 class="fw-bold mb-1">Classrooms</h2>
+        <p class="text-muted mb-0">
+            Pin each lecture hall once, then pick it from the dropdown every time
+            you start a class. Students must be within
+            {{ geofence_radius_m }}m of the room's coordinates to mark attendance.
+        </p>
+    </div>
+
+    <div class="alert alert-info d-flex gap-2 align-items-start">
+        <i class="fas fa-lightbulb mt-1"></i>
+        <div>
+            <strong>Pin it from a phone, standing in the room.</strong>
+            A laptop has no GPS — it works out where it is from Wi-Fi or its
+            internet connection, which can be tens of kilometres out. Open this
+            page on your phone in the lecture hall and tap
+            <em>Use my current location</em>, or paste the coordinates from a
+            maps app.
+        </div>
+    </div>
+
+    <!-- Add / re-pin a room -->
+    <div class="card shadow-sm border-0 mb-4">
+        <div class="card-header bg-white py-3">
+            <h5 class="mb-0 fw-bold text-success">
+                <i class="fas fa-plus me-1"></i> Add a classroom
+            </h5>
+        </div>
+        <div class="card-body">
+            <form method="POST" action="{{ url_for('add_classroom') }}" id="classroomForm">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                {# Filled in by "Use my current location". The typed field
+                   below is the fallback, and either one is enough. #}
+                <input type="hidden" name="lat" id="capturedLat">
+                <input type="hidden" name="lon" id="capturedLon">
+                <input type="hidden" name="accuracy_m" id="capturedAccuracy">
+
+                <div class="row g-3">
+                    <div class="col-12 col-md-5">
+                        <label class="form-label small fw-bold" for="roomName">Room name</label>
+                        <input type="text" class="form-control" id="roomName" name="name"
+                            maxlength="80" required placeholder="LT1 – Main Hall">
+                        <div class="form-text">What you'll recognise in the dropdown.</div>
+                    </div>
+                    <div class="col-12 col-md-7">
+                        <label class="form-label small fw-bold" for="coordinates">Coordinates</label>
+                        <div class="input-group">
+                            <input type="text" class="form-control" id="coordinates" name="coordinates"
+                                maxlength="80" placeholder="7.22609, 3.44156" autocomplete="off">
+                            <button class="btn btn-outline-success" type="button" id="captureBtn">
+                                <i class="fas fa-location-crosshairs me-1"></i> Use my current location
+                            </button>
+                        </div>
+                        <div class="form-text" id="captureStatus">
+                            Latitude first. In Google Maps, long-press the room and copy the numbers.
+                        </div>
+                    </div>
+                </div>
+
+                <button type="submit" class="btn btn-success mt-3">
+                    <i class="fas fa-save me-1"></i> Save classroom
+                </button>
+            </form>
+        </div>
+    </div>
+
+    <!-- Saved rooms -->
+    <div class="card shadow-sm border-0">
+        <div class="card-header bg-white py-3">
+            <h5 class="mb-0 fw-bold text-success">
+                <i class="fas fa-school me-1"></i> Saved classrooms
+            </h5>
+        </div>
+        <div class="card-body p-0">
+            {% if classrooms %}
+            <div class="table-responsive">
+                <table class="table table-hover align-middle mb-0">
+                    <thead class="bg-light">
+                        <tr>
+                            <th class="ps-4">Room</th>
+                            <th>Coordinates</th>
+                            <th class="text-center">Pinned to within</th>
+                            <th class="text-end pe-4">&nbsp;</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for room in classrooms %}
+                        <tr>
+                            <td class="ps-4 fw-bold">{{ room.name }}</td>
+                            <td class="text-muted font-monospace small">
+                                {{ '%.5f'|format(room.latitude) }}, {{ '%.5f'|format(room.longitude) }}
+                            </td>
+                            <td class="text-center">
+                                {% if room.accuracy_m %}
+                                <span class="badge bg-success">±{{ room.accuracy_m|round|int }}m</span>
+                                {% else %}
+                                <span class="text-muted small">entered by hand</span>
+                                {% endif %}
+                            </td>
+                            <td class="text-end pe-4">
+                                <form method="POST" class="d-inline"
+                                    action="{{ url_for('delete_classroom', classroom_id=room.id) }}"
+                                    onsubmit="return confirm('Remove {{ room.name }}? Classes already held there keep their attendance.')">
+                                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                    <button type="submit" class="btn btn-outline-danger btn-sm">Remove</button>
+                                </form>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% else %}
+            <div class="text-center py-5">
+                <span style="font-size: 3rem;">🏫</span>
+                <p class="mt-3 text-muted mb-0">
+                    No classrooms saved yet. Add the halls you teach in and they'll
+                    be waiting in the dropdown every term.
+                </p>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+
+    <a href="{{ url_for('lecturer_dashboard') }}" class="btn btn-link mt-3">← Back to my courses</a>
+</div>
+
+<script>
+    // The accuracy the server will accept for a pin. Checking it here too means
+    // a bad fix is caught while the lecturer is still standing in the room,
+    // rather than after a round trip.
+    const MAX_PIN_ACCURACY_M = {{ max_pin_accuracy_m }};
+
+    const captureBtn = document.getElementById('captureBtn');
+    const statusEl = document.getElementById('captureStatus');
+    const coordinatesEl = document.getElementById('coordinates');
+
+    function say(message, tone) {
+        statusEl.textContent = message;
+        statusEl.className = 'form-text ' + (tone || '');
+    }
+
+    captureBtn.addEventListener('click', function () {
+        if (!navigator.geolocation) {
+            say('This browser cannot report a location. Paste the coordinates instead.', 'text-danger');
+            return;
+        }
+        captureBtn.disabled = true;
+        say('Getting a fix — this is more accurate outdoors or by a window...');
+
+        navigator.geolocation.getCurrentPosition(
+            function (position) {
+                captureBtn.disabled = false;
+                const accuracy = Math.round(position.coords.accuracy);
+                if (accuracy > MAX_PIN_ACCURACY_M) {
+                    // Almost always a laptop: no GPS, so the fix comes from
+                    // Wi-Fi or the IP address and is kilometres wide.
+                    say('This device only knows where it is to within ' + accuracy +
+                        'm — too imprecise to pin a classroom. Try a phone standing ' +
+                        'in the room, or paste the coordinates from a map.', 'text-danger');
+                    return;
+                }
+                document.getElementById('capturedLat').value = position.coords.latitude;
+                document.getElementById('capturedLon').value = position.coords.longitude;
+                document.getElementById('capturedAccuracy').value = accuracy;
+                coordinatesEl.value = position.coords.latitude.toFixed(5) + ', ' +
+                    position.coords.longitude.toFixed(5);
+                say('Got it — accurate to about ' + accuracy + 'm. Name the room and save.',
+                    'text-success');
+            },
+            function (error) {
+                captureBtn.disabled = false;
+                const messages = {
+                    1: 'Location permission was denied. Allow it, or paste the coordinates.',
+                    2: 'Your device could not work out where it is. Try outdoors, or paste the coordinates.',
+                    3: 'Timed out looking for a fix. Try again outdoors, or paste the coordinates.'
+                };
+                say(messages[error.code] || 'Could not get a location.', 'text-danger');
+            },
+            { enableHighAccuracy: true, timeout: 20000, maximumAge: 0 }
+        );
+    });
+
+    // Typing coordinates by hand replaces a captured fix; leaving the hidden
+    // fields set would silently save the old one under the new numbers.
+    coordinatesEl.addEventListener('input', function () {
+        document.getElementById('capturedLat').value = '';
+        document.getElementById('capturedLon').value = '';
+        document.getElementById('capturedAccuracy').value = '';
+    });
+</script>
+{% endblock %}

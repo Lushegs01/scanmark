@@ -126,6 +126,50 @@ that id is how you find the message there.
 | `Brevo refused the sender ...` | That exact address is not verified in the Brevo dashboard. |
 | `Brevo returned 429 / 402` | The account's sending limit, not a configuration problem. |
 
+## Where the geofence gets its centre
+
+Attendance is refused beyond `GEOFENCE_RADIUS_M` from the classroom. That
+distance is measured from a **pin**, and where the pin comes from is the whole
+question.
+
+Originally the projector page asked its browser. Lecturers project from a
+laptop, and a laptop has no GPS: it locates itself from Wi-Fi or its IP
+address, which in practice lands tens of kilometres away. The pin is the
+centre of the fence, so its error is added to everybody's — every student in
+the hall is refused, and told *they* are too far away.
+
+**Saved classrooms** are the fix. Under `/classrooms`, teaching staff pin each
+lecture hall once — from a phone standing in the room, or by pasting the
+coordinates off a map — and give it a name. That room is then picked from a
+dropdown when a class is started, or attached to a class already running from
+the projector page. The laptop never needs to know where it is.
+
+Operationally:
+
+- **Rooms are per institution.** Every university has an LT1; one deployment
+  serves several, and neither may see or use another's.
+- **A page with a saved room does not geolocate at all** — no permission
+  prompt, and no chance of a worse answer overwriting a good one. The server
+  enforces the same precedence, so a projector page left open across a deploy
+  cannot drag the fence off the hall either.
+- **A browser pin is still accepted when it is precise enough** — pinning from
+  a phone in the room was never the broken case. `GEOFENCE_MAX_PIN_ACCURACY_M`
+  is the threshold, and a pin that fails it is refused with a message naming
+  saved classrooms as the way out.
+- **A lost Redis pin rebuilds itself.** The live pin is a Redis key with
+  `CLASS_LOCATION_TTL`; a restart or an eviction mid-lecture used to refuse
+  every remaining scan. The room is recorded on the session row, so the pin is
+  rebuilt from the database on the next scan — read in a join the scan path was
+  already doing, so it costs no extra query.
+- **Deleting a room keeps its history.** Sessions held there lose only the
+  ability to rebuild a lost pin; their attendance is untouched.
+
+Before the first class of term, check that each hall a course meets in has a
+row under `/classrooms`. A course whose lecturer never picks one falls back to
+the browser pin, and with `GEOFENCE_REQUIRED` on (the default) an imprecise
+laptop fix now refuses the class *loudly* on the projector screen rather than
+quietly at every phone.
+
 ## Environment variables
 
 | Variable | Default | Notes |
@@ -146,6 +190,7 @@ that id is how you find the message there.
 | `GEOFENCE_REQUIRED` | **true** | What happens when a lecturer never pins a classroom (they dismissed the browser's GPS prompt). Defaults **on**: with nothing to measure against, the scan is refused. Off, the failure is silent and total — a lecturer who dismissed one prompt records a whole term of attendance that anyone could have submitted from anywhere, with nothing on the register saying so. Refusing is loud and fixable in ten seconds by granting location on the QR screen, which tells the lecturer which of the two applies. |
 | `GEOFENCE_MAX_ACCURACY_M` | `GEOFENCE_RADIUS_M` | Reported GPS accuracy beyond which a fix proves nothing. The reading is refused rather than used to widen the fence — accuracy is self-reported, so treating it as an allowance would be a free pass for the asking. |
 | `GEOFENCE_MAX_LOCATION_AGE_MS` | 30000 | Oldest position fix a scan may carry. Both this and `accuracy_m` are now **required** on a scan when a classroom is pinned; they used to be read only if present, so omitting them was the way past every proximity check. |
+| `GEOFENCE_MAX_PIN_ACCURACY_M` | `GEOFENCE_RADIUS_M` | Worst accuracy a **classroom pin** may report. The pin is the centre of the fence, so its error is added to every student's: a pin 36km out refuses the whole room and blames the students for it. Lecturers project from laptops, which have no GPS and locate themselves from Wi-Fi or their IP address, honestly reporting kilometres — that is what this catches. Safe to enforce only because of saved classrooms (below). |
 | `SCAN_ADMISSION_RATE` | 0 (off) | Scans per second per session that admission control lets through to the database. A token bucket in Redis smooths the burst a projected QR code creates — arrival rate rather than sustainable rate otherwise decides how much work Postgres is asked to do in the first second. **Set from the staging matrix**: the default is 0 because a number invented in code would be a guess with the authority of a default. Fails open if Redis is unreachable, so a limiter outage never becomes an attendance outage. |
 | `SCAN_ADMISSION_BURST` | one second of `SCAN_ADMISSION_RATE` | Instantaneous burst allowed through untouched before shaping starts. A class arriving inside the sustainable rate never meets this code. |
 | `SCAN_ADMISSION_RETRY_SECONDS` | 0.5 | `Retry-After` on a shed scan. Deliberately sub-second: this smooths microbursts, it does not queue attendance. |
