@@ -48,7 +48,14 @@
 
     const MAX_ANALYSIS_WIDTH = 960;
     const TARGET_INTERVAL_MS = 125;
+    // How old a fix may be before we look for a better one. Deliberately
+    // tighter than the server's limit, so there is room to get a fresh fix
+    // and still post inside it.
     const POSITION_MAX_AGE_MS = 10000;
+    // What the SERVER will refuse. Sent by the page; the fallback matches
+    // GEOFENCE_MAX_LOCATION_AGE_MS's own default.
+    const SERVER_MAX_AGE_MS = Number(config.maxLocationAgeMs) > 0
+        ? Number(config.maxLocationAgeMs) : 30000;
     const TRANSIENT_RETRY_LIMIT = 3;
     // How many times we may re-read the same projected code and resubmit on
     // our own after a rejection the student could plausibly fix (an expired
@@ -72,6 +79,7 @@
     let resumeTimeoutId = null;
     let bannerTimeoutId = null;
     let latestPosition = null;
+    let watchId = null;
     let cameraStartedAt = 0;
     let cameraReadyMs = 0;
     let qrCapturedAt = 0;
@@ -99,27 +107,59 @@
         bannerTimeoutId = setTimeout(() => resultBanner.classList.add('d-none'), 7000);
     }
 
-    function prewarmLocation() {
-        if (!navigator.geolocation) return;
-        navigator.geolocation.getCurrentPosition(
+    /**
+     * A problem with the fix itself, not with the network.
+     *
+     * Retrying it immediately gets the same cached fix, so these are handed
+     * back to the student with the reason rather than swallowed by the
+     * transient-retry path — which is what used to happen to a GPS permission
+     * denial, reported as "Network busy" while the network was fine.
+     */
+    function locationError(message) {
+        const error = new Error(message);
+        error.locationProblem = true;
+        return error;
+    }
+
+    function positionAge(position) {
+        // Clock skew between the fix's stamp and now can read negative; the
+        // server floors it at zero, so judge it the same way here.
+        return Math.max(0, Date.now() - position.timestamp);
+    }
+
+    /**
+     * Keep a fix arriving while the camera is open.
+     *
+     * A position fetched only at the moment of a scan is the slowest possible
+     * way to get one: the GPS is cold exactly when the student is waiting.
+     * Watching from camera start means there is usually a recent fix in hand
+     * before the code is even read.
+     */
+    function startWatchingLocation() {
+        if (!navigator.geolocation || watchId !== null) return;
+        watchId = navigator.geolocation.watchPosition(
             position => { latestPosition = position; },
-            () => {},
-            { enableHighAccuracy: true, timeout: 8000, maximumAge: POSITION_MAX_AGE_MS }
+            () => {},        // failures are reported at scan time, not here
+            { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
         );
+    }
+
+    function stopWatchingLocation() {
+        if (watchId === null) return;
+        navigator.geolocation.clearWatch(watchId);
+        watchId = null;
     }
 
     function recentPosition() {
         if (!latestPosition) return null;
-        return Date.now() - latestPosition.timestamp <= POSITION_MAX_AGE_MS
+        return positionAge(latestPosition) <= POSITION_MAX_AGE_MS
             ? latestPosition : null;
     }
 
-    function acquirePosition() {
-        const cached = recentPosition();
-        if (cached) return Promise.resolve(cached);
+    function requestPosition(maximumAge) {
         return new Promise((resolve, reject) => {
             if (!navigator.geolocation) {
-                reject(new Error('Geolocation is not supported by this browser.'));
+                reject(locationError('Geolocation is not supported by this browser.'));
                 return;
             }
             navigator.geolocation.getCurrentPosition(
@@ -127,10 +167,45 @@
                     latestPosition = position;
                     resolve(position);
                 },
-                () => reject(new Error('Location is required. Allow GPS and scan again.')),
-                { enableHighAccuracy: true, timeout: 10000, maximumAge: POSITION_MAX_AGE_MS }
+                () => reject(locationError(
+                    'Location is required. Allow GPS access and scan again.')),
+                { enableHighAccuracy: true, timeout: 10000, maximumAge: maximumAge }
             );
         });
+    }
+
+    /**
+     * A fix the server will accept, or an error saying why not.
+     *
+     * maximumAge is a hint, not a promise: Android's fused provider hands
+     * back a last-known location — minutes or hours old — whenever it cannot
+     * get a fresh one, typically indoors, which is exactly where a lecture
+     * happens. Posting that earns "Location fix is stale" from the server
+     * after a pointless round trip, so ask again with maximumAge: 0 to force
+     * a real fix, and only give up when that is stale too.
+     */
+    async function acquirePosition() {
+        const cached = recentPosition();
+        if (cached) return cached;
+
+        let position = await requestPosition(POSITION_MAX_AGE_MS);
+        if (positionAge(position) > SERVER_MAX_AGE_MS) {
+            status('Getting a fresh location...', 'scanning');
+            try {
+                position = await requestPosition(0);
+            } catch (_) {
+                // Keep the stale one's error below rather than the timeout's:
+                // "your phone gave us an old fix" is the useful sentence.
+            }
+        }
+        if (positionAge(position) > SERVER_MAX_AGE_MS) {
+            throw locationError(
+                'Your phone is reporting a location from ' +
+                `${Math.round(positionAge(position) / 1000)}s ago, which is too ` +
+                'old to prove you are in the classroom. Move near a window or ' +
+                'step outside for a moment, then scan again.');
+        }
+        return position;
     }
 
     async function configureDetector() {
@@ -178,7 +253,7 @@
         rejectionStreak = 0;
         retryAttempt = 0;
         cameraStartedAt = performance.now();
-        prewarmLocation();
+        startWatchingLocation();
         container.style.display = 'block';
         document.body.style.overflow = 'hidden';
         loader.style.display = 'block';
@@ -216,6 +291,10 @@
     function stopScanner() {
         active = false;
         decodePending = false;
+        // The watch exists to have a fix ready for a scan. With the camera
+        // closed there is nothing to scan, and a live GPS watch is one of the
+        // most expensive things a page can leave running on a phone.
+        stopWatchingLocation();
         clearInterval(focusIntervalId);
         clearTimeout(resumeTimeoutId);
         if (animationFrameId !== null) cancelAnimationFrame(animationFrameId);
@@ -414,6 +493,14 @@
             result(message, 'danger');
             resumeScanning(1200);
         } catch (error) {
+            if (error && error.locationProblem) {
+                retryAttempt = 0;
+                rejectionStreak = 0;
+                result(`${error.message} Tap "Start Advanced Scanner" to try again.`,
+                       'danger');
+                stopScanner();
+                return;
+            }
             if (retryAttempt < TRANSIENT_RETRY_LIMIT) {
                 const delay = retryDelay();
                 status(`Network busy; retrying in ${Math.ceil(delay / 1000)}s`, 'error');
