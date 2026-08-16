@@ -4384,7 +4384,12 @@ def scan_page():
     # the "you haven't marked attendance yet" empty state, however many
     # classes they had actually attended.
     _courses, attendance_data = _student_attendance_summary()
-    return render_template('scan.html', attendance_data=attendance_data)
+    # The page enforces the same freshness rule the scan endpoint does, so a
+    # fix it already knows is too old is replaced before it is posted rather
+    # than after a round trip. Two separately maintained numbers would drift.
+    return render_template('scan.html', attendance_data=attendance_data,
+                           max_location_age_ms=GEOFENCE_MAX_LOCATION_AGE_MS,
+                           max_location_accuracy_m=GEOFENCE_MAX_ACCURACY_M)
 
 
 def _read_pin(data):

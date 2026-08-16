@@ -2183,3 +2183,40 @@ class TestMatricNumbersAreScopedToTheirUniversity:
             unbound = User.query.filter_by(email='clash@gmail.com').first()
             assert unbound.institution == ''      # not half-bound
             assert not unbound.enrolled_courses
+
+
+class TestScanPageLocationRules:
+    """
+    The page enforces the same freshness rule the scan endpoint does, so a
+    fix the phone already knows is too old is replaced before it is posted.
+    Two separately maintained numbers would drift apart, and the drift would
+    show up as students being refused for a rule the page never applied.
+    """
+
+    def test_the_page_is_told_the_servers_limits(self, appmod, seed, login):
+        student = login(seed['student_email'])
+        body = student.get('/scan_page').get_data(as_text=True)
+
+        assert f'maxLocationAgeMs: {appmod.GEOFENCE_MAX_LOCATION_AGE_MS}' in body
+        assert f'maxLocationAccuracyM: {appmod.GEOFENCE_MAX_ACCURACY_M}' in body
+
+    def test_the_scanner_asks_for_a_fresh_fix_when_the_cached_one_is_stale(self):
+        """
+        maximumAge is a hint: Android returns a last-known location, minutes
+        old, whenever it cannot get a fresh fix — which is indoors, which is
+        where a lecture is. Without the forced-fresh retry that gets posted
+        and the server refuses it as stale.
+        """
+        scanner = open('static/scanner.js', encoding='utf-8').read()
+
+        assert 'requestPosition(0)' in scanner, \
+            'nothing forces a fresh fix when the OS hands back an old one'
+        assert 'SERVER_MAX_AGE_MS' in scanner
+        # The watch is what keeps a recent fix in hand before the code is read.
+        assert 'watchPosition' in scanner
+        assert 'clearWatch' in scanner, 'a live GPS watch must not outlive the camera'
+
+    def test_a_location_problem_is_not_reported_as_a_network_problem(self):
+        """It used to fall into the transient-retry path: "Network busy"."""
+        scanner = open('static/scanner.js', encoding='utf-8').read()
+        assert 'locationProblem' in scanner

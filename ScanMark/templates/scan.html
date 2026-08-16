@@ -438,7 +438,11 @@
     window.SCANMARK_SCANNER_CONFIG = {
         csrfToken: "{{ csrf_token() }}",
         userMarker: "{{ current_user.id }}",
-        endpoint: "{{ url_for('mark_attendance') }}"
+        endpoint: "{{ url_for('mark_attendance') }}",
+        // The server's own limits, so the page cannot enforce a different
+        // rule than the one that will judge the scan.
+        maxLocationAgeMs: {{ max_location_age_ms }},
+        maxLocationAccuracyM: {{ max_location_accuracy_m }}
     };
 </script>
 <script src="{{ static_url('scanner.js') }}"></script>
