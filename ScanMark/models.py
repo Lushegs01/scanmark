@@ -35,11 +35,14 @@ class User(UserMixin, db.Model):
     # Which university this person belongs to, as the domain their address
     # sits under ('funaab.edu.ng', 'unilag.edu.ng'). One deployment serves
     # several, so this is what keeps one university's courses, rosters and
-    # dashboards out of another's. Derived from the address at signup;
-    # NULL for a personal-email account until it registers for its first
-    # course, and NULL on rows that predate the column until the boot
-    # backfill reaches them.
-    institution = db.Column(db.String(120), nullable=True, index=True)
+    # dashboards out of another's. Derived from the address at signup.
+    #
+    # Empty string rather than NULL — a personal-email account has none until
+    # it registers for its first course, and NULL would take it out of the
+    # matric uniqueness rule below entirely, because SQL treats every NULL as
+    # distinct from every other.
+    institution = db.Column(db.String(120), nullable=False, default='',
+                            server_default='', index=True)
     full_name = db.Column(db.String(100), nullable=False)
     email = db.Column(db.String(120), unique=True, nullable=False)
     password = db.Column(db.String(200), nullable=False)
@@ -69,7 +72,10 @@ class User(UserMixin, db.Model):
     department = db.Column(db.String(50), nullable=True)
 
     # Student Specifics (Nullable for Staff)
-    matric_no = db.Column(db.String(20), unique=True, nullable=True)
+    # NOT globally unique: a matric number identifies a student within their
+    # own university, and two universities' numbering formats can collide.
+    # The rule lives in __table_args__ as (institution, matric_no).
+    matric_no = db.Column(db.String(20), nullable=True)
     level = db.Column(db.String(10), nullable=True)
 
     # Relationships
@@ -84,6 +90,14 @@ class User(UserMixin, db.Model):
 
 # NEW: Links HODs/Lecturers to a Faculty (e.g., "Physical Sciences")
     faculty = db.Column(db.String(50), nullable=True)
+
+    __table_args__ = (
+        # One matric number per student, within one university. Staff rows
+        # hold NULL and are exempt: SQL treats NULLs as distinct, so any
+        # number of them coexist.
+        db.UniqueConstraint('institution', 'matric_no',
+                            name='uq_user_matric_per_institution'),
+    )
 
     def get_id(self):
         """

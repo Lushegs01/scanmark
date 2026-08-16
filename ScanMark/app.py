@@ -2770,7 +2770,11 @@ def campos_sso_callback():
             institution=institution_for_email(email) or NO_INSTITUTION,
         )
         # CampOS is the source of truth for matric number (guard uniqueness).
-        if matric_no and not User.query.filter_by(matric_no=matric_no).first():
+        # Scoped to the school: the same number at another university belongs
+        # to a different student and is none of this row's business.
+        if matric_no and not User.query.filter_by(
+                matric_no=matric_no,
+                institution=institution_for_email(email) or NO_INSTITUTION).first():
             user.matric_no = matric_no
         if level:
             user.level = level
@@ -2817,7 +2821,9 @@ def campos_sso_callback():
         if full_name and user.full_name != full_name:
             user.full_name = full_name
             changed = True
-        matric_owner = User.query.filter_by(matric_no=matric_no).first() if matric_no else None
+        matric_owner = (User.query.filter_by(matric_no=matric_no,
+                                             institution=institution_of(user)).first()
+                        if matric_no else None)
         if matric_no and (not matric_owner or matric_owner.id == user.id) and user.matric_no != matric_no:
             user.matric_no = matric_no
             changed = True
@@ -2908,9 +2914,11 @@ def complete_profile():
             # Uncaught, this was a 500 on a page every new student sees.
             db.session.rollback()
             app.logger.warning(
-                'Matric number already registered (user id=%s)', current_user.id)
-            flash("That matric number is already registered to another "
-                  "account. Check it, or contact your department.", "danger")
+                'Matric number already registered at this institution '
+                '(user id=%s)', current_user.id)
+            flash("That matric number is already registered at your "
+                  "institution. Check it, or contact your department.",
+                  "danger")
             return render_template('complete_profile.html',
                                    levels=LEVEL_CHOICES), 409
 
@@ -3935,11 +3943,29 @@ def register_course():
     if course in current_user.enrolled_courses:
         flash(f"You are already registered for {course.code}.", "info")
     else:
-        current_user.enrolled_courses.append(course)
         # A personal-email account belongs to whichever university it first
         # registers at, and to that one only from here on. Clearing
         # User.institution is what undoes it if somebody joined the wrong one.
-        if not student_institution and course.institution:
+        binding = bool(not student_institution and course.institution)
+        if binding and current_user.matric_no:
+            # Matric numbers are unique within a university. Joining one whose
+            # number is already taken has to be refused here, in words: left
+            # to the database it is an IntegrityError on an enrolment that
+            # looks nothing like a matric problem.
+            clash = User.query.filter_by(
+                matric_no=current_user.matric_no,
+                institution=course.institution).first()
+            if clash:
+                app.logger.warning(
+                    'Refused to bind user id=%s to %s: matric already held there',
+                    current_user.id, course.institution)
+                flash("Your matric number is already registered at the "
+                      "institution that runs this course. Check it, or "
+                      "contact your department.", "danger")
+                return redirect(url_for('student_dashboard'))
+
+        current_user.enrolled_courses.append(course)
+        if binding:
             current_user.institution = course.institution
             app.logger.info('Bound user id=%s to institution %s on first '
                             'registration', current_user.id, course.institution)
@@ -5567,9 +5593,10 @@ with app.app_context():
         ("user", "campos_user_id", "VARCHAR(100)"),
         ("user", "campos_institution_id", "VARCHAR(100)"),
         # Which university a row belongs to. Backfilled from the address
-        # below; a personal-email account stays NULL until it registers for
-        # its first course.
-        ("user", "institution", "VARCHAR(120)"),
+        # below; a personal-email account holds '' until it registers for its
+        # first course. Empty rather than NULL because it is half of the
+        # matric uniqueness key, and SQL treats every NULL as distinct.
+        ("user", "institution", "VARCHAR(120) DEFAULT ''"),
         # Empty string, not NULL: it joins the offering uniqueness key, and
         # SQL treats NULLs as distinct.
         ("course", "institution", "VARCHAR(120) DEFAULT ''"),
@@ -5748,6 +5775,8 @@ with app.app_context():
                 "UPDATE class_session SET sequence = 1 WHERE sequence IS NULL"))
             conn.execute(db.text(
                 "UPDATE course SET institution = '' WHERE institution IS NULL"))
+            conn.execute(db.text(
+                'UPDATE "user" SET institution = \'\' WHERE institution IS NULL'))
             conn.commit()
         except Exception as _error:
             conn.rollback()
@@ -5764,6 +5793,9 @@ with app.app_context():
         _pending = (db.session.query(User.id, User.email)
                     .filter((User.institution.is_(None)) | (User.institution == ''))
                     .all())
+        # Anything left unresolved must still be '' rather than NULL: the
+        # column is NOT NULL in the model, and the SQLite rebuild below copies
+        # these rows into a table that enforces it.
         _assigned = 0
         for _user_id, _user_email in _pending:
             _derived = institution_for_email(_user_email or '')
@@ -5870,6 +5902,112 @@ with app.app_context():
                 except Exception as _error:
                     conn.rollback()
                     _fatal_migration('widen the course offering key', _error)
+
+    # ── The matric number becomes unique per institution, not per instance ──
+    # It identifies a student within their own university, and two
+    # universities' numbering formats can collide: under the old global rule
+    # the second student to hold "20200001" anywhere was simply refused.
+    #
+    # Legacy rows cannot violate the new rule — a globally unique column is
+    # unique within every subset of it — so there is nothing to reconcile
+    # first.
+    def _matric_unique_columns(inspector):
+        """Every unique key over matric_no, however it was declared."""
+        return [sorted(entry.get('column_names') or [])
+                for entry in (inspector.get_unique_constraints('user')
+                              + [index for index in inspector.get_indexes('user')
+                                 if index.get('unique')])
+                if 'matric_no' in (entry.get('column_names') or [])]
+
+    _matric_keys = _matric_unique_columns(db.inspect(db.engine))
+    _matric_is_global = ['matric_no'] in _matric_keys
+    _matric_is_scoped = ['institution', 'matric_no'] in _matric_keys
+
+    if db.engine.dialect.name == 'sqlite':
+        # SQLite writes a column-level UNIQUE into the table definition, out
+        # of ALTER TABLE's reach, and reports it only through the autoindex
+        # it creates. Same rebuild as `course` above — and `user` is a
+        # reserved word, so every statement quotes it.
+        _user_rebuild = False
+        with db.engine.connect() as conn:
+            for _index in conn.execute(db.text('PRAGMA index_list("user")')).mappings():
+                if not _index['unique']:
+                    continue
+                _columns = [row['name'] for row in conn.execute(
+                    db.text(f"PRAGMA index_info('{_index['name']}')")).mappings()]
+                if _columns == ['matric_no']:
+                    _user_rebuild = True
+                    break
+
+        if _user_rebuild:
+            print('[MIGRATION] Rebuilding `user` so a matric number is unique '
+                  'within a university rather than across the instance')
+            _user_columns = ', '.join(f'"{name}"' for name
+                                      in User.__table__.columns.keys())
+            _raw = db.engine.raw_connection()
+            try:
+                _cursor = _raw.cursor()
+                _cursor.execute("PRAGMA foreign_keys=OFF")
+                # Keeps the RENAME from rewriting attendance, enrollments,
+                # course_instructors, course.coordinator_id and the rest to
+                # point at the temporary name.
+                _cursor.execute("PRAGMA legacy_alter_table=ON")
+                _cursor.execute("BEGIN")
+                _cursor.execute('ALTER TABLE "user" RENAME TO user_pre_matric_upgrade')
+                _raw.commit()
+                User.__table__.create(bind=db.engine)
+                _cursor = _raw.cursor()
+                _cursor.execute("BEGIN")
+                _cursor.execute(
+                    f'INSERT INTO "user" ({_user_columns}) '
+                    f'SELECT {_user_columns} FROM user_pre_matric_upgrade')
+                _cursor.execute("DROP TABLE user_pre_matric_upgrade")
+                _raw.commit()
+                _cursor.execute("PRAGMA legacy_alter_table=OFF")
+                _cursor.execute("PRAGMA foreign_keys=ON")
+                # Nothing may point at a user that is no longer there.
+                _orphans = _raw.cursor().execute(
+                    'PRAGMA foreign_key_check').fetchall()
+                if _orphans:
+                    raise RuntimeError(
+                        f'foreign keys broken by the rebuild: {_orphans[:5]}')
+                print('[MIGRATION] `user` rebuilt; matric numbers are unique '
+                      'per (institution, matric_no)')
+            except Exception as _error:
+                _raw.rollback()
+                _fatal_migration('rebuild the user table', _error)
+            finally:
+                _raw.close()
+    elif _matric_is_global or not _matric_is_scoped:
+        with db.engine.connect() as conn:
+            try:
+                # A NULL institution would opt a row out of the key entirely,
+                # so the column has to be NOT NULL before the key means
+                # anything. SQLite gets this from the rebuild above.
+                if any(column['name'] == 'institution' and column['nullable']
+                       for column in db.inspect(db.engine).get_columns('user')):
+                    conn.execute(db.text(
+                        'ALTER TABLE "user" ALTER COLUMN institution SET NOT NULL'))
+                if _matric_is_global:
+                    # Whatever Postgres called it when the column said UNIQUE.
+                    _global_name = next(
+                        (entry['name'] for entry
+                         in db.inspect(db.engine).get_unique_constraints('user')
+                         if sorted(entry.get('column_names') or []) == ['matric_no']),
+                        'user_matric_no_key')
+                    print('[MIGRATION] Dropping the instance-wide unique on '
+                          'matric_no; it is a per-university number')
+                    conn.execute(db.text(
+                        f'ALTER TABLE "user" DROP CONSTRAINT "{_global_name}"'))
+                if not _matric_is_scoped:
+                    conn.execute(db.text(
+                        'ALTER TABLE "user" ADD CONSTRAINT '
+                        'uq_user_matric_per_institution UNIQUE (institution, matric_no)'))
+                conn.commit()
+            except Exception as _error:
+                conn.rollback()
+                _fatal_migration('scope the matric number to its institution',
+                                 _error)
 
     # ── Backfill: adopt legacy attendance rows into per-day class sessions ──
     # Before sessions were wired up, scans were saved with session_id NULL.

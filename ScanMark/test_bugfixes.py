@@ -1383,6 +1383,80 @@ class TestUpgradingAnExistingDatabase:
         finally:
             connection.close()
 
+    def test_the_matric_number_becomes_unique_per_university(self, tmp_path):
+        """
+        The legacy column says `matric_no VARCHAR(20) UNIQUE`, which is a
+        column-level UNIQUE baked into the table definition — out of ALTER
+        TABLE's reach on SQLite, exactly like the course code was. Until it is
+        gone, the second university to enrol a student numbered 20200001 is
+        refused.
+        """
+        import sqlite3
+
+        database, output = self._boot_against(tmp_path)
+        assert 'Rebuilding `user`' in output
+
+        connection = sqlite3.connect(database)
+        try:
+            # Kemi already holds 20200001 at funaab.edu.ng (from the legacy
+            # rows, adopted by the backfill).
+            assert connection.execute(
+                'SELECT institution FROM "user" WHERE matric_no = ?',
+                ('20200001',)).fetchone()[0] == 'funaab.edu.ng'
+
+            insert = ('INSERT INTO "user" (full_name,email,password,role,'
+                      'matric_no,institution,email_verified) '
+                      'VALUES (?,?,?,?,?,?,1)')
+            # The same number at another university is a different student.
+            connection.execute(insert, ('Ngozi', 'n@student.unilag.edu.ng', 'h',
+                                        'student', '20200001', 'unilag.edu.ng'))
+            connection.commit()
+
+            # ...but not twice within one.
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(insert, ('Imposter', 'i@student.unilag.edu.ng',
+                                            'h', 'student', '20200001',
+                                            'unilag.edu.ng'))
+                connection.commit()
+        finally:
+            connection.close()
+
+    def test_the_rebuild_keeps_everything_that_points_at_a_user(self, tmp_path):
+        """
+        `user` is referenced by enrollments, attendance, course_instructors and
+        course.coordinator_id. A rebuild that renames the table without
+        `legacy_alter_table` rewrites those references to the temporary name
+        and leaves the rows pointing at nothing.
+        """
+        import sqlite3
+
+        database, _output = self._boot_against(tmp_path)
+
+        connection = sqlite3.connect(database)
+        try:
+            assert connection.execute('PRAGMA foreign_key_check').fetchall() == []
+            assert connection.execute(
+                'SELECT count(*) FROM "user"').fetchone()[0] == 2
+            # The enrolment, the scan and the course still resolve to their user.
+            assert connection.execute(
+                'SELECT count(*) FROM enrollments e '
+                'JOIN "user" u ON u.id = e.user_id').fetchone()[0] == 1
+            assert connection.execute(
+                'SELECT count(*) FROM attendance a '
+                'JOIN "user" u ON u.id = a.student_id').fetchone()[0] == 1
+            assert connection.execute(
+                'SELECT count(*) FROM course c '
+                'JOIN "user" u ON u.id = c.coordinator_id').fetchone()[0] == 1
+            # And the identity columns survived intact.
+            assert connection.execute(
+                'SELECT email FROM "user" WHERE id = 2').fetchone()[0] == \
+                'k@student.funaab.edu.ng'
+            assert connection.execute(
+                'SELECT count(*) FROM "user" WHERE institution IS NULL'
+            ).fetchone()[0] == 0
+        finally:
+            connection.close()
+
     def test_booting_twice_over_the_same_database_changes_nothing(self, tmp_path):
         import os
         import subprocess
