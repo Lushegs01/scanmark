@@ -53,16 +53,22 @@
                            button's label squeezed the field to about 90px on a
                            phone — and a phone standing in the lecture hall is
                            the device this page is designed for. #}
+                        {# maxlength has to clear a full maps URL, not just two
+                           numbers: at 80 the browser silently truncated a
+                           pasted link into an unparseable fragment. The server
+                           caps the same field at 500. #}
                         <input type="text" class="form-control" id="coordinates" name="coordinates"
-                            maxlength="80" placeholder="7.22609, 3.44156" autocomplete="off"
-                            inputmode="decimal">
+                            maxlength="500" placeholder="7.22609, 3.44156 — or paste a map link"
+                            autocomplete="off">
                         <div class="d-grid d-sm-block mt-2">
                             <button class="btn btn-outline-success btn-sm" type="button" id="captureBtn">
-                                <i class="fas fa-location-crosshairs me-1"></i> Use my current location
+                                <i class="fas fa-location-crosshairs me-1"></i>
+                                <span id="captureLabel">Use my current location</span>
                             </button>
                         </div>
                         <div class="form-text" id="captureStatus">
-                            Latitude first. In Google Maps, long-press the room and copy the numbers.
+                            Latitude first. In Google Maps, long-press the room — then either copy
+                            the numbers it shows, or share the link and paste that.
                         </div>
                     </div>
                 </div>
@@ -152,59 +158,139 @@
     // rather than after a round trip.
     const MAX_PIN_ACCURACY_M = {{ max_pin_accuracy_m }};
 
+    // How long to keep listening for the fix to get better.
+    //
+    // A phone answers almost immediately — with its WORST fix. The first
+    // reading comes from the network (Wi-Fi, or the IP address, which is
+    // tens of kilometres wide), and GPS narrows it over the following
+    // seconds. `getCurrentPosition` hands back that first reading and stops,
+    // so it reported 20000m for a phone that would have reached 15m if
+    // anyone had waited. Watching until the accuracy is good enough is the
+    // difference between this working and not.
+    const CAPTURE_WINDOW_MS = 45000;
+
     const captureBtn = document.getElementById('captureBtn');
+    const captureLabel = document.getElementById('captureLabel');
     const statusEl = document.getElementById('captureStatus');
     const coordinatesEl = document.getElementById('coordinates');
+
+    let watchId = null;
+    let bestFix = null;
+    let countdown = null;
 
     function say(message, tone) {
         statusEl.textContent = message;
         statusEl.className = 'form-text ' + (tone || '');
     }
 
-    captureBtn.addEventListener('click', function () {
-        if (!navigator.geolocation) {
-            say('This browser cannot report a location. Paste the coordinates instead.', 'text-danger');
+    function stopWatching() {
+        if (watchId !== null) {
+            navigator.geolocation.clearWatch(watchId);
+            watchId = null;
+        }
+        if (countdown !== null) {
+            clearInterval(countdown);
+            countdown = null;
+        }
+        captureLabel.textContent = 'Use my current location';
+    }
+
+    function useFix(position) {
+        const accuracy = Math.round(position.coords.accuracy);
+        document.getElementById('capturedLat').value = position.coords.latitude;
+        document.getElementById('capturedLon').value = position.coords.longitude;
+        document.getElementById('capturedAccuracy').value = accuracy;
+        coordinatesEl.value = position.coords.latitude.toFixed(5) + ', ' +
+            position.coords.longitude.toFixed(5);
+        say('Got it — accurate to about ' + accuracy + 'm. Name the room and save.',
+            'text-success');
+    }
+
+    function giveUp() {
+        stopWatching();
+        const best = bestFix ? Math.round(bestFix.coords.accuracy) : null;
+        if (best === null) {
+            say('Could not get a location at all. Paste the coordinates from a map instead.',
+                'text-danger');
             return;
         }
-        captureBtn.disabled = true;
-        say('Getting a fix — this is more accurate outdoors or by a window...');
+        say('The best this device managed was ±' + best + 'm, and a classroom needs ' +
+            'to be marked to within ' + MAX_PIN_ACCURACY_M + 'm. On a laptop that is ' +
+            'expected — it has no GPS. On a phone, check that location is set to ' +
+            '"precise" rather than "approximate" and try again near a window. ' +
+            'Otherwise paste the coordinates from a map.', 'text-danger');
+    }
 
-        navigator.geolocation.getCurrentPosition(
+    captureBtn.addEventListener('click', function () {
+        // A second tap while it is searching means "stop and take what you
+        // have" — better than a button that only ever gets more disabled.
+        if (watchId !== null) {
+            if (bestFix && Math.round(bestFix.coords.accuracy) <= MAX_PIN_ACCURACY_M) {
+                stopWatching();
+                useFix(bestFix);
+            } else {
+                giveUp();
+            }
+            return;
+        }
+        if (!navigator.geolocation) {
+            say('This browser cannot report a location. Paste the coordinates instead.',
+                'text-danger');
+            return;
+        }
+
+        bestFix = null;
+        const startedAt = Date.now();
+        captureLabel.textContent = 'Searching — tap to stop';
+        say('Looking for a GPS fix. The first answer is always the vaguest, so this ' +
+            'takes a few seconds — stand still, near a window if you can.');
+
+        // A visible countdown, because a silent 45 seconds reads as "broken".
+        countdown = setInterval(function () {
+            if (watchId === null) return;
+            const left = Math.ceil((CAPTURE_WINDOW_MS - (Date.now() - startedAt)) / 1000);
+            const sofar = bestFix
+                ? 'best so far ±' + Math.round(bestFix.coords.accuracy) + 'm'
+                : 'no fix yet';
+            say('Narrowing it down — ' + sofar + ', ' + Math.max(0, left) + 's left. ' +
+                'It stops as soon as it is good enough.');
+        }, 1000);
+
+        watchId = navigator.geolocation.watchPosition(
             function (position) {
-                captureBtn.disabled = false;
-                const accuracy = Math.round(position.coords.accuracy);
-                if (accuracy > MAX_PIN_ACCURACY_M) {
-                    // Almost always a laptop: no GPS, so the fix comes from
-                    // Wi-Fi or the IP address and is kilometres wide.
-                    say('This device only knows where it is to within ' + accuracy +
-                        'm — too imprecise to pin a classroom. Try a phone standing ' +
-                        'in the room, or paste the coordinates from a map.', 'text-danger');
+                if (!bestFix || position.coords.accuracy < bestFix.coords.accuracy) {
+                    bestFix = position;
+                }
+                if (position.coords.accuracy <= MAX_PIN_ACCURACY_M) {
+                    stopWatching();
+                    useFix(position);
                     return;
                 }
-                document.getElementById('capturedLat').value = position.coords.latitude;
-                document.getElementById('capturedLon').value = position.coords.longitude;
-                document.getElementById('capturedAccuracy').value = accuracy;
-                coordinatesEl.value = position.coords.latitude.toFixed(5) + ', ' +
-                    position.coords.longitude.toFixed(5);
-                say('Got it — accurate to about ' + accuracy + 'm. Name the room and save.',
-                    'text-success');
+                if (Date.now() - startedAt >= CAPTURE_WINDOW_MS) giveUp();
             },
             function (error) {
-                captureBtn.disabled = false;
-                const messages = {
-                    1: 'Location permission was denied. Allow it, or paste the coordinates.',
-                    2: 'Your device could not work out where it is. Try outdoors, or paste the coordinates.',
-                    3: 'Timed out looking for a fix. Try again outdoors, or paste the coordinates.'
-                };
-                say(messages[error.code] || 'Could not get a location.', 'text-danger');
+                // A watch reports errors as they happen and keeps going; only
+                // a denial is final, because it will never start working.
+                if (error.code === 1) {
+                    stopWatching();
+                    say('Location permission was denied. Allow it in your browser settings, ' +
+                        'or paste the coordinates from a map.', 'text-danger');
+                    return;
+                }
+                if (Date.now() - startedAt >= CAPTURE_WINDOW_MS) giveUp();
             },
-            { enableHighAccuracy: true, timeout: 20000, maximumAge: 0 }
+            { enableHighAccuracy: true, timeout: CAPTURE_WINDOW_MS, maximumAge: 0 }
         );
+
+        // A watch that never fires at all still has to end.
+        setTimeout(function () { if (watchId !== null) giveUp(); }, CAPTURE_WINDOW_MS + 500);
     });
 
-    // Typing coordinates by hand replaces a captured fix; leaving the hidden
-    // fields set would silently save the old one under the new numbers.
+    // Typing or pasting replaces a captured fix; leaving the hidden fields set
+    // would silently save the old one under the new numbers. It also means the
+    // lecturer has decided not to wait, so stop searching.
     coordinatesEl.addEventListener('input', function () {
+        stopWatching();
         document.getElementById('capturedLat').value = '';
         document.getElementById('capturedLon').value = '';
         document.getElementById('capturedAccuracy').value = '';
