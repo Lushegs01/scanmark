@@ -46,8 +46,35 @@
     const cameraInfo = document.getElementById('camera-info');
     const resultBanner = document.getElementById('result-banner');
 
-    const MAX_ANALYSIS_WIDTH = 960;
-    const TARGET_INTERVAL_MS = 125;
+    // ---- How hard the scanner hunts -------------------------------------
+    //
+    // A code across a lecture hall covers very few pixels. Cropping the middle
+    // of the frame and rendering it larger is a free digital zoom: the decoder
+    // gets the same photons spread over more samples, which is often all its
+    // grid-fitting needs to lock on. Past about 2x it is inventing detail.
+    const MAX_UPSCALE = 2;
+    // Regions of the frame's short edge, cycled one per frame so no single
+    // frame pays for all of them — the whole view first (a code held close, or
+    // off to one side), then progressively tighter middles for one far away.
+    //
+    // `width` is what each is worth analysing at. The wide pass exists to
+    // catch a code that is already large or off-centre, and does not need the
+    // full working resolution to do it; spending it there doubled the cost of
+    // the most common frame for nothing.
+    const HUNT_REGIONS = [
+        { fraction: 1, width: 512 },
+        { fraction: 0.55, width: 720 },
+        { fraction: 0.32, width: 720 },
+        { fraction: 0.55, width: 720 }
+    ];
+    const TARGET_INTERVAL_MS = 70;
+    // Consecutive frames that find nothing before the scanner changes
+    // something about how it is looking. Roughly a second of not finding it.
+    const ESCALATE_AFTER_MISSES = 10;
+    // Transitions per sampled pixel above which the middle of the frame holds
+    // something finely striped — a code too small or too blurred to decode,
+    // rather than a wall. Calibrated well above sensor noise.
+    const PATTERN_THRESHOLD = 0.03;
     // How old a fix may be before we look for a better one. Deliberately
     // tighter than the server's limit, so there is room to get a fresh fix
     // and still post inside it.
@@ -93,6 +120,15 @@
     let retryAttempt = 0;
     let rejectionStreak = 0;
     let torchEnabled = false;
+    // The student tapped the flashlight themselves. The automatic hunt below
+    // then leaves it alone — a control that fights the person holding it is
+    // worse than no control.
+    let torchManual = false;
+    let frameCallbackId = null;
+    let missStreak = 0;
+    let enhancing = false;
+    let adapting = false;
+    let resolutionRaised = false;
 
     function status(message, type) {
         statusBadge.textContent = message;
@@ -249,9 +285,16 @@
     async function startScanner() {
         stopScanner();
         // A deliberate tap is a fresh start: give the automatic-resubmit
-        // budget back rather than inheriting the previous attempt's streak.
+        // budget back rather than inheriting the previous attempt's streak,
+        // and begin the hunt from an un-adapted camera so a zoom left over
+        // from the last room does not narrow this one's first look.
         rejectionStreak = 0;
         retryAttempt = 0;
+        missStreak = 0;
+        enhancing = false;
+        resolutionRaised = false;
+        torchManual = false;
+        torchEnabled = false;
         cameraStartedAt = performance.now();
         startWatchingLocation();
         container.style.display = 'block';
@@ -263,6 +306,11 @@
             stream = await navigator.mediaDevices.getUserMedia({
                 video: {
                     facingMode: { ideal: 'environment' },
+                    // Start modest. Distance is a resolution problem before
+                    // it is anything else, but most scans are of a code a few
+                    // metres away and 720p reads those in half the time. The
+                    // hunt raises this to 1080p the moment it starts failing,
+                    // which is the only time the extra pixels earn their cost.
                     width: { ideal: 1280 },
                     height: { ideal: 720 },
                     focusMode: { ideal: 'continuous' }
@@ -275,13 +323,12 @@
             track = stream.getVideoTracks()[0];
             await applyCameraSettings();
             cameraReadyMs = performance.now() - cameraStartedAt;
-            const settings = track.getSettings();
-            cameraInfo.textContent = `${settings.width || video.videoWidth}x${settings.height || video.videoHeight}`;
+            announce('');
             loader.style.display = 'none';
             active = true;
             status(detector ? 'Scanning (native detector)...' : 'Scanning...', 'scanning');
             focusIntervalId = setInterval(triggerFocus, 4000);
-            animationFrameId = requestAnimationFrame(analyseFrame);
+            scheduleFrame();
         } catch (error) {
             stopScanner();
             result(`Camera error: ${error.message || error}`, 'danger');
@@ -298,7 +345,10 @@
         clearInterval(focusIntervalId);
         clearTimeout(resumeTimeoutId);
         if (animationFrameId !== null) cancelAnimationFrame(animationFrameId);
-        focusIntervalId = resumeTimeoutId = animationFrameId = null;
+        if (frameCallbackId !== null && video.cancelVideoFrameCallback) {
+            video.cancelVideoFrameCallback(frameCallbackId);
+        }
+        focusIntervalId = resumeTimeoutId = animationFrameId = frameCallbackId = null;
         if (stream) stream.getTracks().forEach(mediaTrack => mediaTrack.stop());
         stream = track = null;
         video.srcObject = null;
@@ -307,63 +357,357 @@
         document.body.style.overflow = '';
     }
 
-    function drawAnalysisFrame() {
-        const fullFrame = frameNumber % 8 === 0;
+    /**
+     * Put one region of the live frame on the analysis canvas.
+     *
+     * `fraction` is how much of the frame's short edge to take from the
+     * middle. Small fractions are rendered back UP towards the analysis
+     * width, which is the whole trick for distance: a 60-pixel code becomes a
+     * 120-pixel one, and the decoder's threshold and grid-fitting stages have
+     * something to work with.
+     */
+    function drawRegion(region) {
         const sourceWidth = video.videoWidth;
         const sourceHeight = video.videoHeight;
-        const cropSize = fullFrame ? Math.min(sourceWidth, sourceHeight)
-            : Math.floor(Math.min(sourceWidth, sourceHeight) * 0.72);
+        const cropSize = Math.max(16,
+            Math.floor(Math.min(sourceWidth, sourceHeight) * region.fraction));
         const sourceX = Math.floor((sourceWidth - cropSize) / 2);
         const sourceY = Math.floor((sourceHeight - cropSize) / 2);
-        const outputWidth = Math.min(MAX_ANALYSIS_WIDTH, cropSize);
-        const outputHeight = outputWidth;
-        if (analysisCanvas.width !== outputWidth || analysisCanvas.height !== outputHeight) {
-            analysisCanvas.width = outputWidth;
-            analysisCanvas.height = outputHeight;
+        const output = Math.min(region.width, Math.floor(cropSize * MAX_UPSCALE));
+        if (analysisCanvas.width !== output || analysisCanvas.height !== output) {
+            analysisCanvas.width = output;
+            analysisCanvas.height = output;
         }
-        context.drawImage(
-            video, sourceX, sourceY, cropSize, cropSize,
-            0, 0, outputWidth, outputHeight
-        );
+        context.drawImage(video, sourceX, sourceY, cropSize, cropSize, 0, 0, output, output);
+        return { whole: region.fraction >= 1 };
     }
 
-    async function decodeCurrentFrame() {
-        const started = performance.now();
-        let value = null;
-        if (detector) {
-            try {
-                const codes = await detector.detect(analysisCanvas);
-                value = codes.length ? codes[0].rawValue : null;
-            } catch (_) {
-                detector = null;
+    /**
+     * Grey copy of the analysis canvas, and what the light in it is doing.
+     *
+     * One pass, because this runs on every frame on a phone: the luma values
+     * feed the contrast stretch, and the histogram is what tells a frame that
+     * is too dark from one that is blown out — which for a projected code in
+     * a dark hall is the failure that actually happens.
+     */
+    function readFrame(image) {
+        const data = image.data;
+        const pixels = data.length >> 2;
+        const grey = new Uint8Array(pixels);
+        const histogram = new Uint32Array(256);
+        let total = 0;
+        for (let index = 0, g = 0; g < pixels; index += 4, g++) {
+            // Rec. 601 luma, in integers: this is the hottest loop here.
+            const luma = (data[index] * 77 + data[index + 1] * 150 + data[index + 2] * 29) >> 8;
+            grey[g] = luma;
+            histogram[luma]++;
+            total += luma;
+        }
+        return { grey, histogram, pixels, mean: total / pixels };
+    }
+
+    /**
+     * Roughly: is there something finely striped in the middle of this?
+     *
+     * A QR code is dense black-and-white transitions; a wall, a face or an
+     * empty screen is not. Counting transitions along a few sampled rows is
+     * cheap and separates the two well enough to steer the camera. Lots of
+     * transitions and still no decode means a real code that is too small or
+     * too blurred — worth zooming into. None means there is nothing here, and
+     * zooming would only narrow the search.
+     */
+    function patternEnergy(grey, width, height) {
+        const rows = 16;
+        let transitions = 0;
+        let sampled = 0;
+        for (let row = 1; row <= rows; row++) {
+            const y = Math.floor(height * row / (rows + 1)) * width;
+            let previous = grey[y];
+            for (let x = 1; x < width; x++) {
+                const value = grey[y + x];
+                if (Math.abs(value - previous) > 40) transitions++;
+                previous = value;
+            }
+            sampled += width;
+        }
+        return sampled ? transitions / sampled : 0;
+    }
+
+    /**
+     * Stretch the frame's contrast across the full range, in place.
+     *
+     * Clips the top and bottom 2% first, so one glare highlight or one dark
+     * corner cannot flatten everything else. This is what rescues a washed-out
+     * projector screen or a code in shadow — both of which are a QR whose
+     * black and white are simply too close together for a threshold to split.
+     */
+    function enhance(image, frame) {
+        const { grey, histogram, pixels } = frame;
+        const clip = Math.max(1, Math.floor(pixels * 0.02));
+        let low = 0;
+        let high = 255;
+        for (let value = 0, seen = 0; value < 256; value++) {
+            seen += histogram[value];
+            if (seen > clip) { low = value; break; }
+        }
+        for (let value = 255, seen = 0; value >= 0; value--) {
+            seen += histogram[value];
+            if (seen > clip) { high = value; break; }
+        }
+        if (high - low < 16) return false;   // already flat; nothing to gain
+        const scale = 255 / (high - low);
+        const data = image.data;
+        for (let g = 0, index = 0; g < pixels; g++, index += 4) {
+            const stretched = (grey[g] - low) * scale;
+            const clamped = stretched < 0 ? 0 : stretched > 255 ? 255 : stretched;
+            data[index] = data[index + 1] = data[index + 2] = clamped;
+        }
+        return true;
+    }
+
+    async function applyAdvanced(settings) {
+        if (!track) return false;
+        try {
+            await track.applyConstraints({ advanced: [settings] });
+            return true;
+        } catch (_) {
+            return false;
+        }
+    }
+
+    function trackSetting(name, fallback) {
+        if (!track || !track.getSettings) return fallback;
+        const value = track.getSettings()[name];
+        return value === undefined ? fallback : value;
+    }
+
+    async function stepZoom(direction) {
+        const range = capabilities.zoom;
+        if (!range) return false;
+        const step = (range.max - range.min) / 4 || range.step || 0.5;
+        const current = trackSetting('zoom', range.min || 1);
+        const next = Math.min(range.max, Math.max(range.min, current + direction * step));
+        if (Math.abs(next - current) < 1e-3) return false;
+        if (!await applyAdvanced({ zoom: next })) return false;
+        zoomSlider.value = next;
+        zoomLabel.textContent = `${Number(next).toFixed(1)}x`;
+        return true;
+    }
+
+    async function stepExposure(direction) {
+        const range = capabilities.exposureCompensation;
+        if (!range) return false;
+        const step = (range.step || 0.33) * 3;
+        const current = trackSetting('exposureCompensation', 0);
+        const next = Math.min(range.max, Math.max(range.min, current + direction * step));
+        if (Math.abs(next - current) < 1e-3) return false;
+        return applyAdvanced({ exposureCompensation: next });
+    }
+
+    async function setTorch(on) {
+        if (!capabilities.torch || torchManual || torchEnabled === on) return false;
+        if (!await applyAdvanced({ torch: on })) return false;
+        torchEnabled = on;
+        torchButton.classList.toggle('active', on);
+        return true;
+    }
+
+    function announce(note) {
+        const size = trackSetting('width', video.videoWidth) + 'x' +
+            trackSetting('height', video.videoHeight);
+        cameraInfo.textContent = note ? `${size} · ${note}` : size;
+    }
+
+    /**
+     * Change one thing about how the camera is looking, then let it try again.
+     *
+     * Ordered by how likely each is to be the actual problem and how cheap it
+     * is to undo. Software enhancement first, because it is free and
+     * reversible. Then exposure — a code projected in a dark hall is BLOWN
+     * OUT, not dark, because the camera meters for the room and lets the
+     * screen saturate to white, and no amount of zoom fixes that. Then the
+     * torch, for a code printed on paper. Then optical zoom, but only when
+     * there is something patterned in the middle worth zooming into.
+     */
+    async function escalate(frame, energy) {
+        if (adapting) return;
+        adapting = true;
+        try {
+            if (!enhancing) {
+                enhancing = true;
+                announce('sharpening');
+                return;
+            }
+            if (await raiseResolution()) {
+                announce('looking closer');
+                return;
+            }
+            if (!frame) return;
+            const blownOut =
+                (frame.histogram[255] + frame.histogram[254]) > frame.pixels * 0.06;
+            if (blownOut && await stepExposure(-1)) {
+                announce('dimming for the screen');
+                return;
+            }
+            if (!blownOut && frame.mean < 70 && await setTorch(true)) {
+                announce('flashlight on');
+                return;
+            }
+            if (energy > PATTERN_THRESHOLD && await stepZoom(1)) {
+                announce('zooming in');
+                return;
+            }
+            // Nothing left to try. Undo the narrowing, so a code that has since
+            // been brought closer is not missed by a camera still zoomed past
+            // it, and start the ladder again.
+            await resetOptics();
+            announce('');
+        } finally {
+            adapting = false;
+        }
+    }
+
+    /**
+     * Ask the camera for every pixel it has, once the easy attempts have
+     * failed.
+     *
+     * This is the single biggest lever on how far away a code can be read —
+     * at 720p one across a hall lands on too few samples to decode at all,
+     * and no amount of cropping invents them back. It is not the starting
+     * point only because it roughly doubles the per-frame cost, which is a
+     * bad trade for the close-up scan that most students are doing.
+     */
+    async function raiseResolution() {
+        if (resolutionRaised || !track) return false;
+        const range = capabilities.width;
+        if (!range || !range.max || range.max <= 1280) return false;
+        try {
+            await track.applyConstraints({
+                width: { ideal: Math.min(1920, range.max) },
+                height: { ideal: 1080 }
+            });
+        } catch (_) {
+            return false;
+        }
+        resolutionRaised = true;
+        return true;
+    }
+
+    async function resetOptics() {
+        if (capabilities.zoom) {
+            const min = capabilities.zoom.min || 1;
+            if (await applyAdvanced({ zoom: min })) {
+                zoomSlider.value = min;
+                zoomLabel.textContent = `${Number(min).toFixed(1)}x`;
             }
         }
+        if (capabilities.exposureCompensation) await applyAdvanced({ exposureCompensation: 0 });
+        await setTorch(false);
+    }
+
+    /**
+     * One pass over the current frame: native detector, then software, then
+     * software again on an enhanced copy once the easy attempts have failed.
+     */
+    async function huntCurrentFrame() {
+        const region = drawRegion(HUNT_REGIONS[frameNumber % HUNT_REGIONS.length]);
+        const started = performance.now();
+        let value = null;
+
+        // The platform's own detector is hardware-backed and better than
+        // anything achievable in JavaScript. Give it the zoomed crop, and on
+        // the wide pass the untouched video frame as well — some
+        // implementations do noticeably better without the canvas round trip.
+        if (detector) {
+            value = await detectWith(analysisCanvas);
+            if (!value && region.whole) value = await detectWith(video);
+        }
+
+        let frame = null;
+        let energy = 0;
         if (!value && typeof window.jsQR === 'function') {
             const image = context.getImageData(0, 0, analysisCanvas.width, analysisCanvas.height);
-            const code = window.jsQR(image.data, image.width, image.height, {
-                inversionAttempts: 'dontInvert'
-            });
-            value = code && code.data;
+            const plain = window.jsQR(image.data, image.width, image.height,
+                                      { inversionAttempts: 'dontInvert' });
+            value = plain && plain.data;
+            if (!value) {
+                // readFrame walks every pixel, so it is deliberately NOT on the
+                // path taken when the plain pass succeeds — which is the common
+                // one. It is computed only to enhance, or on the frame that is
+                // about to decide what to change about the camera.
+                const deciding = (missStreak + 1) % ESCALATE_AFTER_MISSES === 0;
+                if (enhancing || deciding) {
+                    frame = readFrame(image);
+                    if (deciding) energy = patternEnergy(frame.grey, image.width, image.height);
+                    if (enhancing && enhance(image, frame)) {
+                        // Both polarities now: a code shown white-on-dark is a
+                        // real thing, and the extra pass has earned itself by
+                        // this point.
+                        const boosted = window.jsQR(image.data, image.width, image.height,
+                                                    { inversionAttempts: 'attemptBoth' });
+                        value = boosted && boosted.data;
+                    }
+                }
+            }
         }
+
         lastDecodeMs = performance.now() - started;
-        analysisIntervalMs = lastDecodeMs > 80 ? 220 : lastDecodeMs > 40 ? 160 : TARGET_INTERVAL_MS;
-        return value;
+        // Back off on slow hardware so the preview stays live; a frozen
+        // viewfinder makes people move the phone, which is the opposite of
+        // what helps.
+        analysisIntervalMs = lastDecodeMs > 110 ? 200
+            : lastDecodeMs > 60 ? 120 : TARGET_INTERVAL_MS;
+
+        if (value) return value;
+
+        missStreak += 1;
+        if (missStreak % ESCALATE_AFTER_MISSES === 0) await escalate(frame, energy);
+        return null;
+    }
+
+    async function detectWith(source) {
+        try {
+            const codes = await detector.detect(source);
+            return codes.length ? codes[0].rawValue : null;
+        } catch (_) {
+            detector = null;
+            return null;
+        }
+    }
+
+    function scheduleFrame() {
+        if (!active) return;
+        // requestVideoFrameCallback fires when a NEW frame is actually
+        // available, rather than once per compositor tick — so no frame is
+        // analysed twice and none is missed while one is in flight.
+        if (typeof video.requestVideoFrameCallback === 'function') {
+            frameCallbackId = video.requestVideoFrameCallback(
+                () => analyseFrame(performance.now()));
+        } else {
+            animationFrameId = requestAnimationFrame(analyseFrame);
+        }
     }
 
     async function analyseFrame(now) {
         if (!active) return;
-        animationFrameId = requestAnimationFrame(analyseFrame);
-        if (decodePending || video.readyState < 2 || now - lastAnalysisAt < analysisIntervalMs) return;
+        if (decodePending || video.readyState < 2 || now - lastAnalysisAt < analysisIntervalMs) {
+            scheduleFrame();
+            return;
+        }
         lastAnalysisAt = now;
         decodePending = true;
         frameNumber += 1;
+        let value = null;
         try {
-            drawAnalysisFrame();
-            const value = await decodeCurrentFrame();
-            if (value && active) await qrDetected(value);
+            value = await huntCurrentFrame();
         } finally {
             decodePending = false;
         }
+        if (value && active) {
+            await qrDetected(value);
+            return;                 // found: qrDetected owns what happens next
+        }
+        scheduleFrame();
     }
 
     async function qrDetected(qrData) {
@@ -383,7 +727,10 @@
             scanFrame.classList.remove('success');
             status('Scanning...', 'scanning');
             active = true;
-            animationFrameId = requestAnimationFrame(analyseFrame);
+            // The code was found once, so whatever the camera had adapted to
+            // was working. Keep it rather than starting the hunt over.
+            missStreak = 0;
+            scheduleFrame();
         }, delayMs);
     }
 
@@ -534,6 +881,9 @@
             result('Flashlight control is not available on this camera.', 'warning');
             return;
         }
+        // From here on the hunt stops touching the torch: whatever the student
+        // chose, they can see the result and the code cannot.
+        torchManual = true;
         torchEnabled = !torchEnabled;
         try {
             await track.applyConstraints({ advanced: [{ torch: torchEnabled }] });
