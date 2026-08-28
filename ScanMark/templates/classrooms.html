@@ -8,7 +8,8 @@
         <p class="text-muted mb-0">
             Pin each lecture hall once, then pick it from the dropdown every time
             you start a class. Students must be within
-            {{ geofence_radius_m }}m of the room's coordinates to mark attendance.
+            {{ geofence_radius_m }}m of the room's coordinates to mark attendance,
+            unless you give a room its own threshold below.
         </p>
     </div>
 
@@ -71,6 +72,19 @@
                             the numbers it shows, or share the link and paste that.
                         </div>
                     </div>
+                    <div class="col-12 col-md-5">
+                        <label class="form-label small fw-bold" for="radiusInput">
+                            Threshold (metres)
+                        </label>
+                        <input type="number" class="form-control" id="radiusInput" name="radius_m"
+                            min="{{ classroom_min_radius_m }}" max="{{ classroom_max_radius_m }}"
+                            step="1" placeholder="{{ geofence_radius_m }} (default)">
+                        <div class="form-text">
+                            How close a student must be to mark attendance here. Leave blank
+                            to use the default. A room with thick walls or a wide overflow
+                            area may need a looser one.
+                        </div>
+                    </div>
                 </div>
 
                 <button type="submit" class="btn btn-success mt-3">
@@ -101,6 +115,7 @@
                             <th class="ps-4">Room</th>
                             <th class="d-none d-md-table-cell">Coordinates</th>
                             <th class="text-center">Pinned to within</th>
+                            <th class="text-center">Threshold</th>
                             <th class="text-end pe-4">&nbsp;</th>
                         </tr>
                     </thead>
@@ -123,6 +138,19 @@
                                 {% else %}
                                 <span class="text-muted small">entered by hand</span>
                                 {% endif %}
+                            </td>
+                            <td class="text-center" style="min-width: 170px;">
+                                <form method="POST" class="d-flex gap-1 justify-content-center align-items-center"
+                                    action="{{ url_for('set_classroom_radius', classroom_id=room.id) }}">
+                                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                    <input type="number" name="radius_m" class="form-control form-control-sm"
+                                        style="width: 80px;" min="{{ classroom_min_radius_m }}"
+                                        max="{{ classroom_max_radius_m }}" step="1"
+                                        value="{{ room.radius_m|round|int if room.radius_m else '' }}"
+                                        placeholder="{{ geofence_radius_m }}">
+                                    <span class="text-muted small">m</span>
+                                    <button type="submit" class="btn btn-outline-secondary btn-sm">Set</button>
+                                </form>
                             </td>
                             <td class="text-end pe-4">
                                 <form method="POST" class="d-inline"

@@ -161,6 +161,14 @@ Operationally:
   every remaining scan. The room is recorded on the session row, so the pin is
   rebuilt from the database on the next scan — read in a join the scan path was
   already doing, so it costs no extra query.
+- **A room can carry its own threshold.** `GEOFENCE_RADIUS_M` is the default,
+  not a fixed rule: a room may be given a `Threshold` on `/classrooms`, and
+  scans for a class held there are measured against that instead. One 100m
+  number cannot fit both a seminar room and a 400-seat theatre with an
+  overflow gallery. Left blank, the room stays on the server default — which
+  is right for almost every room, so the field is optional. Values are
+  bounded (5m–2000m): below that, ordinary indoor GPS drift refuses students
+  sitting in the hall; above it, the fence stops fencing anything.
 - **Deleting a room keeps its history.** Sessions held there lose only the
   ability to rebuild a lost pin; their attendance is untouched.
 
@@ -186,7 +194,7 @@ quietly at every phone.
 | `GUNICORN_THREADS` | 8 | Threads per worker. workers × threads = concurrent requests. |
 | `GUNICORN_TIMEOUT` | 60 | Above the 30s platform router timeout on purpose. |
 | `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` | 5 / 5 | **Per worker.** Postgres sees up to `workers × (pool + overflow)` connections — 40 with defaults. Keep below your plan's connection cap, or put PgBouncer in front when scaling out. |
-| `GEOFENCE_RADIUS_M` | 100 | Max metres between the pinned class location and a scanning student. Phone GPS inside buildings is often 20–50m off — don't set this too tight. |
+| `GEOFENCE_RADIUS_M` | 100 | Default max metres between the pinned class location and a scanning student. Phone GPS inside buildings is often 20–50m off — don't set this too tight. A saved classroom may override it per room (see below), so this is the fallback rather than a ceiling. |
 | `GEOFENCE_REQUIRED` | **true** | What happens when a lecturer never pins a classroom (they dismissed the browser's GPS prompt). Defaults **on**: with nothing to measure against, the scan is refused. Off, the failure is silent and total — a lecturer who dismissed one prompt records a whole term of attendance that anyone could have submitted from anywhere, with nothing on the register saying so. Refusing is loud and fixable in ten seconds by granting location on the QR screen, which tells the lecturer which of the two applies. |
 | `GEOFENCE_MAX_ACCURACY_M` | `GEOFENCE_RADIUS_M` | Reported GPS accuracy beyond which a fix proves nothing. The reading is refused rather than used to widen the fence — accuracy is self-reported, so treating it as an allowance would be a free pass for the asking. |
 | `GEOFENCE_MAX_LOCATION_AGE_MS` | 30000 | Oldest position fix a scan may carry. Both this and `accuracy_m` are now **required** on a scan when a classroom is pinned; they used to be read only if present, so omitting them was the way past every proximity check. |

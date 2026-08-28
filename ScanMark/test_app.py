@@ -1883,6 +1883,106 @@ class TestSavedClassrooms:
             # strand a class the lecturer has already started.
             assert latest.classroom_id is None
 
+    # --- A room's own threshold, instead of the server-wide default ----
+
+    def test_a_room_can_be_saved_with_its_own_threshold(
+            self, appmod, seed, login):
+        ada = login(seed['coordinator_email'])
+        self._add(ada, coordinates='7.22000, 3.44000', radius_m='250')
+
+        from models import Classroom
+        with appmod.app.app_context():
+            assert Classroom.query.one().radius_m == 250
+
+    def test_a_wider_threshold_admits_a_scan_the_default_would_refuse(
+            self, appmod, seed, login):
+        ada = login(seed['coordinator_email'])
+        self._add(ada, coordinates='7.22000, 3.44000', radius_m='300')
+        ada.post(f"/session/{seed['session_id']}/classroom",
+                 data={'classroom_id': self._room_id(appmod)})
+
+        kemi = login(seed['student_email'])
+        result = self._scan_at_metres(appmod, seed['session_id'], kemi, 250)
+        assert result['status'] == 'success'
+
+    def test_a_tighter_threshold_refuses_a_scan_the_default_would_admit(
+            self, appmod, seed, login):
+        ada = login(seed['coordinator_email'])
+        self._add(ada, coordinates='7.22000, 3.44000', radius_m='30')
+        ada.post(f"/session/{seed['session_id']}/classroom",
+                 data={'classroom_id': self._room_id(appmod)})
+
+        kemi = login(seed['student_email'])
+        result = self._scan_at_metres(appmod, seed['session_id'], kemi, 80)
+        assert result['status'] == 'error'
+        assert 'max 30m' in result['message']
+
+    def test_a_blank_threshold_keeps_the_server_default(
+            self, appmod, seed, login):
+        ada = login(seed['coordinator_email'])
+        self._add(ada, coordinates='7.22000, 3.44000')
+
+        from models import Classroom
+        with appmod.app.app_context():
+            assert Classroom.query.one().radius_m is None
+
+    def test_a_threshold_outside_the_allowed_bounds_is_rejected(
+            self, appmod, seed, login):
+        ada = login(seed['coordinator_email'])
+        self._add(ada, coordinates='7.22000, 3.44000', radius_m='1')
+
+        from models import Classroom
+        with appmod.app.app_context():
+            # Refused, not silently clamped — the room is not saved at all.
+            assert Classroom.query.count() == 0
+
+    def test_an_existing_rooms_threshold_can_be_changed_without_repinning(
+            self, appmod, seed, login):
+        ada = login(seed['coordinator_email'])
+        self._add(ada, coordinates='7.22000, 3.44000')
+        room_id = self._room_id(appmod)
+
+        response = ada.post(f'/classrooms/{room_id}/radius',
+                            data={'radius_m': '400'}, follow_redirects=True)
+        assert response.status_code == 200
+
+        from models import db, Classroom
+        with appmod.app.app_context():
+            room = db.session.get(Classroom, room_id)
+            assert room.radius_m == 400
+            assert round(room.latitude, 5) == 7.22000
+
+    def test_re_pinning_a_room_does_not_silently_drop_its_threshold(
+            self, appmod, seed, login):
+        """
+        Re-pinning is how somebody fixes coordinates they captured from the
+        doorway. Leaving the threshold field blank while doing so must not
+        wipe one they set deliberately — the flash message says it updated
+        the coordinates, and it should be telling the truth.
+        """
+        ada = login(seed['coordinator_email'])
+        self._add(ada, coordinates='7.22000, 3.44000', radius_m='300')
+        self._add(ada, coordinates='7.30000, 3.50000')
+
+        from models import Classroom
+        with appmod.app.app_context():
+            room = Classroom.query.one()
+            assert round(room.latitude, 5) == 7.30000   # the re-pin landed
+            assert room.radius_m == 300                 # ...and kept this
+
+    def test_only_a_course_lecturer_can_change_a_rooms_threshold(
+            self, appmod, seed, other_institution, login):
+        ada = login(seed['coordinator_email'])
+        self._add(ada, coordinates='7.22000, 3.44000')
+        room_id = self._room_id(appmod)
+
+        bola = login(other_institution['coordinator_email'])
+        bola.post(f'/classrooms/{room_id}/radius', data={'radius_m': '400'})
+
+        from models import db, Classroom
+        with appmod.app.app_context():
+            assert db.session.get(Classroom, room_id).radius_m is None
+
 
 class TestQrTokens:
 
