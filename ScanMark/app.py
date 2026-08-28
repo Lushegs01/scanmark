@@ -1719,6 +1719,14 @@ GEOFENCE_MAX_PIN_ACCURACY_M = int(
     os.environ.get('GEOFENCE_MAX_PIN_ACCURACY_M') or GEOFENCE_RADIUS_M
 )
 
+# Bounds on the PER-CLASSROOM override of GEOFENCE_RADIUS_M (see
+# Classroom.radius_m). Not a policy choice so much as a sanity rail: below
+# CLASSROOM_MIN_RADIUS_M ordinary GPS drift would refuse students standing
+# in the room; above CLASSROOM_MAX_RADIUS_M the "geofence" no longer fences
+# anything a phone could plausibly be outside of.
+CLASSROOM_MIN_RADIUS_M = 5
+CLASSROOM_MAX_RADIUS_M = 2000
+
 
 def _make_signature(message: str) -> str:
     """Return a 16-char HMAC-SHA256 hex signature."""
@@ -4694,6 +4702,32 @@ def _read_coordinates(form):
     return latitude, longitude, accuracy_m
 
 
+def _read_radius(form):
+    """
+    Optional per-classroom geofence override from the add-classroom form.
+
+    Blank keeps the room on the server-wide default (GEOFENCE_RADIUS_M) —
+    that is right for almost every room, so the field is optional rather
+    than something every lecturer has to think about. A value is stored
+    only when someone deliberately typed one, and only within sane bounds:
+    too tight and ordinary GPS drift refuses people standing in the room,
+    too loose and it stops being a geofence at all.
+    """
+    raw = _clean_text(form.get('radius_m', ''), 10)
+    if not raw:
+        return None
+    try:
+        radius_m = float(raw)
+    except ValueError:
+        raise ValueError('The threshold must be a number of metres.')
+    if not math.isfinite(radius_m) or not (
+            CLASSROOM_MIN_RADIUS_M <= radius_m <= CLASSROOM_MAX_RADIUS_M):
+        raise ValueError(
+            f'The threshold must be between {CLASSROOM_MIN_RADIUS_M:g} and '
+            f'{CLASSROOM_MAX_RADIUS_M:g} metres.')
+    return radius_m
+
+
 @app.route('/classrooms')
 @login_required
 def classrooms():
@@ -4703,7 +4737,9 @@ def classrooms():
         return denied
     return render_template('classrooms.html', classrooms=_my_classrooms(),
                            geofence_radius_m=GEOFENCE_RADIUS_M,
-                           max_pin_accuracy_m=GEOFENCE_MAX_PIN_ACCURACY_M)
+                           max_pin_accuracy_m=GEOFENCE_MAX_PIN_ACCURACY_M,
+                           classroom_min_radius_m=CLASSROOM_MIN_RADIUS_M,
+                           classroom_max_radius_m=CLASSROOM_MAX_RADIUS_M)
 
 
 @app.route('/classrooms/add', methods=['POST'])
@@ -4721,6 +4757,7 @@ def add_classroom():
 
     try:
         latitude, longitude, accuracy_m = _read_coordinates(request.form)
+        radius_m = _read_radius(request.form)
     except ValueError as problem:
         flash(str(problem), 'error')
         return redirect(url_for('classrooms'))
@@ -4737,13 +4774,20 @@ def add_classroom():
         existing.latitude = latitude
         existing.longitude = longitude
         existing.accuracy_m = accuracy_m
+        # Only when one was actually typed. Somebody re-pinning a room is
+        # fixing its coordinates, and a blank field must not silently drop a
+        # threshold they set deliberately — the flash below says coordinates,
+        # and it should be telling the truth. Clearing an override is what the
+        # per-room control on the list does.
+        if radius_m is not None:
+            existing.radius_m = radius_m
         db.session.commit()
         flash(f'Updated the coordinates for {existing.name}.', 'success')
         return redirect(url_for('classrooms'))
 
     room = Classroom(institution=institution, name=name, latitude=latitude,
                      longitude=longitude, accuracy_m=accuracy_m,
-                     created_by_id=current_user.id)
+                     radius_m=radius_m, created_by_id=current_user.id)
     db.session.add(room)
     try:
         db.session.commit()
@@ -4779,6 +4823,35 @@ def delete_classroom(classroom_id):
     db.session.delete(room)
     db.session.commit()
     flash(f'Removed {name}.', 'success')
+    return redirect(url_for('classrooms'))
+
+
+@app.route('/classrooms/<int:classroom_id>/radius', methods=['POST'])
+@login_required
+def set_classroom_radius(classroom_id):
+    """
+    Change how close a student must be to mark attendance in this room —
+    without needing to stand in it and re-pin its coordinates.
+    """
+    denied = require_role(*TEACHING_ROLES)
+    if denied:
+        return denied
+
+    room = _my_classroom(classroom_id)
+    if room is None:
+        flash('That classroom no longer exists.', 'warning')
+        return redirect(url_for('classrooms'))
+
+    try:
+        radius_m = _read_radius(request.form)
+    except ValueError as problem:
+        flash(str(problem), 'error')
+        return redirect(url_for('classrooms'))
+
+    room.radius_m = radius_m
+    db.session.commit()
+    label = f'{radius_m:g}m' if radius_m else f'the default ({GEOFENCE_RADIUS_M}m)'
+    flash(f'{room.name} now needs students within {label}.', 'success')
     return redirect(url_for('classrooms'))
 
 
@@ -5162,6 +5235,10 @@ def mark_attendance():
                 # without a second round trip on the scan path.
                 Classroom.latitude.label('room_lat'),
                 Classroom.longitude.label('room_lon'),
+                # This room's own geofence radius, if it was given one — the
+                # join is already happening for room_lat/room_lon, so reading
+                # it costs nothing extra here.
+                Classroom.radius_m.label('room_radius_m'),
             )
             .join(Course, Course.id == ClassSession.course_id)
             .outerjoin(Classroom, Classroom.id == ClassSession.classroom_id)
@@ -5304,11 +5381,15 @@ def mark_attendance():
             distance_m = calculate_distance(
                 class_loc['lat'], class_loc['lon'], student_lat, student_lon
             )
-            if distance_m > GEOFENCE_RADIUS_M:
+            # A saved classroom may have its own threshold; anything else
+            # (an ad-hoc pin, or a room that never set one) uses the
+            # server-wide default.
+            geofence_radius_m = target['room_radius_m'] or GEOFENCE_RADIUS_M
+            if distance_m > geofence_radius_m:
                 return respond(
                     'error',
                     f'Too far from the classroom. You are {int(distance_m)}m away '
-                    f'(max {GEOFENCE_RADIUS_M}m).',
+                    f'(max {int(geofence_radius_m)}m).',
                     422,
                     'outside_geofence',
                 )
@@ -6010,6 +6091,10 @@ with app.app_context():
         ("class_session", "classroom_id", "INTEGER"),
         # When a student joined a course.
         ("enrollments", "enrolled_at", "TIMESTAMP"),
+        # Per-classroom geofence override. NULL on every existing row, which
+        # is exactly right: they were sized against the server-wide default
+        # and should keep being so until a lecturer opts a room out of it.
+        ("classroom", "radius_m", "FLOAT"),
     ]
     database_inspector = inspect(db.engine)
     existing_columns = {

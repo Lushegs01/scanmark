@@ -193,6 +193,14 @@ class Classroom(db.Model):
     # than leaving a lecturer to work that out from students being refused.
     accuracy_m = db.Column(db.Float, nullable=True)
 
+    # How close a student's scan must land to these coordinates to mark
+    # attendance here, in metres. NULL means "use the server default"
+    # (GEOFENCE_RADIUS_M) — most rooms never touch this. A lecture theatre
+    # with a fenced-off overflow gallery, or a room a lecturer has found
+    # needs slack for GPS drift near thick walls, is why it is a knob at
+    # all rather than a single fixed number.
+    radius_m = db.Column(db.Float, nullable=True)
+
     created_by_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
     created_at = db.Column(db.DateTime, nullable=False, default=utcnow_naive)
 
