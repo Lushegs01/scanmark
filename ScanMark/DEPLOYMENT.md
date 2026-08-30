@@ -366,6 +366,105 @@ Load balancer
 Transaction pooling suits this workload: the scan path is short, autocommit-
 shaped transactions with no session-level state to preserve.
 
+On a managed Postgres this is usually a hosted pooler rather than something
+you run — see "Running on managed Postgres (Neon)" below.
+
+## Running on managed Postgres (Neon)
+
+### The pooler is the PgBouncer
+
+Neon's pooled connection string — the host with `-pooler` in it — *is*
+PgBouncer in transaction-pooling mode, run by Neon and included on every
+plan. The connection maths above still describes what happens, but the
+answer to "when do I add PgBouncer" is "it is already there; connect to the
+pooled host". Transaction pooling is the mode this workload wants anyway,
+for the reason the section above gives.
+
+Keep `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` where they are. The pooler lifts the
+`instances x WEB_CONCURRENCY x (pool + overflow)` ceiling; it does not make a
+large per-worker pool free.
+
+`pool_pre_ping` and `pool_recycle`, already set in `app.py`, are what keep
+this working across a suspend: the platform drops idle connections, and a
+pool that hands out a dead one turns the first scan of the morning into a
+500.
+
+### Put the compute in the web instance's region
+
+What matters is the round trip from the **web instance** to Postgres, not
+from the student's phone. A scan makes several — in the budget table above,
+`session_course`, `enrollment` and `db_insert` are 40 ms between them. A
+cross-region hop is added to each one, so a database in Virginia behind a web
+service in Frankfurt spends its whole budget on geography.
+
+Neon cannot move an existing project between regions: fixing it means a new
+project and a dump/restore. Check it before there is real attendance data to
+migrate.
+
+### Scale-to-zero does not happen here
+
+`/healthz` reaches PostgreSQL — that is the point of it, see "Health checks"
+— and the platform calls it continuously. The compute therefore never sees
+the idle window that would suspend it, and the deployment is billed as
+always-on whatever the plan says about scaling to zero.
+
+That is the right trade for a live deployment: a suspended compute puts a
+cold start in front of the first scan of every morning. But it does set the
+floor on the bill, and the floor is set by the health check rather than by
+the students.
+
+Pointing the platform health check at `/livez` instead lets the compute
+suspend overnight and out of term, at the cost of the platform no longer
+noticing that an instance cannot reach its database. Reasonable while
+piloting; not once a class depends on it.
+
+### Cap the autoscale ceiling
+
+Usage-based billing with a 16 CU ceiling and no cap is how one runaway query
+becomes a surprise invoice. Set the compute's maximum to **2-4 CU**, and a
+budget alert alongside it.
+
+Nothing is given up. One instance holds at most
+`WEB_CONCURRENCY x (DB_POOL_SIZE + DB_MAX_OVERFLOW)` = 40 connections, and the
+measured scan path is tens of milliseconds; ScanMark cannot drive 16 CU of
+work through 40 connections. The ceiling is there to bound the bill, not the
+capacity.
+
+Rehearsals are the other half of this. Run the 600/2,000 scenarios against a
+**branch** or a throwaway project — a load test aimed at the production
+compute is billed like production traffic, and "never rehearse against
+production" now has a second reason behind it.
+
+### Which plan, and estimating the month
+
+A free tier is not a candidate for a live deployment. The always-on
+behaviour above consumes its compute allowance long before the month ends —
+`0.25 CU x 730 h` is roughly 182 CU-hours against an allowance of 100 — and
+an exhausted allowance suspends the compute, which for this application
+means refusing to boot, around week three of every month.
+
+The entry-level paid tier is the working choice. What the tier above it adds
+is compliance and networking — private networking (which needs the app inside
+the same cloud's VPC, so it does not apply to a PaaS deployment), SOC 2,
+HIPAA, IP allowlisting — plus a compute ceiling this workload cannot reach.
+Move up when an institution asks for SOC 2 or an uptime SLA in writing, not
+before.
+
+To size a month, take the always-on floor and add the lectures:
+
+```
+CU-hours = (0.25 x 730)                        <- floor, set by the health check
+         + (avg CU above 0.25 x lecture hours) <- the actual classes
+
+bill     = CU-hours x the plan's per-CU-hour rate
+         + stored GB x the storage rate
+```
+
+Storage is not a factor early on. The growth is `session_roster` (one row per
+enrolled student per meeting) and an append-only `audit_log` that is never
+pruned by design. Both grow with the timetable rather than with traffic, and
+neither approaches a gigabyte in a first year.
+
 ## Roles
 
 Only two roles can be self-assigned through the public signup form: **Lecturer**
@@ -393,8 +492,9 @@ placement has to be explicit.
    Postgres ceiling of 40 connections. This is a staging candidate, not a
    capacity guarantee; accept it only after the checked-in 600/2,000 scenarios.
 2. **Scaling out** (2+ instances): connection math multiplies per instance —
-   add **PgBouncer** (transaction pooling) in front of Postgres, keep
-   `DB_POOL_SIZE`/`DB_MAX_OVERFLOW` modest.
+   add **PgBouncer** (transaction pooling) in front of Postgres, or connect to
+   your provider's pooled endpoint, and keep `DB_POOL_SIZE`/`DB_MAX_OVERFLOW`
+   modest.
 3. **Static/bandwidth**: WhiteNoise already serves /static compressed with
    cache headers. A CDN (e.g. Cloudflare free tier) in front additionally
    absorbs static traffic and TLS handshakes close to campus.
