@@ -136,6 +136,20 @@ class AuthenticatedUser(HttpUser):
     abstract = True
     wait_time = between(0.2, 1.0)
 
+    def browser_headers(self, path):
+        """
+        The headers a browser attaches to a same-origin POST.
+
+        ``Referer`` is not decoration. Flask-WTF's ``WTF_CSRF_SSL_STRICT`` is
+        on by default and, on an HTTPS request, refuses a POST that carries no
+        referrer with 400 "The referrer header is missing." Every real
+        deployment is HTTPS, so a harness that omits it cannot get past
+        /login — it measures the CSRF rejection path and reports it as a
+        login failure. Browsers send it under the app's own
+        ``Referrer-Policy: strict-origin-when-cross-origin``; so does this.
+        """
+        return {'Referer': f'{self.host.rstrip("/")}{path}'}
+
     def login(self):
         # Interleaved so no two Locust processes claim the same student.
         number = next(_user_counter) * WORKER_COUNT + _worker_index(self.environment) + 1
@@ -156,7 +170,7 @@ class AuthenticatedUser(HttpUser):
             'csrf_token': match.group(1),
             'email': email,
             'password': PASSWORD,
-        }, name='/login [authenticate]')
+        }, name='/login [authenticate]', headers=self.browser_headers('/login'))
         if response.status_code >= 400 or '/login' in response.url:
             raise StopUser()
         scan_page = self.client.get('/scan_page', name='/scan_page [preload]')
@@ -195,10 +209,12 @@ class AuthenticatedUser(HttpUser):
         }
 
     def scan(self, name='/mark_attendance [scan]', token=None):
+        headers = self.browser_headers('/scan_page')
+        headers['X-CSRFToken'] = self.csrf
         return self.client.post(
             '/mark_attendance',
             json=self.scan_payload(token),
-            headers={'X-CSRFToken': self.csrf},
+            headers=headers,
             name=name,
             catch_response=True,
         )

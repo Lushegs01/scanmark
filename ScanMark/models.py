@@ -295,6 +295,32 @@ class Attendance(db.Model):
     timestamp = db.Column(db.DateTime, default=utcnow_naive)
     device_id = db.Column(db.String(200), nullable=True)
 
+    # --- CampOS delivery, as a transactional outbox ---
+    #
+    # The scan is the record; carrying it into CampOS is a separate,
+    # optional, and FALLIBLE step. It used to live only in an in-process
+    # thread pool, which meant three ways to lose it silently: the queue was
+    # full, the delivery raised and was logged, or the process was replaced
+    # mid-lecture by a deploy. Nothing anywhere remembered that a scan still
+    # owed CampOS a record, so "did every attendance reach CampOS?" was not a
+    # question the system could answer, let alone fix.
+    #
+    # Making the intent part of the same INSERT that records the attendance
+    # is what fixes that, and it is free: no extra statement, no extra round
+    # trip, nothing added to the request. The row itself is the queue, so it
+    # survives a restart, a rolling deploy and a crash, and any instance can
+    # pick up work any other instance dropped.
+    #
+    #   'skipped' — CampOS is not configured; nothing is owed
+    #   'pending' — owed, and eligible from campos_next_attempt_at
+    #   'sent'    — delivered
+    #   'failed'  — dead-lettered after CAMPOS_MAX_ATTEMPTS; needs a human
+    campos_state = db.Column(db.String(10), nullable=False, default='skipped',
+                             server_default='skipped')
+    campos_attempts = db.Column(db.Integer, nullable=False, default=0,
+                                server_default='0')
+    campos_next_attempt_at = db.Column(db.DateTime, nullable=True)
+
     __table_args__ = (
         # One scan per student per class session, enforced by the database so
         # concurrent duplicate requests can't both slip past the app-level
@@ -302,6 +328,15 @@ class Attendance(db.Model):
         # are distinct for unique-index purposes on SQLite and Postgres).
         db.Index('uq_attendance_student_session', 'student_id', 'session_id',
                  unique=True),
+        # The sweeper's claim query. PARTIAL on purpose: in a healthy system
+        # essentially every row is 'sent', so a full index over the state
+        # column would be almost entirely dead weight that every attendance
+        # INSERT still has to maintain. This one only ever holds the rows
+        # that are actually owed, so it stays small enough to be resident
+        # however large the attendance table grows.
+        db.Index('ix_attendance_campos_outbox', 'campos_next_attempt_at',
+                 postgresql_where=db.text("campos_state = 'pending'"),
+                 sqlite_where=db.text("campos_state = 'pending'")),
         # The live attendee feed filters on session_id; the per-student
         # course totals on the dashboard filter on (course_id, student_id).
         db.Index('ix_attendance_session_id', 'session_id'),

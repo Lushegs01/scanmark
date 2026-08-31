@@ -84,6 +84,9 @@
     const SERVER_MAX_AGE_MS = Number(config.maxLocationAgeMs) > 0
         ? Number(config.maxLocationAgeMs) : 30000;
     const TRANSIENT_RETRY_LIMIT = 3;
+    //: Marks that this page already reloaded itself once to recover a
+    //  session/CSRF mismatch, so it cannot do it again in a loop.
+    const RELOADED_FOR_SESSION_KEY = 'scanmark-reloaded-for-session';
     // How many times we may re-read the same projected code and resubmit on
     // our own after a rejection the student could plausibly fix (an expired
     // code, a GPS fix that was too far out). Past this the camera stops and
@@ -734,11 +737,36 @@
         }, delayMs);
     }
 
-    function retryDelay() {
-        const base = Math.min(15000, 1500 * (2 ** retryAttempt));
-        retryAttempt += 1;
-        return Math.floor(base * (0.75 + Math.random() * 0.5));
+    /**
+     * How long the server says to wait, in ms, or null if it did not say.
+     *
+     * ScanMark sends Retry-After on exactly the two responses that mean "we
+     * are shedding on purpose": 429 from the per-session admission bucket
+     * (sub-second — it is smoothing a microburst, not queueing attendance)
+     * and 503 when the database connection pool is exhausted (seconds). The
+     * server knows how long its own queue needs to drain; a client guessing
+     * instead is wrong in both directions. Guessing LONGER than the shed
+     * interval wastes the QR window and can let the token expire; guessing
+     * SHORTER is 2,000 phones coming back before there is anywhere to put
+     * them, which is the burst again.
+     *
+     * Clamped, because the header is still input: a bad or hostile value
+     * must not park the scanner for an hour or turn the backoff into a
+     * tight loop.
+     */
+    function serverRetryDelay(response) {
+        const header = response && response.headers
+            ? response.headers.get('Retry-After') : null;
+        if (!header) return null;
+        const seconds = Number(header);
+        if (!Number.isFinite(seconds) || seconds < 0) return null;
+        const clamped = Math.min(30, seconds) * 1000;
+        // Jitter even the server's number. Every phone in the room was shed
+        // by the same response and would otherwise come back in the same
+        // millisecond.
+        return Math.max(250, Math.floor(clamped * (0.75 + Math.random() * 0.5)));
     }
+
 
     async function submitAttendance(qrData) {
         const gpsStarted = performance.now();
@@ -783,17 +811,35 @@
             const contentType = response.headers.get('content-type') || '';
             if (!contentType.includes('application/json')) {
                 // A non-JSON body from a 4xx is almost always the CSRF guard
-                // rejecting a page that has been open longer than the token
-                // lives. Retrying cannot fix that; reloading can.
+                // rejecting a page whose token no longer matches the session:
+                // the page has been open longer than the token lives, or the
+                // session store failed over and the server is now issuing
+                // cookie sessions. Retrying cannot fix either; reloading can,
+                // because the reloaded page carries a token minted against
+                // whatever session the server is using NOW.
+                //
+                // So do it, rather than asking 2,000 students in a lecture
+                // theatre to each read an instruction and tap Reload. Once
+                // only: a sessionStorage marker means a fault that survives
+                // the reload shows the message instead of looping, and the
+                // marker is cleared as soon as a scan gets a real answer.
                 if (response.status < 500 && response.status !== 429) {
                     retryAttempt = 0;
                     rejectionStreak = 0;
-                    result('Your session expired. Reload this page, then scan again.', 'danger');
                     stopScanner();
+                    if (!sessionStorage.getItem(RELOADED_FOR_SESSION_KEY)) {
+                        sessionStorage.setItem(RELOADED_FOR_SESSION_KEY, '1');
+                        result('Reconnecting…', 'warning');
+                        setTimeout(() => location.reload(), 400);
+                        return;
+                    }
+                    result('Your session expired. Reload this page, then scan again.', 'danger');
                     return;
                 }
                 throw new Error(`HTTP ${response.status}`);
             }
+            // A real answer means whatever the reload was for is resolved.
+            sessionStorage.removeItem(RELOADED_FOR_SESSION_KEY);
 
             const payload = await response.json();
 
@@ -809,9 +855,12 @@
                 stopScanner();
                 return;
             }
-            // Server fault or rate limit: back off and try the same code again.
+            // Server fault or deliberate shedding: back off and try the same
+            // code again, at the pace the server asked for where it gave one.
             if (response.status === 429 || response.status >= 500) {
-                throw new Error(payload.message || `HTTP ${response.status}`);
+                const error = new Error(payload.message || `HTTP ${response.status}`);
+                error.retryAfterMs = serverRetryDelay(response);
+                throw error;
             }
 
             retryAttempt = 0;
@@ -849,7 +898,12 @@
                 return;
             }
             if (retryAttempt < TRANSIENT_RETRY_LIMIT) {
-                const delay = retryDelay();
+                retryAttempt += 1;
+                const delay = error && error.retryAfterMs !== null
+                    && error.retryAfterMs !== undefined
+                    ? error.retryAfterMs
+                    : Math.floor(Math.min(15000, 1500 * (2 ** (retryAttempt - 1)))
+                                 * (0.75 + Math.random() * 0.5));
                 status(`Network busy; retrying in ${Math.ceil(delay / 1000)}s`, 'error');
                 resumeTimeoutId = setTimeout(() => submitAttendance(qrData), delay);
             } else {

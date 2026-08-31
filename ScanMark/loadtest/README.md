@@ -39,6 +39,42 @@ describes a system nobody is running.
 concurrency. It is a regression signal and is labelled as one. Never quote it
 as user capacity.
 
+## Which tool, and why there are two
+
+**`scan_burst.py` is the one to reach for first.** Every Locust scenario here
+signs its virtual student in and *then* scans, so a 2,000-user run measures
+`login + scan` and reports the sum under the scan's name. That is not a
+detail: verifying one password costs ~100 ms of CPU (Werkzeug's scrypt), so a
+2,000-user spawn spends over a minute of CPU on authentication while the scans
+it is supposed to be measuring queue behind it. The published "scan p95" then
+describes password hashing.
+
+Real classes do not work that way. Students are signed in before the lecturer
+projects the code. `scan_burst.py` splits the two — sign everyone in
+(untimed), then release every scan at once against a barrier — and verifies,
+against the database, that every admitted scan is on the register exactly
+once.
+
+```bash
+python loadtest/scan_burst.py --host https://staging.example \
+    --students 2000 --session-id 1 --secret "$TARGET_SECRET_KEY" \
+    --database-url "$DATABASE_URL"
+```
+
+Useful flags:
+
+| Flag | What it rehearses |
+|---|---|
+| `--login-noise 40` | a sign-in rush running *through* the burst. The question that matters is what authentication does to scan latency, and this is the only way to see it. |
+| `--projector-watchers 3` | the lecturer's screen polling every second while the class scans. |
+| `--session-id 1,2,3,4,5` | concurrent classes; students are dealt round-robin across them. |
+| `--warm-connections` | reuse the TCP connection from sign-in. Off by default, because a phone waits on the projector and whoever has the shortest idle timeout closes the socket first — so a real scan pays for a fresh handshake. |
+| `--proxied-https` | the target is plain HTTP standing in for a deployment that terminates TLS at a load balancer. Keeps TLS CPU out of a measurement of the app without relaxing anything on the server. |
+| `--burst-concurrency 1` | the uncontended serial cost of one scan — the baseline every other number should be read against. |
+
+Use the Locust scenarios for sustained arrival-rate shapes, the login
+stampede on its own, and the duplicate race.
+
 ## Prerequisites
 
 | Variable | What it is |

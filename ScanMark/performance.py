@@ -11,20 +11,60 @@ from __future__ import annotations
 import math
 import threading
 import time
+from bisect import bisect_right
 from collections import Counter, defaultdict, deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Callable
 from sqlalchemy.pool import QueuePool
 
 
+#: Latency buckets, in milliseconds, shared by every timing metric.
+#
+# Chosen around the numbers this application actually has to defend: the scan
+# SLO (50 / 150 / 300 ms), a Redis or Postgres round trip (well under 5 ms),
+# and the far tail where a request has stopped being useful to a student.
+LATENCY_BUCKETS_MS = (
+    1, 2.5, 5, 10, 25, 50, 100, 150, 250, 500, 1000, 2500, 5000, 10000,
+)
+
+
 class RuntimeMetrics:
-    """Thread-safe counters, gauges, and bounded latency samples."""
+    """
+    Thread-safe counters, gauges, bounded latency samples AND cumulative
+    histogram buckets.
+
+    The buckets are not decoration, and they are not a duplicate of the
+    percentiles beside them. They exist because THE PERCENTILES CANNOT BE
+    ADDED UP.
+
+    This process is one of `workers` in one of N instances, and each one keeps
+    its own reservoir. A Prometheus scrape reaches exactly one of them, so
+    `p95` here has always meant "the 95th percentile of the requests that
+    happened to land on this worker" — measured, one scrape saw 48 of the 200
+    scans a run had just performed. There is no arithmetic that turns a set of
+    per-worker p95s into the p95 of the service; averaging them is simply
+    wrong, and taking the max is a different statistic that answers a
+    different question.
+
+    Bucket COUNTS do add up. Summing `..._bucket{le="150"}` across every
+    worker and every instance gives the true number of requests under 150 ms
+    for the whole deployment, and `histogram_quantile()` computes a real
+    service-wide p95 from it. That is what makes a single dashboard possible
+    at all once there is more than one process — which, for this application,
+    is always.
+
+    The per-worker percentiles are kept as well: they are the cheapest way to
+    see one worker misbehaving, which an aggregate deliberately hides.
+    """
 
     def __init__(self, sample_limit: int = 4096):
         self._lock = threading.Lock()
         self._counters: Counter[str] = Counter()
         self._gauges: dict[str, float] = {}
         self._samples = defaultdict(lambda: deque(maxlen=sample_limit))
+        # name -> [count per bucket..., +Inf], plus a running sum for averages
+        self._buckets: dict[str, list[int]] = {}
+        self._sums: dict[str, float] = {}
 
     def increment(self, name: str, amount: float = 1) -> None:
         with self._lock:
@@ -35,14 +75,25 @@ class RuntimeMetrics:
             self._gauges[name] = value
 
     def observe_ms(self, name: str, value_ms: float) -> None:
+        value = max(0.0, float(value_ms))
+        # bisect, not a scan: this runs on the hot path, several times per
+        # request, and O(log n) over a fixed 14-element ladder is free.
+        index = bisect_right(LATENCY_BUCKETS_MS, value)
         with self._lock:
-            self._samples[name].append(max(0.0, float(value_ms)))
+            self._samples[name].append(value)
+            counts = self._buckets.get(name)
+            if counts is None:
+                counts = self._buckets[name] = [0] * (len(LATENCY_BUCKETS_MS) + 1)
+            counts[index] += 1
+            self._sums[name] = self._sums.get(name, 0.0) + value
 
     def snapshot(self) -> dict:
         with self._lock:
             counters = dict(self._counters)
             gauges = dict(self._gauges)
             samples = {name: list(values) for name, values in self._samples.items()}
+            buckets = {name: list(values) for name, values in self._buckets.items()}
+            sums = dict(self._sums)
         histograms = {}
         for name, values in samples.items():
             ordered = sorted(values)
@@ -53,7 +104,8 @@ class RuntimeMetrics:
                 "p99": _percentile(ordered, 0.99),
                 "max": ordered[-1] if ordered else 0,
             }
-        return {"counters": counters, "gauges": gauges, "histograms": histograms}
+        return {"counters": counters, "gauges": gauges, "histograms": histograms,
+                "buckets": buckets, "sums": sums}
 
     def prometheus(self) -> str:
         snapshot = self.snapshot()
@@ -65,11 +117,28 @@ class RuntimeMetrics:
         for name, stats in sorted(snapshot["histograms"].items()):
             safe_name = _metric_name(name)
             lines.append(f"scanmark_{safe_name}_count {stats['count']}")
+            # Kept per worker, and labelled as such: an aggregate cannot show
+            # you that ONE worker is the slow one.
             for percentile in ("p50", "p95", "p99", "max"):
                 lines.append(
                     f'scanmark_{safe_name}_ms{{stat="{percentile}"}} '
                     f"{stats[percentile]:.3f}"
                 )
+        # The mergeable half. Cumulative ("le" = less-than-or-equal) counts,
+        # which is the shape histogram_quantile() expects and the only shape
+        # that survives being summed across workers and instances.
+        for name, counts in sorted(snapshot["buckets"].items()):
+            safe_name = _metric_name(name)
+            running = 0
+            for edge, count in zip(LATENCY_BUCKETS_MS, counts):
+                running += count
+                lines.append(
+                    f'scanmark_{safe_name}_ms_bucket{{le="{edge}"}} {running}')
+            running += counts[-1]
+            lines.append(f'scanmark_{safe_name}_ms_bucket{{le="+Inf"}} {running}')
+            lines.append(f'scanmark_{safe_name}_ms_sum '
+                         f'{snapshot["sums"].get(name, 0.0):.3f}')
+            lines.append(f'scanmark_{safe_name}_ms_hcount {running}')
         return "\n".join(lines) + "\n"
 
 
