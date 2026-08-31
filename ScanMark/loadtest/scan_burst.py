@@ -328,7 +328,7 @@ def main():
     pool.map(do_login, phones)
     login_wall = time.perf_counter() - started
     ready = [phone for phone in phones if phone.csrf]
-    print(f'\nPhase 1 — authentication (NOT the burst measurement)')
+    print('\nPhase 1 — authentication (NOT the burst measurement)')
     print(f'  signed in {len(ready)}/{len(phones)} in {login_wall:.1f}s '
           f'at concurrency {arguments.login_concurrency} '
           f'({len(ready)/max(login_wall, 1e-9):.1f} logins/sec)')
@@ -516,7 +516,7 @@ def main():
                     )).one()
             verified = {'rows': rows, 'distinct_students': distinct_students,
                         'duplicate_rows': rows - distinct_pairs}
-            print(f'\nPhase 3 — correctness')
+            print('\nPhase 3 — correctness')
             print(f'  attendance rows      {rows}')
             print(f'  distinct students    {distinct_students}')
             print(f'  duplicate (student, session) rows {rows - distinct_pairs}')
