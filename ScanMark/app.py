@@ -17,7 +17,8 @@ from dotenv import load_dotenv
 load_dotenv()
 from authlib.integrations.flask_client import OAuth
 from flask import (Flask, render_template, redirect, url_for,
-                   flash, request, send_file, jsonify, Response, session)
+                   flash, request, send_file, jsonify, make_response,
+                   Response, session)
 from markupsafe import escape
 from flask_login import LoginManager, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -32,6 +33,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import joinedload
 from sqlalchemy.pool import Pool
 import redis
+from flask.sessions import SecureCookieSessionInterface
 from flask_session import Session
 from itsdangerous import URLSafeTimedSerializer
 from flask_mail import Connection as FlaskMailConnection, Mail, Message
@@ -39,6 +41,7 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from flask_wtf.csrf import CSRFProtect
 from flask_compress import Compress
+from werkzeug.middleware.proxy_fix import ProxyFix
 from whitenoise import WhiteNoise
 import sentry_sdk
 from sentry_sdk.integrations.flask import FlaskIntegration
@@ -398,6 +401,54 @@ class HealthcheckMiddleware:
         return self.wrapped(environ, start_response)
 
 
+# ------------------------------------------------------------------
+# WHO THE CLIENT IS, BEHIND A LOAD BALANCER
+# ------------------------------------------------------------------
+# Every deployment topology this application targets — Render, Fly, Railway,
+# an ALB, Cloudflare — puts at least one reverse proxy in front of gunicorn.
+# Without ProxyFix, `request.remote_addr` is that proxy, so
+# `get_remote_address()` returns ONE address for the entire internet and every
+# per-IP limit becomes a single global bucket:
+#
+#   /signup            5 per hour   -> five signups a day for the whole world
+#   /forgot_password  10 per hour   -> ten resets an hour, globally
+#   /resend_verification, /reset_password: the same
+#   the anonymous default            -> one 20,000/min bucket for everybody
+#
+# That is a capacity bug and a security bug at once. Legitimate students are
+# refused by a counter somebody else filled, and a brute-forcer's per-IP cap
+# is shared with — and therefore hidden among — the people it is meant to
+# distinguish them from. Scaling out makes it worse, not better: every
+# instance sees the same proxy address.
+#
+# Trusting the header blindly is the opposite mistake: `X-Forwarded-For` is
+# client-supplied, so `x_for` must be the number of proxies that actually
+# rewrite it, counted from the right. One platform router is one hop, which is
+# the common case and the default here; put the real number in
+# TRUSTED_PROXY_COUNT if your topology has more (e.g. Cloudflare in front of
+# Render is 2). Zero disables it entirely, which is correct when gunicorn is
+# directly exposed.
+#
+# x_proto matters too: without it `request.is_secure` is False behind a
+# TLS-terminating router, and Flask-WTF's WTF_CSRF_SSL_STRICT referrer check
+# — a real defence against a cross-origin POST — silently never runs.
+TRUSTED_PROXY_COUNT = max(0, int(os.environ.get(
+    'TRUSTED_PROXY_COUNT', '1' if IS_PRODUCTION else '0')))
+
+if TRUSTED_PROXY_COUNT:
+    app.wsgi_app = ProxyFix(
+        app.wsgi_app,
+        x_for=TRUSTED_PROXY_COUNT,
+        x_proto=TRUSTED_PROXY_COUNT,
+        x_host=0,     # the host is decided by PUBLIC_ORIGIN/TRUSTED_HOSTS,
+        x_port=0,     # never by a header, and reject_untrusted_host enforces it
+        x_prefix=0,
+    )
+    print(f"🔗 Trusting {TRUSTED_PROXY_COUNT} reverse proxy hop(s) for the "
+          f"client address and scheme")
+else:
+    print("🔗 No reverse proxy trusted; the peer address is the client address")
+
 app.wsgi_app = HealthcheckMiddleware(WhiteNoise(
     app.wsgi_app,
     root=_static_root,
@@ -456,6 +507,181 @@ def set_security_headers(response):
             f'max-age={HSTS_MAX_AGE}; includeSubDomains'
         )
     return response
+
+
+# ============================================================
+# PASSWORD HASHING CAPACITY
+# ============================================================
+# The most expensive thing this application does is verify a password, and
+# nothing about the code makes that visible.
+#
+# Werkzeug hashes with scrypt (N=32768, r=8, p=1). That is the right choice —
+# it is deliberately, necessarily slow — but the cost is not small and it is
+# not only CPU. Measured on the container this was developed in:
+#
+#   concurrency  verifies/sec  per-verify   transient RAM
+#             1           9.9      101 ms           32 MB
+#             2          19.6      102 ms           64 MB
+#             4          38.5      104 ms          128 MB
+#             8          37.3      214 ms          256 MB
+#            16          37.4      428 ms          512 MB
+#            32          36.7      870 ms         1024 MB
+#
+# Throughput stops improving at four. scrypt is memory-HARD by design: each
+# verification touches a 32 MB working set at random, so past a handful of
+# concurrent hashes the bottleneck is memory bandwidth, not cores. Every
+# thread beyond the knee therefore buys exactly zero extra logins while
+# costing 32 MB of resident memory and a proportional increase in everyone
+# else's latency.
+#
+# Two things follow, and both of them matter on the morning of a lecture:
+#
+#  1. A 2,000-student login rush cannot be made faster by adding threads. It
+#     is ~50 seconds of memory-bandwidth-bound work and no configuration
+#     changes that. What configuration CAN change is whether those 2,000
+#     logins take every request slot in the process while they do it — and by
+#     default they do, so scans queue behind authentication. Measured: with
+#     logins running concurrently, the scan path's own per-stage timings
+#     inflated 5.7x, including stages that do no I/O at all.
+#  2. Unbounded concurrency here is an out-of-memory risk, not just a latency
+#     one. 32 gunicorn threads all verifying passwords is ~1 GB of transient
+#     RSS on an instance that may only have 512 MB.
+#
+# So password hashing gets its own admission control: a semaphore sized to
+# the measured knee. Logins past it WAIT briefly (they are far less
+# time-sensitive than a scan) and are shed with 503 + Retry-After rather than
+# being allowed to consume the instance. Recalibrate the knee for your own
+# hardware with `python benchmarks/benchmark_password_hash.py`.
+#
+# The budget is INSTANCE-wide, and each gunicorn worker gets an equal share:
+# the semaphore is per-process but memory bandwidth is not, so a budget of 4
+# across 4 workers has to mean one each, not four each.
+PASSWORD_HASH_CONCURRENCY = max(1, int(os.environ.get(
+    'PASSWORD_HASH_CONCURRENCY',
+    # The knee is set by memory bandwidth rather than by core count, so this
+    # does not scale linearly with CPUs; a small box gets a smaller number,
+    # a large one is capped where the measured curve flattens.
+    max(2, min(4, os.cpu_count() or 2)),
+)))
+_password_workers = max(1, int(os.environ.get('WEB_CONCURRENCY', 4)))
+PASSWORD_HASH_SLOTS_PER_WORKER = max(
+    1, PASSWORD_HASH_CONCURRENCY // _password_workers)
+
+# How long a login may wait for a slot before it is shed.
+#
+# This is a real trade-off, not a number to maximise, and it is worth being
+# explicit about which way it cuts. A waiting request still occupies a
+# gunicorn request slot, so a LONG wait protects memory (the semaphore is
+# doing its job) while holding slots that scans need. A SHORT wait frees the
+# slot quickly but sheds more logins, and every shed login is a client that
+# will come back — which is a retry storm if the response does not carry
+# Retry-After. Both are better than no bound at all, where 32 threads hold
+# ~1 GB between them, each verification slows to ~870 ms, and there is no
+# slot left for a scan.
+#
+# What no setting can change: a 2,000-student rush is ~54 seconds of
+# memory-hard work on this class of instance. The honest answers to that are
+# capacity (scale out before the lecture) and not needing to log in at all —
+# the 30-day remember-me cookie means a student authenticates about once a
+# term, so the realistic stampede is far smaller than the roster.
+#
+# Two seconds absorbs an ordinary clump without shedding, and gives the slot
+# back long before gunicorn's timeout turns it into a 502 with no guidance.
+PASSWORD_HASH_MAX_WAIT_SECONDS = float(os.environ.get(
+    'PASSWORD_HASH_MAX_WAIT_SECONDS', 2))
+PASSWORD_HASH_RETRY_SECONDS = int(os.environ.get(
+    'PASSWORD_HASH_RETRY_SECONDS', 3))
+
+_password_hash_gate = threading.BoundedSemaphore(PASSWORD_HASH_SLOTS_PER_WORKER)
+
+
+class PasswordHashingOverloaded(Exception):
+    """No hashing slot became free in time. Retryable, never a credential answer."""
+
+
+class _PasswordHashSlot:
+    """Hold one hashing slot, or raise; records the wait either way."""
+
+    def __enter__(self):
+        started = time.perf_counter()
+        acquired = _password_hash_gate.acquire(
+            timeout=PASSWORD_HASH_MAX_WAIT_SECONDS)
+        waited_ms = (time.perf_counter() - started) * 1000
+        runtime_metrics.observe_ms('password.gate_wait', waited_ms)
+        if not acquired:
+            runtime_metrics.increment('password.shed')
+            raise PasswordHashingOverloaded()
+        runtime_metrics.gauge('password.slots', PASSWORD_HASH_SLOTS_PER_WORKER)
+        self._started = time.perf_counter()
+        return self
+
+    def __exit__(self, *_exc):
+        runtime_metrics.observe_ms(
+            'password.hash', (time.perf_counter() - self._started) * 1000)
+        _password_hash_gate.release()
+        return False
+
+
+def verify_password(password_hash, candidate):
+    """`check_password_hash` under the instance's hashing budget."""
+    with _PasswordHashSlot():
+        return check_password_hash(password_hash, candidate)
+
+
+def hash_password(plaintext):
+    """`generate_password_hash` under the same budget — it costs the same."""
+    with _PasswordHashSlot():
+        return generate_password_hash(plaintext, method='scrypt')
+
+
+#: Stored in `User.password` for an account that has no password to check.
+#
+# Identity-provider accounts (CampOS SSO, Google) sign in through their
+# provider and never through the password form, so they were given a hash of
+# 32 random bytes. That hash is unguessable — which is the point — but it also
+# means the 100 ms of memory-hard scrypt spent producing it protects nothing:
+# there is no low-entropy secret for the work factor to defend. It is pure
+# cost, and it lands squarely on the SSO login path, which is exactly where a
+# 2,000-student burst arrives.
+#
+# A sentinel is both cheaper and stronger: `check_password_hash` returns False
+# for it (verified, not assumed), so no password can ever match, and there is
+# no derived material for an attacker who steals the table to work on at all.
+# It is also legible — "this account cannot sign in with a password" is now
+# something the row states rather than something you infer.
+UNUSABLE_PASSWORD = '!'
+
+
+def is_password_usable(password_hash):
+    """False for identity-provider accounts that have no password to check."""
+    return bool(password_hash) and not password_hash.startswith('!')
+
+
+@app.errorhandler(PasswordHashingOverloaded)
+def _password_hashing_overloaded(_error):
+    """
+    Shed, not failed.
+
+    This must never look like "wrong password": the credential was never
+    checked, so saying so would train students to retype a correct password
+    and would hand an attacker a signal about load rather than about secrets.
+    """
+    runtime_metrics.increment('password.shed_responses')
+    app.logger.warning('Password hashing shed: no slot within %ss',
+                       PASSWORD_HASH_MAX_WAIT_SECONDS)
+    if request.accept_mimetypes.best == 'application/json' or request.is_json:
+        response = jsonify({
+            'status': 'error',
+            'outcome': 'auth_overloaded',
+            'message': 'Too many people are signing in at once. '
+                       'Please try again in a moment.',
+        })
+    else:
+        flash('Too many people are signing in at once. '
+              'Please try again in a moment.', 'warning')
+        response = make_response(render_template('login.html'), 503)
+    response.headers['Retry-After'] = str(PASSWORD_HASH_RETRY_SECONDS)
+    return response, 503
 
 
 def user_based_rate_limit_key():
@@ -529,13 +755,186 @@ if redis_url:
         redis_pool = None
         redis_url = ''
 
+# Defined unconditionally, and installed below only when a Redis session
+# store exists. Keeping it at module scope is what lets the failure paths
+# be tested in CI, which has no Redis — and an untested fallback is not a
+# fallback.
+#: Seconds the session store stays "known down" after a Redis failure.
+#
+# A breaker rather than a per-request try/except, for two reasons that
+# both showed up in a rehearsal:
+#
+#  1. CORRECTNESS. Deciding per request meant the store could change under
+#     one browser between its GET and its POST — and it did. Flask-Session
+#     UNSIGNS the cookie to find the session id, and a cookie written by
+#     the fallback is a signed dict, not a signed id. Unsigning it fails
+#     quietly and Flask-Session hands back a fresh empty session WITHOUT
+#     touching Redis and WITHOUT raising, so the wrapper saw success, used
+#     the server-side store, and the CSRF token minted a moment earlier
+#     was gone. Every POST came back "The CSRF session token is missing."
+#     A breaker keeps a whole outage on one side of the fence.
+#
+#  2. LATENCY. Without it every request pays REDIS_CONNECT_TIMEOUT (2 s by
+#     default) to rediscover that Redis is still down. That is 2 s added
+#     to every scan in the room, which is worse than the outage.
+SESSION_STORE_BREAKER_SECONDS = float(
+    os.environ.get('SESSION_STORE_BREAKER_SECONDS', 10))
+
+class ResilientSessionInterface:
+    """Redis-backed sessions that fall back to signed cookies, not to 500."""
+
+    def __init__(self, primary, fallback):
+        self.primary = primary
+        self.fallback = fallback
+        #: Monotonic deadline; until it passes, use cookies and do not
+        #: touch Redis at all.
+        self._down_until = 0.0
+
+    def _trip(self, error):
+        first = time.monotonic() >= self._down_until
+        self._down_until = time.monotonic() + SESSION_STORE_BREAKER_SECONDS
+        runtime_metrics.increment('session.redis_unavailable')
+        if first:
+            app.logger.warning(
+                'Session store unreachable; serving signed-cookie sessions '
+                'for the next %ss. Sign-ins survive on the remember-me '
+                'cookie and the security stamp still revokes them: %s',
+                SESSION_STORE_BREAKER_SECONDS, error)
+
+    def _store_is_up(self):
+        up = time.monotonic() >= self._down_until
+        runtime_metrics.gauge('session.store_up', 1 if up else 0)
+        return up
+
+    def _delegate(self, session_state):
+        return (self.fallback
+                if getattr(session_state, '_scanmark_cookie_fallback', False)
+                else self.primary)
+
+    def _open_fallback(self, flask_app, http_request):
+        session_state = self.fallback.open_session(flask_app, http_request)
+        if session_state is not None:
+            session_state._scanmark_cookie_fallback = True
+        return session_state
+
+    def open_session(self, flask_app, http_request):
+        if not self._store_is_up():
+            return self._open_fallback(flask_app, http_request)
+        try:
+            session_state = self.primary.open_session(flask_app, http_request)
+            if session_state is not None:
+                return session_state
+        except redis.RedisError as error:
+            self._trip(error)
+        return self._open_fallback(flask_app, http_request)
+
+    def save_session(self, flask_app, session_state, response):
+        delegate = self._delegate(session_state)
+        try:
+            return delegate.save_session(flask_app, session_state, response)
+        except redis.RedisError as error:
+            # Never turn a served request into a 500 on the way out. The
+            # work is already done and committed; only the session record
+            # is lost, and the remember-me cookie re-establishes the user.
+            self._trip(error)
+            runtime_metrics.increment('session.redis_save_failed')
+            return None
+
+    # Flask and Flask-Login reach through the interface for these.
+    def is_null_session(self, obj):
+        return self.primary.is_null_session(obj) or \
+            self.fallback.is_null_session(obj)
+
+    def make_null_session(self, flask_app):
+        return self.primary.make_null_session(flask_app)
+
+    def get_cookie_name(self, flask_app):
+        return self.primary.get_cookie_name(flask_app)
+
+    def regenerate(self, session_state):
+        """Used by the CampOS SSO path to rotate the SID before login."""
+        regenerate = getattr(self._delegate(session_state), 'regenerate', None)
+        if callable(regenerate):
+            try:
+                return regenerate(session_state)
+            except redis.RedisError as error:
+                self._trip(error)
+        # A cookie session's identity IS its signed value, so clearing it
+        # and letting it be re-signed is the equivalent rotation.
+        return None
+
+    def __getattr__(self, name):
+        return getattr(self.primary, name)
+
+
 if redis_client is not None:
     app.config['SESSION_TYPE'] = 'redis'
     app.config['SESSION_PERMANENT'] = False
     app.config['SESSION_USE_SIGNER'] = True
     app.config['SESSION_REDIS'] = redis_client
+
+    # Flask defaults SESSION_REFRESH_EACH_REQUEST to True, and with a
+    # server-side store that means a Redis WRITE on every authenticated
+    # request whose session did not change — purely to push the record's
+    # expiry out again. Measured on the scan path: 4 Redis round trips per
+    # scan, of which this was one, and it is the only WRITE among them. In a
+    # 2,000-student burst that is 2,000 writes to Redis that change nothing.
+    #
+    # Turning it off makes the session window fixed instead of sliding, which
+    # is the more conservative of the two — a session expires at a knowable
+    # time rather than living forever as long as somebody keeps clicking. It
+    # costs nothing here because the record's lifetime (below) is longer than
+    # the 30-day remember-me cookie, so a student is re-authenticated by that
+    # cookie well before the record can lapse, without retyping a password.
+    #
+    # Set SESSION_REFRESH_EACH_REQUEST=true to restore sliding expiry.
+    app.config['SESSION_REFRESH_EACH_REQUEST'] = _env_flag(
+        'SESSION_REFRESH_EACH_REQUEST', False)
+    # Explicit rather than inherited: this is the session record's TTL in
+    # Redis, and with the refresh off it is now load-bearing.
+    app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=int(
+        os.environ.get('SESSION_LIFETIME_DAYS',
+                       int(os.environ.get('REMEMBER_COOKIE_DAYS', 30)) + 1)))
     Session(app)
-    print("🟢 Redis Sessions Enabled")
+
+    # ------------------------------------------------------------------
+    # SURVIVING A REDIS OUTAGE
+    # ------------------------------------------------------------------
+    # Flask-Session reads the session inside `ctx.push()` — BEFORE the
+    # request context exists and therefore before any Flask error handler
+    # can run. So when Redis goes away, `open_session` raises out of the WSGI
+    # layer and EVERY request in the application returns a bare 500. Measured
+    # directly: with Redis stopped mid-lecture, 19 of 19 scans returned 500,
+    # and there is no error handler that could have caught them.
+    #
+    # That is the worst shape a dependency failure can take here. Attendance
+    # is the one thing that must keep working: a lecture happens once, and a
+    # cache being down is not a reason for a student to be marked absent.
+    #
+    # So Redis becomes the FAST path rather than the only path. If it cannot
+    # be reached, the session falls back to Flask's own signed cookie — the
+    # same mechanism this application uses when REDIS_URL is unset — for as
+    # long as the outage lasts. That keeps the three things a scan needs:
+    #
+    #   * the CSRF token (it lives in the session; an empty session on every
+    #     request would fail every POST, which is why "return a blank session"
+    #     is not a fallback)
+    #   * the signed-in user
+    #   * revocation, because the session carries the user's security stamp
+    #     and `load_user` still checks it against the database on every
+    #     request — a password reset still signs the other party out
+    #
+    # The cookie is signed, not encrypted, so what it exposes is a user their
+    # own id and stamp. That is the price, it is bounded, and it is paid only
+    # while Redis is down.
+    app.session_interface = ResilientSessionInterface(
+        app.session_interface, SecureCookieSessionInterface())
+
+    print("🟢 Redis Sessions Enabled "
+          f"(refresh_each_request="
+          f"{app.config['SESSION_REFRESH_EACH_REQUEST']}, "
+          f"lifetime={app.config['PERMANENT_SESSION_LIFETIME'].days}d, "
+          f"cookie fallback on Redis outage)")
 else:
     print("🟡 No usable REDIS_URL. Using default cookie sessions (local dev only).")
 
@@ -572,6 +971,14 @@ limiter = Limiter(
     key_func=user_based_rate_limit_key,
     storage_uri=limiter_storage,
     default_limits=[_default_rate_limits],
+    # Fail OPEN when the counter store is unreachable. Flask-Limiter's default
+    # is to raise, which turns a Redis outage into a 500 on every rate-limited
+    # route — including /mark_attendance. A rate limiter exists to shape load,
+    # not to be a second thing that can take attendance down; losing the
+    # counters costs enforcement for the duration of the outage, and that is
+    # strictly the lesser failure. It is the same choice `admit_scan` already
+    # makes explicitly, and for the same reason.
+    swallow_errors=True,
 )
 print(f"🛡️ Rate Limiter Active (Storage: {limiter_storage.split(':')[0]})")
 
@@ -1024,28 +1431,77 @@ if db_url and db_url.startswith("postgres://"):
 _db_uri = db_url or 'sqlite:///scanmark_v2.db'
 app.config['SQLALCHEMY_DATABASE_URI'] = _db_uri
 
+
+def _is_postgres_uri(uri):
+    """
+    True for every spelling of a PostgreSQL URL SQLAlchemy accepts.
+
+    A plain ``startswith('postgresql://')`` test was wrong twice over, and the
+    second way was silent. ``postgresql+psycopg2://`` and ``postgresql+psycopg://``
+    are ordinary, documented forms — psycopg 3 requires the explicit driver —
+    and under the old test a deployment using one was BOTH refused at boot
+    ("DATABASE_URL is not a PostgreSQL URL") and, if somebody then set
+    ALLOW_SQLITE_IN_PRODUCTION to get past that, dropped straight through the
+    engine-options block below. That is the dangerous half: the engine then
+    ran on SQLAlchemy's defaults with no InstrumentedQueuePool, no pool_size,
+    no pool_timeout and no pool_pre_ping, so the pool-wait metric that exists
+    to tell saturation from slowness reported nothing, and PoolTimeoutError —
+    which the scan path turns into a retryable 503 — could no longer be
+    reached at the configured boundary.
+    """
+    scheme = uri.split('://', 1)[0].lower()
+    return scheme == 'postgresql' or scheme.startswith('postgresql+')
+
+
 # SQLite is single-writer and, on most PaaS hosts, sits on a disk that is
 # wiped on every restart — so "it booted" and "attendance is being kept" are
 # different statements. The old warning printed only when FLASK_ENV was
 # literally 'production', so on Render it never printed at all.
 _require_in_production(
-    _db_uri.startswith('postgresql://'),
+    _is_postgres_uri(_db_uri),
     "DATABASE_URL is not a PostgreSQL URL. SQLite cannot handle concurrent "
     "scan load and its data is lost on restart.",
     override_env='ALLOW_SQLITE_IN_PRODUCTION',
 )
 
-if _db_uri.startswith("postgresql://"):
-    # Pool sizing is PER gunicorn worker: the server sees up to
-    # workers × (pool_size + max_overflow) connections. With the default
-    # 4 workers this is 4 × (5 + 5) = 40 — make sure the Postgres plan
-    # allows at least that many, or tune these env vars down.
+if _is_postgres_uri(_db_uri):
+    # ------------------------------------------------------------------
+    # THE CONNECTION BUDGET
+    # ------------------------------------------------------------------
+    # This pool is PER GUNICORN WORKER, so the number Postgres actually sees
+    # is
+    #
+    #     instances x workers x (pool_size + max_overflow)
+    #
+    # and it is the single easiest way to turn "scale out" into an outage:
+    # every new instance multiplies it, and when it crosses the plan's
+    # `max_connections` the database refuses EVERY client at once — including
+    # the instances that were already healthy.
+    #
+    # A worker cannot use more connections at a time than it has request
+    # slots, so the pool is derived from the thread count rather than fixed.
+    # A worker with 2 threads can hold at most 2 connections concurrently;
+    # one spare absorbs a checkout that overlaps a checkin, and the overflow
+    # is a small burst allowance that gets returned. Sizing above the thread
+    # count buys nothing — the connections simply sit idle, occupying a slot
+    # on the server that another instance needs.
+    #
+    # With the shipped gunicorn defaults on a 4-CPU instance (8 workers x 2
+    # threads) this is 8 x (3 + 2) = 40 connections per instance. Three
+    # instances is 120, which already exceeds several managed plans: that is
+    # the point at which PgBouncer in transaction mode stops being optional.
+    # DEPLOYMENT.md carries the arithmetic.
+    _threads_per_worker = max(1, int(os.environ.get('GUNICORN_THREADS', 2)))
     app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
         "poolclass": InstrumentedQueuePool,
-        "pool_size": int(os.environ.get('DB_POOL_SIZE', 5)),
-        "max_overflow": int(os.environ.get('DB_MAX_OVERFLOW', 5)),
+        "pool_size": int(os.environ.get('DB_POOL_SIZE', _threads_per_worker + 1)),
+        "max_overflow": int(os.environ.get('DB_MAX_OVERFLOW', _threads_per_worker)),
         "pool_recycle": 1800,
-        "pool_timeout": 30,
+        # A scan that has waited 30s for a connection is a scan whose QR token
+        # has already expired. Failing fast with a retryable 503 (which the
+        # scan path turns into Retry-After) is strictly better than holding a
+        # request slot for half a minute to eventually answer nobody.
+        "pool_timeout": float(os.environ.get('DB_POOL_TIMEOUT', 10)),
         "pool_pre_ping": True     # 🚨 THE FIX: Silently tests the connection before running a query
     }
 else:
@@ -1510,11 +1966,18 @@ CLASS_LOCATION_TTL = int(os.environ.get('CLASS_LOCATION_TTL', 14400))   # 4 hour
 def set_class_location(session_id, lat, lon):
     """Store the lecturer's pinned classroom for ONE class session."""
     if redis_client:
-        _redis_timed(
-            'setex', redis_client.setex,
-            f"class_location:session:{session_id}", CLASS_LOCATION_TTL,
-            f"{lat},{lon}"
-        )
+        try:
+            _redis_timed(
+                'setex', redis_client.setex,
+                f"class_location:session:{session_id}", CLASS_LOCATION_TTL,
+                f"{lat},{lon}"
+            )
+        except redis.RedisError as error:
+            # The pin's durable home is class_session.classroom_id; this is a
+            # cache write, and failing it must not fail the request that
+            # started the class.
+            runtime_metrics.increment('redis.location_errors')
+            app.logger.warning('Could not cache the classroom pin: %s', error)
     else:
         # Local-dev fallback: module-level dict (single process only)
         _local_locations[session_id] = {'lat': lat, 'lon': lon}
@@ -1545,15 +2008,24 @@ def get_class_location(session_id, course_id=None, saved_room=None):
     than as another query on the hot path.
     """
     if redis_client:
-        value = _redis_timed('get', redis_client.get,
-                             f"class_location:session:{session_id}")
-        if value:
-            return _parse_location(value)
-        if course_id is not None:
-            legacy = _redis_timed('get', redis_client.get,
-                                  f"class_location:{course_id}")
-            if legacy:
-                return _parse_location(legacy)
+        # Redis is the fast path for the pin, never the only one. When it is
+        # unreachable the saved classroom below still answers, so a cache
+        # outage costs a database read — not a refused scan for everybody in
+        # the room, which is what an uncaught RedisError here produced.
+        try:
+            value = _redis_timed('get', redis_client.get,
+                                 f"class_location:session:{session_id}")
+            if value:
+                return _parse_location(value)
+            if course_id is not None:
+                legacy = _redis_timed('get', redis_client.get,
+                                      f"class_location:{course_id}")
+                if legacy:
+                    return _parse_location(legacy)
+        except redis.RedisError as error:
+            runtime_metrics.increment('redis.location_errors')
+            app.logger.warning('Classroom pin lookup failed, using the saved '
+                               'room: %s', error)
     else:
         found = _local_locations.get(session_id)
         if found is None and course_id is not None:
@@ -1748,10 +2220,19 @@ def generate_signed_qr(session_id: int) -> str:
     """
     cache_key = f"qr_token:session:{session_id}"
 
+    # Redis shares ONE token between /api/qr_data and the PNG endpoint. When
+    # it is unreachable each call mints its own, which is a degradation, not
+    # a failure: both tokens are signed, both are inside QR_CODE_WINDOW, and
+    # a scan of either is accepted. Raising here instead would take down the
+    # lecturer's projector screen — and with it the whole room's ability to
+    # scan — because a cache was down.
     if redis_client:
-        cached = _redis_timed('get', redis_client.get, cache_key)
-        if cached:
-            return cached.decode()
+        try:
+            cached = _redis_timed('get', redis_client.get, cache_key)
+            if cached:
+                return cached.decode()
+        except redis.RedisError:
+            runtime_metrics.increment('redis.qr_cache_errors')
 
     # Create a new token
     timestamp = int(time.time())
@@ -1760,7 +2241,11 @@ def generate_signed_qr(session_id: int) -> str:
     token = f"{message}|{sig}"
 
     if redis_client:
-        _redis_timed('setex', redis_client.setex, cache_key, QR_TOKEN_TTL, token)
+        try:
+            _redis_timed('setex', redis_client.setex, cache_key, QR_TOKEN_TTL,
+                         token)
+        except redis.RedisError:
+            runtime_metrics.increment('redis.qr_cache_errors')
 
     return token
 
@@ -2123,8 +2608,13 @@ def record_audit(action, target_type=None, target_id=None, target_label=None,
             course_id=course_id,
             target_label=(str(target_label)[:200] if target_label else None),
             details=json.dumps(details, default=str) if details else None,
-            ip_address=(request.headers.get('X-Forwarded-For', '').split(',')[0].strip()
-                        or request.remote_addr or '')[:45] or None,
+            # ProxyFix has already resolved this to the client address,
+            # counting only the hops TRUSTED_PROXY_COUNT says are ours.
+            # Reading X-Forwarded-For by hand here took the LEFTMOST entry,
+            # which is the one part of that header a client writes itself —
+            # so anyone could stamp any address they liked into the audit
+            # trail of a course deletion.
+            ip_address=(request.remote_addr or '')[:45] or None,
             user_agent=(request.headers.get('User-Agent') or '')[:200] or None,
         )
         db.session.add(entry)
@@ -2350,7 +2840,7 @@ def reset_password(token):
             return render_template('reset_password.html')
 
         # FIX #1: Consistent hashing method (scrypt everywhere)
-        user.password = generate_password_hash(new_password, method='scrypt')
+        user.password = hash_password(new_password)
         # Reaching the inbox proves the address; an account stuck unverified
         # can legitimately recover this way.
         user.email_verified = True
@@ -2534,6 +3024,12 @@ def internal_metrics():
         except Exception:
             runtime_metrics.increment('redis.pool.stat_errors')
 
+    # Outbox depth, read at scrape time rather than only after a sweep — a
+    # backlog that is growing because the sweeper itself is wedged is exactly
+    # the case where waiting for the sweeper to publish it would hide it.
+    if campos_is_configured():
+        _publish_campos_backlog()
+
     return Response(runtime_metrics.prometheus(), mimetype='text/plain')
 
 
@@ -2585,7 +3081,7 @@ def authorize_google():
         user = User(
             full_name=full_name,
             email=email,
-            password=generate_password_hash(secrets.token_hex(32), method='scrypt'),
+            password=UNUSABLE_PASSWORD,
             # Google only hands us an address it has already verified, and a
             # Google sign-in never mints a staff role.
             role='student' if (auto_role or 'student') != 'lecturer' else auto_role,
@@ -2608,7 +3104,7 @@ def authorize_google():
         # takeover with extra steps: the squatter's chosen password keeps
         # working on an account that is now trusted. Retire that password and
         # revoke anything it already minted, exactly as the CampOS path does.
-        user.password = generate_password_hash(secrets.token_hex(32), method='scrypt')
+        user.password = UNUSABLE_PASSWORD
         rotate_security_stamp(user)
         user.email_verified = True
         db.session.commit()
@@ -2798,7 +3294,7 @@ def campos_sso_callback():
             campos_institution_id=campos_institution_id,
             full_name=full_name,
             email=email,
-            password=generate_password_hash(secrets.token_hex(32), method='scrypt'),
+            password=UNUSABLE_PASSWORD,
             role=role,
             # CampOS is the identity provider; the address arrives inside a
             # signed token, so there is nothing left for ScanMark to confirm.
@@ -2835,7 +3331,7 @@ def campos_sso_callback():
             # Adopting it as-is would leave the squatter's password working, so
             # retire that password; the owner can set a new one through
             # "forgot password" if they ever want to sign in without CampOS.
-            user.password = generate_password_hash(secrets.token_hex(32), method='scrypt')
+            user.password = UNUSABLE_PASSWORD
             # And anything that password already minted: a squatter's live
             # session outlives the password it was created with.
             rotate_security_stamp(user)
@@ -2986,7 +3482,8 @@ def login():
         password = request.form.get('password') or ''
         user = User.query.filter_by(email=email).first()
 
-        if user and check_password_hash(user.password, password):
+        if (user and is_password_usable(user.password)
+                and verify_password(user.password, password)):
             # An unconfirmed self-service STUDENT account is not yet proof
             # that the person typing owns the address they registered. Staff
             # accounts are not held here — see role_requires_email_verification.
@@ -3065,7 +3562,7 @@ def signup():
         new_user = User(
             full_name=name,
             email=email,
-            password=generate_password_hash(password, method='scrypt'),
+            password=hash_password(password),
             role=final_role,
             matric_no=matric_no,
             level=level or None,
@@ -4023,6 +4520,9 @@ def register_course():
 # QR CODE ROUTES  (FIX #3, #5, #6)
 # ============================================================
 
+#: This process, for leases and logs. Not persisted anywhere.
+_INSTANCE_ID = f"{os.environ.get('HOSTNAME', 'host')}:{os.getpid()}:{secrets.token_hex(4)}"
+
 _daily_session_locks = {}
 _daily_session_locks_guard = threading.Lock()
 
@@ -4321,9 +4821,14 @@ def get_qr_image(session_id):
     # instead of re-encoding on every poll.
     png_cache_key = f"qr_png:{qr_text}"
     if redis_client:
-        cached_png = _redis_timed('get', redis_client.get, png_cache_key)
-        if cached_png:
-            return send_file(io.BytesIO(cached_png), mimetype='image/png')
+        try:
+            cached_png = _redis_timed('get', redis_client.get, png_cache_key)
+            if cached_png:
+                return send_file(io.BytesIO(cached_png), mimetype='image/png')
+        except redis.RedisError:
+            # Re-encoding the PNG costs a few milliseconds on the ONE screen
+            # in the room. Refusing to draw it costs the whole class.
+            runtime_metrics.increment('redis.qr_cache_errors')
 
     try:
         import qrcode
@@ -4332,8 +4837,11 @@ def get_qr_image(session_id):
         img.save(buf, format="PNG")
         png_bytes = buf.getvalue()
         if redis_client:
-            _redis_timed('setex', redis_client.setex,
-                         png_cache_key, QR_TOKEN_TTL, png_bytes)
+            try:
+                _redis_timed('setex', redis_client.setex,
+                             png_cache_key, QR_TOKEN_TTL, png_bytes)
+            except redis.RedisError:
+                runtime_metrics.increment('redis.qr_cache_errors')
         return send_file(io.BytesIO(png_bytes), mimetype='image/png')
     except ImportError:
         return "QR code library not installed", 500
@@ -4897,32 +5405,399 @@ def set_session_classroom(session_id):
 # Delivery stays off the scan request path and retries bounded transient errors.
 # Configure CAMPOS_CORE_URL and CAMPOS_API_KEY to enable it.
 
-def report_attendance_to_campos(
-    matric_no,
-    email,
-    course_code,
-    course_title,
-    session_id,
-    session_title,
-    external_id,
-    scanned_at_iso,
-):
-    if not os.environ.get('CAMPOS_API_KEY'):
-        return
+# ------------------------------------------------------------------
+# CAMPOS DELIVERY — A TRANSACTIONAL OUTBOX
+# ------------------------------------------------------------------
+# Attendance commits on its own and CampOS delivery follows it. That ordering
+# is not negotiable: a CampOS outage must never be able to cost a student
+# their attendance, so the delivery is never in the scan's transaction and
+# never able to roll it back.
+#
+# What WAS negotiable, and wrong, is what happened when the delivery did not
+# succeed. It lived only in an in-process thread pool, so it was lost three
+# different ways — a full queue (logged, dropped), a raised error (logged,
+# dropped), or a deploy/crash while the work was queued (not even logged).
+# None of them left a trace that could be swept up later, which meant the
+# system could not answer "is every scan in CampOS?" and could not repair
+# itself if the answer was no.
+#
+# The fix is the row itself. `attendance.campos_state` is written by the same
+# INSERT that records the scan — no extra statement, nothing added to the
+# request — so the intent to deliver is as durable as the attendance, and any
+# instance can finish work any other instance started. The in-process pool
+# stays, but only as an OPTIMISATION: it makes the common case immediate. The
+# sweeper is what makes it correct.
+CAMPOS_MAX_ATTEMPTS = max(1, int(os.environ.get('CAMPOS_MAX_ATTEMPTS', 8)))
+CAMPOS_RETRY_BASE_SECONDS = float(os.environ.get('CAMPOS_RETRY_BASE_SECONDS', 30))
+CAMPOS_RETRY_CAP_SECONDS = float(os.environ.get('CAMPOS_RETRY_CAP_SECONDS', 3600))
+CAMPOS_SWEEP_INTERVAL_SECONDS = float(
+    os.environ.get('CAMPOS_SWEEP_INTERVAL_SECONDS', 30))
+CAMPOS_SWEEP_BATCH = max(1, int(os.environ.get('CAMPOS_SWEEP_BATCH', 100)))
+# How long the immediate in-process attempt is given before the sweeper is
+# allowed to consider the row abandoned. Long enough that the two never race
+# over a healthy delivery; short enough that a worker killed mid-flight is
+# picked up while the lecture is still on.
+CAMPOS_FIRST_SWEEP_DELAY_SECONDS = float(
+    os.environ.get('CAMPOS_FIRST_SWEEP_DELAY_SECONDS', 120))
+
+
+def campos_is_configured():
+    return bool((os.environ.get('CAMPOS_API_KEY') or '').strip())
+
+
+# ------------------------------------------------------------------
+# A BREAKER IN FRONT OF THE IMMEDIATE ATTEMPT
+# ------------------------------------------------------------------
+# The in-process attempt exists to make the common case immediate. When CampOS
+# is DOWN it does the opposite: every scan hands a thread a request that will
+# spend ~10 seconds failing (connect timeout x 3 bounded retries), and each
+# failure then writes the row's retry schedule back to Postgres. During a
+# 2,000-student burst that is 2,000 doomed HTTP attempts and 2,000 extra
+# UPDATEs competing with the 2,000 INSERTs that actually matter.
+#
+# Measured, 2,000 simultaneous scans with CampOS unreachable: throughput fell
+# from 257 to 178 scans/sec and server-side p50 rose from 16 ms to 28 ms.
+# Every scan still succeeded — attendance is never at CampOS's mercy — but a
+# third of the capacity went to work that was certain to fail.
+#
+# So after a few consecutive failures the immediate path stands down for a
+# cooldown and leaves delivery entirely to the sweeper, which runs on its own
+# schedule, off the burst, in bounded batches. Nothing is lost by this: the
+# row is already 'pending' in the database, which is the whole point of the
+# outbox. The sweeper is also the probe that closes the breaker again.
+CAMPOS_BREAKER_FAILURES = max(1, int(
+    os.environ.get('CAMPOS_BREAKER_FAILURES', 3)))
+CAMPOS_BREAKER_COOLDOWN_SECONDS = float(
+    os.environ.get('CAMPOS_BREAKER_COOLDOWN_SECONDS', 60))
+
+_campos_breaker_lock = threading.Lock()
+_campos_breaker = {'failures': 0, 'open_until': 0.0}
+
+
+def _campos_breaker_is_open():
+    with _campos_breaker_lock:
+        is_open = time.monotonic() < _campos_breaker['open_until']
+    runtime_metrics.gauge('campos.breaker_open', 1 if is_open else 0)
+    return is_open
+
+
+def _campos_record_failure():
+    with _campos_breaker_lock:
+        _campos_breaker['failures'] += 1
+        if _campos_breaker['failures'] >= CAMPOS_BREAKER_FAILURES:
+            opened = time.monotonic() >= _campos_breaker['open_until']
+            _campos_breaker['open_until'] = (
+                time.monotonic() + CAMPOS_BREAKER_COOLDOWN_SECONDS)
+            if opened:
+                app.logger.warning(
+                    'CampOS looks down after %s consecutive failures; immediate '
+                    'delivery stands down for %ss and the outbox sweeper takes '
+                    'over. No attendance is affected.',
+                    _campos_breaker['failures'], CAMPOS_BREAKER_COOLDOWN_SECONDS)
+                runtime_metrics.increment('campos.breaker_opened')
+
+
+def _campos_record_success():
+    with _campos_breaker_lock:
+        was_open = time.monotonic() < _campos_breaker['open_until']
+        _campos_breaker['failures'] = 0
+        _campos_breaker['open_until'] = 0.0
+    if was_open:
+        app.logger.info('CampOS is answering again; immediate delivery resumed')
+
+
+def _campos_backoff_seconds(attempts):
+    """Exponential backoff, capped, with full jitter."""
+    ceiling = min(CAMPOS_RETRY_CAP_SECONDS,
+                  CAMPOS_RETRY_BASE_SECONDS * (2 ** max(0, attempts - 1)))
+    # Full jitter, not a fixed delay: without it every row queued by the same
+    # class retries in the same instant, which is the burst again, aimed at a
+    # service that has just told us it is struggling.
+    return ceiling * (0.5 + secrets.randbelow(1000) / 2000.0)
+
+
+def _campos_payload(row):
+    return {
+        'matricNumber': row['matric_no'],
+        'email': row['email'],
+        'courseCode': row['course_code'],
+        'courseTitle': row['course_title'],
+        'sessionId': str(row['session_id']),
+        'sessionTitle': row['session_title'],
+        'status': 'present',
+        # Stable and derived from the attendance row's own primary key, so a
+        # redelivery after a timeout we never saw the answer to is a
+        # duplicate CampOS can recognise rather than a second record.
+        'externalId': f"scanmark-attendance:{row['attendance_id']}",
+        'scannedAt': row['scanned_at_iso'],
+    }
+
+
+def _campos_mark(attendance_id, state, attempts=None, next_attempt_at=None):
+    """Record the outcome of one delivery attempt. Never raises."""
+    values = {'campos_state': state}
+    if attempts is not None:
+        values['campos_attempts'] = attempts
+    values['campos_next_attempt_at'] = next_attempt_at
     try:
-        report_attendance_event({
-            'matricNumber': matric_no,
-            'email': email,
-            'courseCode': course_code,
-            'courseTitle': course_title,
-            'sessionId': str(session_id),
-            'sessionTitle': session_title,
-            'status': 'present',
-            'externalId': str(external_id),
-            'scannedAt': scanned_at_iso,
-        })
-    except CamposIntegrationError as e:
-        app.logger.warning('CampOS attendance report failed: %s', e)
+        db.session.execute(
+            Attendance.__table__.update()
+            .where(Attendance.id == attendance_id)
+            .values(**values))
+        db.session.commit()
+    except Exception:                                    # noqa: BLE001
+        db.session.rollback()
+        runtime_metrics.increment('campos.state_write_errors')
+        app.logger.exception('Could not record CampOS state for attendance %s',
+                             attendance_id)
+
+
+def _deliver_campos_row(row, inline_retries=3):
+    """
+    One delivery attempt for one attendance row.
+
+    Returns True when the row is finished with (delivered, or dead-lettered).
+    Must be called inside an application context.
+
+    `inline_retries` is 1 on the immediate path and 3 on the sweeper's. The
+    immediate attempt is an OPTIMISATION — the row is already 'pending' and
+    the sweeper owns delivery — so retrying inside it buys nothing and costs
+    a thread ~10 seconds of connect timeouts per scan while a class is still
+    arriving. Retries belong to the sweeper, which runs off the burst.
+    """
+    attempts = (row.get('campos_attempts') or 0) + 1
+    started = time.perf_counter()
+    try:
+        report_attendance_event(_campos_payload(row), attempts=inline_retries)
+    except CamposIntegrationError as error:
+        runtime_metrics.increment('campos.delivery_failures')
+        _campos_record_failure()
+        if attempts >= CAMPOS_MAX_ATTEMPTS:
+            # Dead letter. Deliberately NOT retried forever: a permanently
+            # rejected event retried on a schedule is a background job that
+            # never drains and a metric nobody can act on. Parked, counted,
+            # and visible in /internal/metrics so somebody is told.
+            runtime_metrics.increment('campos.dead_lettered')
+            app.logger.error(
+                'CampOS delivery dead-lettered after %s attempts '
+                '(attendance id %s): %s', attempts, row['attendance_id'], error)
+            _campos_mark(row['attendance_id'], 'failed', attempts, None)
+            return True
+        retry_at = _utcnow() + timedelta(
+            seconds=_campos_backoff_seconds(attempts))
+        app.logger.warning(
+            'CampOS delivery attempt %s failed for attendance %s, retrying '
+            'at %s: %s', attempts, row['attendance_id'], retry_at, error)
+        _campos_mark(row['attendance_id'], 'pending', attempts, retry_at)
+        return False
+    runtime_metrics.observe_ms('campos.delivery',
+                               (time.perf_counter() - started) * 1000)
+    runtime_metrics.increment('campos.delivered')
+    _campos_record_success()
+    _campos_mark(row['attendance_id'], 'sent', attempts, None)
+    return True
+
+
+def report_attendance_to_campos(row):
+    """
+    The immediate, best-effort attempt, run on the bounded pool.
+
+    Losing this one costs nothing but latency: the row is already marked
+    'pending' in the database, so the sweeper will deliver it. That is the
+    whole reason this can stay a fire-and-forget thread.
+    """
+    if not campos_is_configured():
+        return
+    if _campos_breaker_is_open():
+        # Stand down. The row is 'pending' in the database and the sweeper
+        # owns it; attempting here would only take CPU and a database
+        # connection away from the scans still arriving.
+        runtime_metrics.increment('campos.immediate_skipped')
+        return
+    with app.app_context():
+        try:
+            _deliver_campos_row(row, inline_retries=1)
+        except Exception:                                # noqa: BLE001
+            app.logger.exception('CampOS immediate delivery raised')
+        finally:
+            db.session.remove()
+
+
+def _claim_campos_batch(limit):
+    """
+    Take ownership of up to `limit` overdue rows.
+
+    FOR UPDATE SKIP LOCKED is what makes this safe with many instances: two
+    sweepers running at the same moment take disjoint sets instead of
+    fighting over the same rows or blocking each other. Without it, running
+    more than one instance would either double-deliver or serialise.
+    """
+    now = _utcnow()
+    claim = (
+        select(Attendance.id, Attendance.session_id, Attendance.campos_attempts,
+               Attendance.timestamp,
+               User.matric_no, User.email,
+               Course.code, Course.title,
+               ClassSession.title.label('session_title'))
+        .join(User, User.id == Attendance.student_id)
+        .join(Course, Course.id == Attendance.course_id)
+        .outerjoin(ClassSession, ClassSession.id == Attendance.session_id)
+        .where(Attendance.campos_state == 'pending',
+               Attendance.campos_next_attempt_at.is_not(None),
+               Attendance.campos_next_attempt_at <= now)
+        .order_by(Attendance.campos_next_attempt_at.asc())
+        .limit(limit)
+    )
+    if db.session.get_bind().dialect.name == 'postgresql':
+        claim = claim.with_for_update(skip_locked=True, of=Attendance)
+    rows = db.session.execute(claim).mappings().all()
+    return [{
+        'attendance_id': row['id'],
+        'session_id': row['session_id'],
+        'campos_attempts': row['campos_attempts'],
+        'matric_no': row['matric_no'],
+        'email': row['email'],
+        'course_code': row['code'],
+        'course_title': row['title'],
+        'session_title': row['session_title'],
+        'scanned_at_iso': (row['timestamp'] or now).isoformat() + 'Z',
+    } for row in rows]
+
+
+def _publish_campos_backlog():
+    """Queue depth and oldest-job age, straight from the outbox."""
+    try:
+        pending, oldest = db.session.execute(
+            select(func.count(Attendance.id),
+                   func.min(Attendance.campos_next_attempt_at))
+            .where(Attendance.campos_state == 'pending')
+        ).one()
+        failed = db.session.execute(
+            select(func.count(Attendance.id))
+            .where(Attendance.campos_state == 'failed')).scalar_one()
+    except Exception:                                    # noqa: BLE001
+        db.session.rollback()
+        return
+    runtime_metrics.gauge('campos.outbox_pending', pending or 0)
+    runtime_metrics.gauge('campos.outbox_failed', failed or 0)
+    runtime_metrics.gauge(
+        'campos.outbox_oldest_seconds',
+        max(0.0, (_utcnow() - oldest).total_seconds()) if oldest else 0.0)
+
+
+def _campos_sweeper_should_run():
+    """
+    One sweeper per DEPLOYMENT, not one per worker.
+
+    Every gunicorn worker in every instance runs this loop, so without a lease
+    a 3-instance x 8-worker deployment would run 24 sweepers. SKIP LOCKED
+    would keep that CORRECT, but it is 24 pointless queries every interval.
+    A short Redis lease makes exactly one of them do the work, and hands the
+    job to another automatically when that one dies.
+
+    With no Redis, every worker sweeps. That is the graceful degradation:
+    wasteful, still correct, and far better than attendance quietly not
+    reaching CampOS because the one machine that could sweep was the one that
+    lost its cache.
+    """
+    if redis_client is None:
+        return True
+    try:
+        return bool(redis_client.set(
+            'campos:sweeper:lease', _INSTANCE_ID, nx=True,
+            px=int(CAMPOS_SWEEP_INTERVAL_SECONDS * 1000 * 0.9)))
+    except redis.RedisError:
+        runtime_metrics.increment('campos.lease_errors')
+        return True
+
+
+def _campos_sweep_once():
+    with app.app_context():
+        try:
+            if not _campos_sweeper_should_run():
+                return 0
+            delivered = 0
+            rows = _claim_campos_batch(CAMPOS_SWEEP_BATCH)
+            for row in rows:
+                if _deliver_campos_row(row):
+                    delivered += 1
+            _publish_campos_backlog()
+            if rows:
+                app.logger.info('CampOS sweep handled %s row(s)', len(rows))
+            return delivered
+        except Exception:                                # noqa: BLE001
+            db.session.rollback()
+            runtime_metrics.increment('campos.sweep_errors')
+            app.logger.exception('CampOS sweep failed')
+            return 0
+        finally:
+            db.session.remove()
+
+
+def _prime_metrics():
+    """
+    Publish the counters and gauges an alert depends on, at zero, before
+    anything has gone wrong.
+
+    Prometheus cannot alert on a series that does not exist yet, and a metric
+    that only appears the first time the bad thing happens is exactly
+    backwards: "no dead letters" and "the exporter is not being scraped" look
+    identical, and the alert that was supposed to catch the first one silently
+    never fires. Naming them here makes absence mean absence.
+    """
+    for counter in (
+        'campos.delivered', 'campos.delivery_failures', 'campos.dead_lettered',
+        'campos.deferred_to_sweeper', 'campos.immediate_skipped',
+        'campos.breaker_opened', 'campos.sweep_errors',
+        'password.shed', 'password.shed_responses',
+        'db.pool.exhausted',
+        'session.redis_unavailable', 'session.redis_save_failed',
+        'redis.location_errors', 'redis.qr_cache_errors',
+        'redis.feed_cache_errors', 'redis.invalidation_errors',
+        'scan.admission.shed', 'scan.admission.errors',
+    ):
+        runtime_metrics.increment(counter, 0)
+    for gauge, value in (
+        ('campos.outbox_pending', 0),
+        ('campos.outbox_failed', 0),
+        ('campos.outbox_oldest_seconds', 0),
+        ('campos.breaker_open', 0),
+        # 1 until something says otherwise: the session store is up at boot,
+        # because production refuses to start without it.
+        ('session.store_up', 1),
+        ('password.slots', PASSWORD_HASH_SLOTS_PER_WORKER),
+    ):
+        runtime_metrics.gauge(gauge, value)
+
+
+_prime_metrics()
+
+
+_campos_sweeper_stop = threading.Event()
+
+
+def _campos_sweeper_loop():
+    # Jittered so eight workers booted in the same second do not all wake
+    # together for the rest of the process's life.
+    _campos_sweeper_stop.wait(secrets.randbelow(
+        max(1, int(CAMPOS_SWEEP_INTERVAL_SECONDS))))
+    while not _campos_sweeper_stop.is_set():
+        _campos_sweep_once()
+        _campos_sweeper_stop.wait(CAMPOS_SWEEP_INTERVAL_SECONDS)
+
+
+def start_campos_sweeper():
+    """Started per worker process; the Redis lease elects one of them."""
+    if not campos_is_configured():
+        return None
+    if _env_flag('CAMPOS_SWEEPER_DISABLED', False):
+        app.logger.warning('CampOS outbox sweeper is DISABLED; failed '
+                           'deliveries will not be retried')
+        return None
+    thread = threading.Thread(target=_campos_sweeper_loop,
+                              name='campos-sweeper', daemon=True)
+    thread.start()
+    return thread
 
 
 def _parse_client_timestamp(value):
@@ -4950,7 +5825,9 @@ def _parse_client_timestamp(value):
     return None
 
 
-def _insert_attendance_once(student_id, course_id, session_id, device_id, scanned_at):
+def _insert_attendance_once(student_id, course_id, session_id, device_id,
+                            scanned_at, campos_state='skipped',
+                            campos_next_attempt_at=None):
     """
     Insert exactly one attendance row and return its id, or None if this
     student already has a row for this class session.
@@ -4967,6 +5844,12 @@ def _insert_attendance_once(student_id, course_id, session_id, device_id, scanne
         'session_id': session_id,
         'device_id': device_id,
         'timestamp': scanned_at,
+        # The outbox intent rides along in the SAME statement. This is the
+        # whole reason durability here is free: no second write, no second
+        # round trip, nothing added to the request the student is waiting on.
+        'campos_state': campos_state,
+        'campos_attempts': 0,
+        'campos_next_attempt_at': campos_next_attempt_at,
     }
     dialect = db.session.get_bind().dialect.name
 
@@ -5220,7 +6103,18 @@ def mark_attendance():
             return respond('error', str(error), 400, 'invalid_qr')
         checkpoint('qr_verify')
 
-        # Session and course in one join instead of two point lookups.
+        # Session, course, room AND this student's enrolment in ONE round
+        # trip. The enrolment used to be a second statement, and on a hot path
+        # a statement is not free even when the row it wants is in shared
+        # buffers: it is a network round trip to Postgres, a parse/plan cache
+        # lookup, and a full pass through SQLAlchemy's execution machinery.
+        # Measured at 5 SQL statements per successful scan before this change.
+        #
+        # The outer join is what keeps the two answers distinguishable: no row
+        # at all means the SESSION does not exist (404), a row with a NULL
+        # `enrolled` means the session exists but this student is not on the
+        # course (403). Collapsing those two into one status would tell an
+        # attacker probing session ids which ones are real.
         target = db.session.execute(
             select(
                 ClassSession.id.label('session_id'),
@@ -5239,9 +6133,16 @@ def mark_attendance():
                 # join is already happening for room_lat/room_lon, so reading
                 # it costs nothing extra here.
                 Classroom.radius_m.label('room_radius_m'),
+                # NULL unless this student is enrolled on this course.
+                enrollments.c.user_id.label('enrolled'),
             )
             .join(Course, Course.id == ClassSession.course_id)
             .outerjoin(Classroom, Classroom.id == ClassSession.classroom_id)
+            .outerjoin(
+                enrollments,
+                (enrollments.c.course_id == ClassSession.course_id)
+                & (enrollments.c.user_id == current_user.id),
+            )
             .where(ClassSession.id == session_id)
         ).mappings().one_or_none()
         checkpoint('session_course')
@@ -5270,16 +6171,10 @@ def mark_attendance():
             return respond('error', 'That queued scan belongs to a different account.',
                            409, 'wrong_user_queue')
 
-        # Indexed existence check rather than materialising every course the
-        # student is enrolled on.
-        enrolled = db.session.execute(
-            select(enrollments.c.user_id)
-            .where(enrollments.c.user_id == current_user.id,
-                   enrollments.c.course_id == target['course_id'])
-            .limit(1)
-        ).scalar_one_or_none()
+        # Already answered by the join above; the composite primary key on
+        # `enrollments` (user_id, course_id) serves the join directly.
         checkpoint('enrollment')
-        if enrolled is None:
+        if target['enrolled'] is None:
             return respond(
                 'error',
                 f"Access denied: you are not registered for {target['course_code']}.",
@@ -5420,13 +6315,35 @@ def mark_attendance():
                 if isinstance(value, (int, float)) and 0 <= value <= 120000:
                     runtime_metrics.observe_ms(f'client.{metric_name}', value)
 
+        # Read the two User columns the CampOS hand-off needs BEFORE the
+        # insert commits. SQLAlchemy expires every instance in the session on
+        # commit (expire_on_commit defaults True), so touching
+        # `current_user.matric_no` afterwards silently issued a second full
+        # `SELECT "user".*` — a whole extra round trip and a whole extra ORM
+        # materialisation on every SUCCESSFUL scan, to re-read two strings
+        # that were already in memory a microsecond earlier. Measured: 5 SQL
+        # statements per scan, of which this was the fifth.
+        student_matric_no = current_user.matric_no
+        student_email = current_user.email
+
         scanned_at = _utcnow()
+        # 'pending' only when there is somewhere to deliver to. On a
+        # deployment with no CampOS this stays 'skipped', so the outbox does
+        # not accumulate a backlog of work that will never be owed to anyone.
+        deliver_to_campos = campos_is_configured()
         record_id = _insert_attendance_once(
             current_user.id,
             target['course_id'],
             target['session_id'],
             str(data.get('device_id') or 'browser')[:200],
             scanned_at,
+            campos_state='pending' if deliver_to_campos else 'skipped',
+            # The sweeper's earliest interest. The in-process attempt below
+            # gets this long to succeed before the row is treated as
+            # abandoned, so the two never race over a healthy delivery.
+            campos_next_attempt_at=(
+                scanned_at + timedelta(seconds=CAMPOS_FIRST_SWEEP_DELAY_SECONDS)
+                if deliver_to_campos else None),
         )
         checkpoint('db_insert')
         if record_id is None:
@@ -5444,20 +6361,26 @@ def mark_attendance():
         # back at most two seconds on a number that is already moving. Redis
         # accelerates the lecturer's reads; it is not on the write path.
 
-        scanned_iso = scanned_at.isoformat() + 'Z'
-        if campos_executor.submit(
+        if deliver_to_campos and campos_executor.submit(
             report_attendance_to_campos,
-            current_user.matric_no,
-            current_user.email,
-            target['course_code'],
-            target['course_title'],
-            target['session_id'],
-            target['session_title'],
-            f'scanmark-attendance:{record_id}',
-            scanned_iso,
+            {
+                'attendance_id': record_id,
+                'session_id': target['session_id'],
+                'campos_attempts': 0,
+                'matric_no': student_matric_no,
+                'email': student_email,
+                'course_code': target['course_code'],
+                'course_title': target['course_title'],
+                'session_title': target['session_title'],
+                'scanned_at_iso': scanned_at.isoformat() + 'Z',
+            },
         ) is None:
-            app.logger.warning(
-                'CampOS delivery queue full; attendance id %s not reported', record_id)
+            # No longer a lost record — just a slower one. The row is
+            # 'pending' in the database, so the sweeper will deliver it.
+            runtime_metrics.increment('campos.deferred_to_sweeper')
+            app.logger.info(
+                'CampOS delivery queue full; attendance id %s deferred to the '
+                'outbox sweeper', record_id)
 
         # Nothing else happens on a scan. A scan used to queue a confirmation
         # email, a WhatsApp, parent copies of both and an attendance-threshold
@@ -5967,11 +6890,30 @@ def course_audit(course_id):
 
 @app.errorhandler(429)
 def ratelimit_handler(e):
+    # How long until the bucket that refused this refills. Flask-Limiter knows
+    # it; without passing it on, every shed phone falls back to its own guess
+    # — and 2,000 phones guessing is the burst again, at a moment the server
+    # has just said it cannot take one. The scanner reads this header.
+    retry_after = 1
+    try:
+        reset = getattr(e, 'reset_at', None) or getattr(e, 'reset', None)
+        if reset:
+            retry_after = max(1, int(reset - time.time()))
+    except (TypeError, ValueError):
+        retry_after = 1
+    retry_after = min(60, retry_after)
+
     if request.is_json:
-        return jsonify({
+        response = jsonify({
             "status": "error",
+            # Same machine-readable contract every other rejection carries.
+            # Its absence here meant a rate-limited scan was the one response
+            # the client could not classify from `outcome` alone.
+            "outcome": "rate_limited",
             "message": f"Rate limit exceeded. Please slow down. ({e.description})"
-        }), 429
+        })
+        response.headers['Retry-After'] = str(retry_after)
+        return response, 429
 
     # 🚨 STOPS THE LOOP BY RENDERING HTML DIRECTLY.
     # e.description is set from each limit's error_message, which is ours — but
@@ -5980,7 +6922,8 @@ def ratelimit_handler(e):
         "<h2>Too Many Requests!</h2>"
         f"<p>{escape(str(e.description))}</p>"
         f"<p>Please wait a minute and <a href='{url_for('dashboard')}'>try again</a>.</p>",
-        status=429, mimetype='text/html'
+        status=429, mimetype='text/html',
+        headers={'Retry-After': str(retry_after)},
     )
 
 
@@ -6095,6 +7038,15 @@ with app.app_context():
         # is exactly right: they were sized against the server-wide default
         # and should keep being so until a lecturer opts a room out of it.
         ("classroom", "radius_m", "FLOAT"),
+        # --- The CampOS delivery outbox ---
+        # Existing rows default to 'skipped' deliberately. They were recorded
+        # before the outbox existed, and their delivery already happened (or
+        # already failed) months ago; adopting them as 'pending' would have
+        # the first sweep after an upgrade replay the entire history of the
+        # deployment at CampOS.
+        ("attendance", "campos_state", "VARCHAR(10) DEFAULT 'skipped'"),
+        ("attendance", "campos_attempts", "INTEGER DEFAULT 0"),
+        ("attendance", "campos_next_attempt_at", "TIMESTAMP"),
     ]
     database_inspector = inspect(db.engine)
     existing_columns = {
@@ -6244,6 +7196,12 @@ with app.app_context():
                 "UPDATE course SET institution = '' WHERE institution IS NULL"))
             conn.execute(db.text(
                 'UPDATE "user" SET institution = \'\' WHERE institution IS NULL'))
+            conn.execute(db.text(
+                "UPDATE attendance SET campos_state = 'skipped' "
+                "WHERE campos_state IS NULL"))
+            conn.execute(db.text(
+                "UPDATE attendance SET campos_attempts = 0 "
+                "WHERE campos_attempts IS NULL"))
             conn.commit()
         except Exception as _error:
             conn.rollback()
@@ -6557,6 +7515,12 @@ with app.app_context():
             " ON attendance (session_id, id)",
             "CREATE INDEX IF NOT EXISTS ix_attendance_course_student"
             " ON attendance (course_id, student_id)",
+            # Partial: only the rows CampOS is still owed. In a healthy
+            # deployment that set is empty, so this index costs nearly
+            # nothing to carry however large the attendance table gets.
+            "CREATE INDEX IF NOT EXISTS ix_attendance_campos_outbox"
+            " ON attendance (campos_next_attempt_at)"
+            " WHERE campos_state = 'pending'",
             "CREATE INDEX IF NOT EXISTS ix_enrollments_course_id"
             " ON enrollments (course_id)",
             "CREATE INDEX IF NOT EXISTS ix_course_instructors_course_id"
@@ -6633,6 +7597,21 @@ with app.app_context():
     db.session.remove()
     db.engine.dispose()  # Forces Gunicorn workers to create fresh connections
     print("[OK] Database initialized successfully!")
+
+
+# The outbox sweeper. Started per worker PROCESS, after the schema work above,
+# and elected down to one by a Redis lease — see _campos_sweeper_should_run.
+# Under `preload_app`, gunicorn forks after this module is imported and Python
+# threads do not survive fork, so the thread has to be (re)started in each
+# child. post_fork in gunicorn.conf.py calls this; the call here covers every
+# other way the module is run (the dev server, a management shell, a test).
+if campos_is_configured() and not _env_flag('CAMPOS_SWEEPER_DISABLED', False):
+    start_campos_sweeper()
+
+
+@atexit.register
+def _stop_campos_sweeper():
+    _campos_sweeper_stop.set()
 
 if __name__ == '__main__':
     # Local development entry point only — production runs the Procfile's

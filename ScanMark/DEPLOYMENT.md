@@ -190,10 +190,20 @@ quietly at every phone.
 | `SECRET_KEY` | — | Required; app refuses to boot in production without it. |
 | `DATABASE_URL` | SQLite (dev only) | Postgres URL in production. |
 | `REDIS_URL` | — (dev fallback) | Required in production. |
-| `WEB_CONCURRENCY` | 4 | Gunicorn workers. Sized for a 1 GB instance. |
-| `GUNICORN_THREADS` | 8 | Threads per worker. workers × threads = concurrent requests. |
+| `WEB_CONCURRENCY` | `2 × CPUs`, capped at 12 | Gunicorn workers. A scan is CPU-bound Python, so parallelism comes from processes. |
+| `GUNICORN_THREADS` | 2 | Threads per worker — to overlap the wait on Postgres, not to add request slots. Measured: raising this to 8 or 16 *lowers* throughput and roughly doubles p95. See `loadtest/gunicorn-matrix.md`. |
+| `GUNICORN_KEEPALIVE` | 75 | Seconds an idle connection is held. **Must exceed your router's idle timeout** (usually 60 s) or the router will reuse a socket the app has closed and hand clients 502s. Gunicorn's own default of 2 s also makes every scan pay a fresh TCP+TLS handshake, because the phone waits longer than that for the projector. |
 | `GUNICORN_TIMEOUT` | 60 | Above the 30s platform router timeout on purpose. |
-| `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` | 5 / 5 | **Per worker.** Postgres sees up to `workers × (pool + overflow)` connections — 40 with defaults. Keep below your plan's connection cap, or put PgBouncer in front when scaling out. |
+| `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` | `threads + 1` / `threads` | **Per worker.** Postgres sees up to `instances × workers × (pool + overflow)` — 40 per instance with the defaults. A worker cannot use more connections at once than it has threads, so sizing above that only occupies slots another instance needs. Keep below your plan's cap, or put PgBouncer in front when scaling out. |
+| `DB_POOL_TIMEOUT` | 10 | Seconds a request waits for a connection before returning a retryable 503. A scan that has waited 30 s has an expired QR token anyway; failing fast frees the request slot. |
+| `PASSWORD_HASH_CONCURRENCY` | `min(4, CPUs)`, ≥2 | **Instance-wide** cap on simultaneous password hashes, shared out across workers. Verifying a password costs ~100 ms of CPU and ~32 MB of RAM (scrypt is memory-hard), and throughput stops improving past a handful. Derive yours with `python benchmarks/benchmark_password_hash.py`. |
+| `PASSWORD_HASH_MAX_WAIT_SECONDS` | 2 | How long a login waits for a hashing slot before it is shed with 503 + `Retry-After`. |
+| `TRUSTED_PROXY_COUNT` | 1 in production, 0 elsewhere | Reverse-proxy hops that rewrite `X-Forwarded-For`/`-Proto`. **Without this every per-IP rate limit becomes one global bucket**, because every request appears to come from the load balancer. Cloudflare in front of Render is 2. Set 0 only when gunicorn is directly exposed. |
+| `SESSION_REFRESH_EACH_REQUEST` | false | Off, the session record is written to Redis only when it changes, instead of on every authenticated request. The window becomes fixed rather than sliding; the 30-day remember-me cookie re-establishes a user before the record can lapse. |
+| `SESSION_STORE_BREAKER_SECONDS` | 10 | After a Redis failure, how long sessions are served from signed cookies before probing Redis again. |
+| `CAMPOS_MAX_ATTEMPTS` | 8 | Delivery attempts before an attendance row is dead-lettered (`campos_state='failed'`). |
+| `CAMPOS_SWEEP_INTERVAL_SECONDS` | 30 | How often the outbox sweeper runs. One sweeper per deployment, elected by a Redis lease. |
+| `CAMPOS_BREAKER_FAILURES` / `CAMPOS_BREAKER_COOLDOWN_SECONDS` | 3 / 60 | After this many consecutive failures the immediate in-process delivery stands down and leaves everything to the sweeper, so a CampOS outage cannot take capacity from a live burst. |
 | `GEOFENCE_RADIUS_M` | 100 | Default max metres between the pinned class location and a scanning student. Phone GPS inside buildings is often 20–50m off — don't set this too tight. A saved classroom may override it per room (see below), so this is the fallback rather than a ceiling. |
 | `GEOFENCE_REQUIRED` | **true** | What happens when a lecturer never pins a classroom (they dismissed the browser's GPS prompt). Defaults **on**: with nothing to measure against, the scan is refused. Off, the failure is silent and total — a lecturer who dismissed one prompt records a whole term of attendance that anyone could have submitted from anywhere, with nothing on the register saying so. Refusing is loud and fixable in ten seconds by granting location on the QR screen, which tells the lecturer which of the two applies. |
 | `GEOFENCE_MAX_ACCURACY_M` | `GEOFENCE_RADIUS_M` | Reported GPS accuracy beyond which a fix proves nothing. The reading is refused rather than used to widen the fence — accuracy is self-reported, so treating it as an allowance would be a free pass for the asking. |
@@ -292,24 +302,42 @@ mark_attendance                <- cheap rejections first, then one INSERT
 PostgreSQL                     <- the source of truth
 ```
 
-Two rules hold the shape:
+Four rules hold the shape:
 
 **Nothing external happens before the attendance commit.** The scan path is
-authenticate -> verify the QR signature locally -> resolve the session ->
-verify enrolment -> admission control -> verify the geofence -> INSERT ->
-COMMIT -> respond. CampOS delivery is queued after the commit, on a bounded
-executor, and cannot delay or fail a scan.
+authenticate -> verify the QR signature locally -> resolve session, course,
+room and enrolment in ONE query -> admission control -> verify the geofence
+-> INSERT -> COMMIT -> respond. That is **three SQL statements and three
+Redis round trips** per successful scan; there is a regression test holding
+the SQL count at three. CampOS delivery is recorded in the same INSERT and
+carried out afterwards, and cannot delay or fail a scan.
 
-**Redis accelerates reads; it is not on the write path.** A successful scan
-performs no Redis write at all. The lecturer's headcount is cached for
-`ATTENDEE_SUMMARY_TTL` seconds, which bounds staleness without putting a
-round trip inside every one of 2,000 requests — and the feed falls back to
-PostgreSQL when Redis is unhealthy, because a cache failure must cost
-database load, not the ability to see who is in the room.
+**Redis accelerates; it is never the only path.** A successful scan performs
+no Redis write. Every Redis read has a fallback: the classroom pin falls back
+to the saved `Classroom` row, the headcount to a Postgres count, the QR token
+to minting a fresh one, admission control to admitting, rate limiting to
+allowing, and the session to a signed cookie. A total Redis outage costs one
+automatic page reload per phone — measured, 29 of 29 scans were still
+recorded — where it previously returned HTTP 500 to every request in the
+application, because Flask-Session reads the session inside `ctx.push()`,
+before any error handler exists.
 
-Admission control fails **open**. If Redis is unreachable the scan is
-admitted: without shaping the system behaves as it did before the bucket
-existed, whereas a limiter that refuses would cost a whole class its register.
+**Delivery to CampOS is durable, and never at the expense of a scan.** The
+attendance row carries its own outbox state (`campos_state`, `campos_attempts`,
+`campos_next_attempt_at`), written by the same INSERT. An in-process attempt
+makes the common case immediate; a sweeper — one per deployment, elected by a
+Redis lease, claiming with `FOR UPDATE SKIP LOCKED` so it is safe across
+instances — owns retries, exponential backoff with full jitter, and
+dead-lettering. Measured: with CampOS completely unreachable, 2,000
+simultaneous scans all succeeded at 304 scans/sec and all 2,000 were queued;
+when CampOS came back the sweeper delivered exactly 2,000 distinct
+`externalId`s in 30 seconds.
+
+**Everything that sheds says when to come back.** 429 (rate limit or
+admission control) and 503 (pool exhausted, or the password-hashing budget)
+all carry `Retry-After`, and the scanner honours it — jittered, bounded to
+three attempts — instead of inventing its own interval. That is what keeps
+2,000 shed phones from becoming the burst again.
 
 ### Scan response budget
 
@@ -320,9 +348,14 @@ existed, whereas a limiter that refuses would cost a whole class its register.
 | `enrollment` | 10 ms | one indexed existence check |
 | `admission` | 5 ms | one Redis round trip |
 | `geofence` | 5 ms | one Redis read plus a Haversine |
-| `db_insert` | 20 ms | `INSERT ... ON CONFLICT DO NOTHING ... RETURNING` |
+| `db_insert` | 20 ms | `INSERT ... ON CONFLICT DO NOTHING ... RETURNING`, outbox state included |
 | `enqueue` | 5 ms | hand-off to the bounded CampOS executor |
 | **total** | **100 ms** | an order of magnitude inside `QR_CODE_WINDOW` |
+
+`enrollment` is now answered by the `session_course` join rather than by its
+own statement, so its stage timing is ~0 and the budget is vestigial. It is
+kept so a regression that reintroduces a second query is visible rather than
+silently absorbed into the total.
 
 Calibrate these from your own staging run — `BUDGET_*_MS` override each.
 Breaches are counted per stage, so a rehearsal tells you *which* component is
@@ -389,12 +422,29 @@ placement has to be explicit.
 
 ## Scaling checklist
 
-1. **One instance** (defaults): 32 request slots and an application-side
-   Postgres ceiling of 40 connections. This is a staging candidate, not a
-   capacity guarantee; accept it only after the checked-in 600/2,000 scenarios.
+0. **Know your instance's two ceilings before you plan anything.** They are
+   different numbers and they fail differently:
+   * *Scan throughput.* One 4-CPU instance sustained **~330 scans/sec** with
+     everything on (CSRF, rate limiting, geofence, Redis, Postgres). A
+     2,000-student burst therefore drains in ~6 seconds — comfortably inside
+     `QR_CODE_WINDOW`, so nothing expires. Two instances halve that, three
+     take it to ~2 seconds.
+   * *Login throughput.* ~30 sign-ins/sec, and **no configuration changes
+     it** — it is memory-bandwidth-bound scrypt. 2,000 students signing in at
+     once is ~70 seconds of work. This is the number that surprises people,
+     so plan for it: the 30-day remember-me cookie means the real pre-lecture
+     rush is a fraction of the roster, and `PASSWORD_HASH_CONCURRENCY` keeps
+     the rush from taking capacity away from scans (measured: with the bound
+     on, scans under a login stampede ran 18% faster with 26% lower p95).
+1. **One instance** (defaults on 4 CPUs): 8 workers × 2 threads = 16 request
+   slots, and an application-side Postgres ceiling of 40 connections. Accept
+   it only after the checked-in 600/2,000 scenarios pass on your own hardware.
 2. **Scaling out** (2+ instances): connection math multiplies per instance —
    add **PgBouncer** (transaction pooling) in front of Postgres, keep
-   `DB_POOL_SIZE`/`DB_MAX_OVERFLOW` modest.
+   `DB_POOL_SIZE`/`DB_MAX_OVERFLOW` modest. Nothing in the application holds
+   cross-request state in process memory, so instances are interchangeable:
+   sessions, rate limits, admission buckets and classroom pins are in Redis,
+   and the CampOS outbox is in Postgres with `SKIP LOCKED` claiming.
 3. **Static/bandwidth**: WhiteNoise already serves /static compressed with
    cache headers. A CDN (e.g. Cloudflare free tier) in front additionally
    absorbs static traffic and TLS handshakes close to campus.
