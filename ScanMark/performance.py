@@ -9,8 +9,10 @@ turning notification work into an unbounded in-process queue.
 from __future__ import annotations
 
 import math
+import os
 import threading
 import time
+import weakref
 from bisect import bisect_right
 from collections import Counter, defaultdict, deque
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -164,8 +166,31 @@ class BoundedExecutor:
         self.max_workers = max_workers
         self.max_queue = max_queue
         self._metrics = metrics
-        self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=name)
-        self._capacity = threading.BoundedSemaphore(max_workers + max_queue)
+        self._start()
+
+        # Threads do not survive fork, and under gunicorn's `preload_app` the
+        # master imports the app — which already runs a job on the email pool
+        # (the Brevo sender check) — and then forks the workers. Each worker
+        # inherited a pool that believed an idle thread was waiting, so its
+        # first job sat in the queue until a second one arrived and started a
+        # thread. Signup sends two emails, which hid it; a password reset sends
+        # one, so the first reset after every boot silently went nowhere. A
+        # forked child gets a pool of its own instead.
+        if hasattr(os, 'register_at_fork'):
+            reference = weakref.ref(self)
+
+            def _restart_in_child():
+                executor = reference()
+                if executor is not None:
+                    executor._start()
+
+            os.register_at_fork(after_in_child=_restart_in_child)
+
+    def _start(self) -> None:
+        """Fresh threads, locks and accounting. Nothing queued carries over."""
+        self._executor = ThreadPoolExecutor(max_workers=self.max_workers,
+                                            thread_name_prefix=self.name)
+        self._capacity = threading.BoundedSemaphore(self.max_workers + self.max_queue)
         self._lock = threading.Lock()
         self._queued_at: deque[float] = deque()
         self._active = 0
