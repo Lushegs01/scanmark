@@ -1,3 +1,4 @@
+import os
 import threading
 import time
 
@@ -432,6 +433,42 @@ def test_bounded_executor_rejects_excess_work():
         assert metrics.snapshot()['counters']['test_queue.rejected'] == 1
     finally:
         release.set()
+        executor.shutdown()
+
+
+@pytest.mark.skipif(not hasattr(os, 'fork'), reason='needs os.fork')
+def test_bounded_executor_still_runs_work_in_a_forked_worker():
+    """
+    gunicorn's preload_app imports the app in the master and then forks the
+    workers, and that import already runs a job on the account-email pool (the
+    Brevo sender check). Threads do not survive fork, but the pool's note that
+    one was idle did, so in every worker the first password-reset or signup
+    email waited in the queue for a thread that did not exist — until a second
+    email came along and started one.
+    """
+    executor = BoundedExecutor(name='test_fork', max_workers=2, max_queue=4,
+                               metrics=RuntimeMetrics())
+    executor.submit(lambda: None).result(timeout=5)   # the boot-time job
+
+    pid = os.fork()
+    if pid == 0:   # the worker: must leave via os._exit, never back into pytest
+        try:
+            executor.submit(lambda: None).result(timeout=3)
+            os._exit(0)
+        except BaseException:
+            os._exit(1)
+
+    try:
+        deadline = time.monotonic() + 15
+        while (finished := os.waitpid(pid, os.WNOHANG))[0] == 0:
+            assert time.monotonic() < deadline, 'forked worker hung'
+            time.sleep(0.05)
+        assert os.waitstatus_to_exitcode(finished[1]) == 0, \
+            'the first job submitted after fork never ran'
+    finally:
+        if not finished[0]:
+            os.kill(pid, 9)
+            os.waitpid(pid, 0)
         executor.shutdown()
 
 
