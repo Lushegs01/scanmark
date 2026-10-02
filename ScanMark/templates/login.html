@@ -57,6 +57,8 @@
                         <p class="page-subtitle">Login to access your dashboard</p>
                     </div>
 
+                    {# Google sign-in is hidden for now. The /login/google route still
+                       exists; remove this comment wrapper to bring the button back.
                     <!-- Google Sign-In -->
                     <a href="{{ url_for('login_google') }}" class="btn btn-glass btn-auth">
                         <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 48 48">
@@ -69,6 +71,7 @@
                     </a>
 
                     <div class="auth-divider"><span>or</span></div>
+                    #}
 
                     <form method="POST" action="/login">
                         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
