@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+{# The host screen. Built for a projector seen from the back of a hall: the QR
+   dominates, the count is the second thing anyone reads, and nothing else
+   competes with either. Host controls stay hidden until the mouse moves. #}
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="robots" content="noindex, nofollow">
+    <title>{{ event.title }} · Projector</title>
+    <link rel="icon" type="image/png" href="{{ static_url('logo-192.png') }}">
+    <style>
+        :root {
+            --green-deep: #00210f;
+            --green: #005A2B;
+            --green-mid: #00a854;
+            --gold: #FFD700;
+            --white: #ffffff;
+            --muted: rgba(255,255,255,.66);
+            --faint: rgba(255,255,255,.14);
+        }
+        * { box-sizing: border-box; }
+        html, body { margin: 0; height: 100%; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            color: var(--white);
+            background: radial-gradient(ellipse at 20% 0%, #00592b 0%, var(--green-deep) 60%) fixed;
+            display: flex; flex-direction: column; min-height: 100vh; overflow-x: hidden;
+            -webkit-font-smoothing: antialiased;
+        }
+        header {
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 2.2vh 3vw 0;
+        }
+        .brand { font-weight: 800; letter-spacing: .16em; text-transform: uppercase; font-size: clamp(14px, 1.5vw, 22px); }
+        .brand .gold { color: var(--gold); }
+        .live {
+            display: inline-flex; align-items: center; gap: .6em;
+            font-weight: 800; letter-spacing: .12em; text-transform: uppercase;
+            font-size: clamp(12px, 1.2vw, 18px); padding: .5em 1em; border-radius: 999px;
+            background: var(--faint);
+        }
+        .live .dot { width: .7em; height: .7em; border-radius: 50%; background: var(--green-mid); box-shadow: 0 0 0 0 rgba(0,168,84,.7); animation: beat 2s infinite; }
+        .live.closed .dot { background: #ff6b5b; animation: none; }
+        .live.stale .dot { background: var(--gold); animation: none; }
+        @keyframes beat { 0% { box-shadow: 0 0 0 0 rgba(0,168,84,.7); } 70% { box-shadow: 0 0 0 .8em rgba(0,168,84,0); } 100% { box-shadow: 0 0 0 0 rgba(0,168,84,0); } }
+        .titles { text-align: center; padding: 1.6vh 3vw 0; }
+        .titles h1 { margin: 0; font-size: clamp(26px, 3.6vw, 64px); font-weight: 900; letter-spacing: -.01em; line-height: 1.05; text-transform: uppercase; }
+        .titles p { margin: .5vh 0 0; font-size: clamp(16px, 1.8vw, 30px); color: var(--muted); font-weight: 600; }
+        main {
+            flex: 1; display: grid; grid-template-columns: auto minmax(0, 1fr);
+            align-items: center; gap: 4vw; padding: 3vh 5vw 4vh;
+        }
+        .qr-wrap { display: flex; flex-direction: column; align-items: center; }
+        .qr {
+            position: relative; background: #fff; border-radius: 2.2vh; padding: 1.4vh;
+            box-shadow: 0 2vh 6vh rgba(0,0,0,.45);
+        }
+        .qr img {
+            display: block; width: min(64vh, 46vw); height: min(64vh, 46vw);
+            image-rendering: pixelated; image-rendering: crisp-edges;
+        }
+        .qr .closed-veil {
+            position: absolute; inset: 0; border-radius: 2.2vh; display: none;
+            align-items: center; justify-content: center; text-align: center;
+            background: rgba(0, 20, 10, .88); color: #fff; font-weight: 900;
+            font-size: clamp(22px, 3vw, 52px); padding: 2vh;
+        }
+        body.is-closed .qr .closed-veil { display: flex; }
+        body.is-closed .scan-cta { visibility: hidden; }
+        .scan-cta { margin-top: 2.4vh; font-size: clamp(20px, 2.6vw, 46px); font-weight: 800; letter-spacing: .02em; }
+        .scan-cta .gold { color: var(--gold); }
+        .side { display: flex; flex-direction: column; justify-content: center; min-width: 0; }
+        .count {
+            font-size: clamp(90px, 15vw, 280px); font-weight: 900; line-height: .9;
+            letter-spacing: -.04em; font-variant-numeric: tabular-nums;
+            transition: transform .25s cubic-bezier(.2,1.6,.4,1), color .4s;
+        }
+        .count.bump { transform: scale(1.08); color: var(--gold); }
+        .count-label { font-size: clamp(18px, 2.2vw, 40px); font-weight: 800; letter-spacing: .3em; color: var(--muted); margin-top: 1.2vh; }
+        .recent { margin-top: 4.5vh; border-top: 2px solid var(--faint); padding-top: 2.4vh; }
+        .recent h2 { margin: 0 0 1.4vh; font-size: clamp(12px, 1.2vw, 20px); letter-spacing: .22em; font-weight: 800; color: var(--muted); }
+        .recent ol { list-style: none; margin: 0; padding: 0; }
+        .recent li {
+            display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 1.2vw; align-items: baseline;
+            padding: .7vh 0; font-size: clamp(16px, 1.7vw, 30px);
+        }
+        .recent li.fresh { animation: slide .5s ease-out both; }
+        @keyframes slide { from { opacity: 0; transform: translateY(-.6em); } to { opacity: 1; transform: none; } }
+        .recent .t { color: var(--muted); font-variant-numeric: tabular-nums; font-size: .8em; }
+        .recent .n { font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .recent .d { color: var(--muted); font-weight: 500; }
+        .recent .empty { color: var(--muted); font-size: clamp(16px, 1.6vw, 28px); }
+        .toolbar {
+            position: fixed; right: 1.6vw; bottom: 1.6vh; display: flex; gap: 8px; flex-wrap: wrap;
+            opacity: 0; transition: opacity .3s; pointer-events: none;
+        }
+        body.show-tools .toolbar, .toolbar:focus-within { opacity: 1; pointer-events: auto; }
+        .toolbar a, .toolbar button {
+            font: inherit; font-size: 14px; font-weight: 700; color: #fff; text-decoration: none;
+            background: rgba(255,255,255,.12); border: 1px solid rgba(255,255,255,.22);
+            padding: 9px 14px; border-radius: 10px; cursor: pointer;
+        }
+        .toolbar form { margin: 0; }
+        .toolbar .danger { background: rgba(255,107,91,.2); border-color: rgba(255,107,91,.5); }
+        .flash { position: fixed; left: 50%; top: 2vh; transform: translateX(-50%); background: #fff; color: #00210f; padding: 10px 18px; border-radius: 10px; font-weight: 700; box-shadow: 0 8px 30px rgba(0,0,0,.3); }
+        @media (max-aspect-ratio: 1/1) {
+            main { grid-template-columns: 1fr; text-align: center; }
+            .qr img { width: min(80vw, 52vh); height: min(80vw, 52vh); }
+            .recent li { text-align: left; }
+        }
+    </style>
+</head>
+<body class="{{ '' if event.accepting_checkins() else 'is-closed' }}">
+    {% with messages = get_flashed_messages() %}
+    {% if messages %}<div class="flash" id="flash">{{ messages[-1] }}</div>{% endif %}
+    {% endwith %}
+
+    <header>
+        <div class="brand">Scan<span class="gold">Mark</span></div>
+        <div class="live {{ '' if event.accepting_checkins() else 'closed' }}" id="liveChip">
+            <span class="dot"></span><span id="liveText">{{ 'Live' if event.accepting_checkins() else 'Check-in closed' }}</span>
+        </div>
+    </header>
+
+    <div class="titles">
+        <h1>{{ event.title }}</h1>
+        {% if event.subtitle or event.venue %}
+        <p>{{ event.subtitle }}{% if event.subtitle and event.venue %} · {% endif %}{{ event.venue }}</p>
+        {% endif %}
+    </div>
+
+    <main>
+        <div class="qr-wrap">
+            <div class="qr">
+                <img src="{{ url_for('event_qr', token=event.public_token) }}" alt="QR code linking to {{ public_url }}">
+                <div class="closed-veil">Check-in<br>closed</div>
+            </div>
+            <div class="scan-cta">Scan to <span class="gold">check in</span></div>
+        </div>
+
+        <section class="side">
+            <div class="count" id="count" aria-live="polite">{{ count }}</div>
+            <div class="count-label">CHECKED IN</div>
+            <div class="recent">
+                <h2>RECENT CHECK-INS</h2>
+                <ol id="recent"><li class="empty">Waiting for the first scan…</li></ol>
+            </div>
+        </section>
+    </main>
+
+    <div class="toolbar" aria-label="Host controls">
+        <button type="button" id="fullscreenBtn">Full screen</button>
+        <a href="{{ url_for('event_attendees', token=event.public_token) }}">Attendees</a>
+        <a href="{{ url_for('event_manage', token=event.public_token) }}">Manage</a>
+        {% if event.accepting_checkins() %}
+        <form method="POST" action="{{ url_for('event_close', token=event.public_token) }}"
+              onsubmit="return confirm('Close check-in? The QR code will stop accepting check-ins.');">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="hidden" name="next" value="projector">
+            <button type="submit" class="danger">Close check-in</button>
+        </form>
+        {% else %}
+        <form method="POST" action="{{ url_for('event_open', token=event.public_token) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="hidden" name="next" value="projector">
+            <button type="submit">Reopen check-in</button>
+        </form>
+        {% endif %}
+    </div>
+
+    <script>
+        (function () {
+            var feedUrl = {{ url_for('event_live', token=event.public_token)|tojson }};
+            var countEl = document.getElementById('count');
+            var recentEl = document.getElementById('recent');
+            var chip = document.getElementById('liveChip');
+            var chipText = document.getElementById('liveText');
+            var shown = parseInt(countEl.textContent, 10) || 0;
+            var lastKey = '';
+            var failures = 0;
+            var POLL_MS = 2000;
+
+            function setChip(state) {
+                chip.classList.toggle('closed', state === 'closed');
+                chip.classList.toggle('stale', state === 'stale');
+                chipText.textContent = state === 'closed' ? 'Check-in closed'
+                    : state === 'stale' ? 'Reconnecting…'
+                    : state === 'signed-out' ? 'Signed out · reload' : 'Live';
+                document.body.classList.toggle('is-closed', state === 'closed');
+            }
+
+            function renderRecent(rows, grew) {
+                var key = rows.map(function (r) { return r.time + r.name + r.department; }).join('|');
+                if (key === lastKey) return;
+                var previousFirst = lastKey.split('|')[0];
+                lastKey = key;
+                recentEl.innerHTML = '';
+                if (!rows.length) {
+                    var empty = document.createElement('li');
+                    empty.className = 'empty';
+                    empty.textContent = 'Waiting for the first scan…';
+                    recentEl.appendChild(empty);
+                    return;
+                }
+                rows.slice(0, 6).forEach(function (row, index) {
+                    var li = document.createElement('li');
+                    if (grew && index === 0 && previousFirst !== row.time + row.name + row.department) li.className = 'fresh';
+                    var t = document.createElement('span'); t.className = 't'; t.textContent = row.time;
+                    var n = document.createElement('span'); n.className = 'n'; n.textContent = row.name;
+                    var d = document.createElement('span'); d.className = 'd'; d.textContent = '  ·  ' + row.department;
+                    n.appendChild(d);
+                    li.appendChild(t); li.appendChild(n);
+                    recentEl.appendChild(li);
+                });
+            }
+
+            function poll() {
+                fetch(feedUrl, { credentials: 'same-origin', headers: { 'Accept': 'application/json' }, cache: 'no-store' })
+                    .then(function (response) {
+                        var type = response.headers.get('content-type') || '';
+                        if (response.redirected || type.indexOf('application/json') === -1) {
+                            throw new Error('signed-out');
+                        }
+                        return response.json();
+                    })
+                    .then(function (data) {
+                        failures = 0;
+                        if (data.status !== 'success') throw new Error('bad');
+                        var grew = data.count > shown;
+                        if (data.count !== shown) {
+                            shown = data.count;
+                            countEl.textContent = shown;
+                            if (grew) {
+                                countEl.classList.add('bump');
+                                setTimeout(function () { countEl.classList.remove('bump'); }, 280);
+                            }
+                        }
+                        renderRecent(data.recent || [], grew);
+                        setChip(data.open ? 'live' : 'closed');
+                    })
+                    .catch(function (error) {
+                        failures += 1;
+                        if (error && error.message === 'signed-out') { setChip('signed-out'); return; }
+                        if (failures >= 2) setChip('stale');
+                    })
+                    .then(function () { setTimeout(poll, POLL_MS); });
+            }
+            poll();
+
+            var hideTimer;
+            document.addEventListener('mousemove', function () {
+                document.body.classList.add('show-tools');
+                clearTimeout(hideTimer);
+                hideTimer = setTimeout(function () { document.body.classList.remove('show-tools'); }, 2500);
+            });
+            document.getElementById('fullscreenBtn').addEventListener('click', function () {
+                if (document.fullscreenElement) { document.exitFullscreen(); }
+                else if (document.documentElement.requestFullscreen) { document.documentElement.requestFullscreen(); }
+            });
+            var flash = document.getElementById('flash');
+            if (flash) setTimeout(function () { flash.remove(); }, 3500);
+        })();
+    </script>
+</body>
+</html>

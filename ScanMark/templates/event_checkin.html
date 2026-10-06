@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en">
+{# The public page behind the projector QR. Standalone on purpose: no navbar,
+   no sign-in links, no service worker, no framework CSS — it has to load fast
+   on a phone on a crowded venue network, and say one thing. #}
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="theme-color" content="#005A2B">
+    <meta name="robots" content="noindex, nofollow">
+    <title>{% if event %}{{ event.title }} · Check in{% else %}ScanMark{% endif %}</title>
+    <link rel="icon" type="image/png" href="{{ static_url('logo-192.png') }}">
+    <style>
+        :root {
+            --green: #005A2B;
+            --green-mid: #007a3d;
+            --green-soft: #e6f4ec;
+            --gold: #FFD700;
+            --ink: #0f1a14;
+            --ink-2: #44524a;
+            --ink-3: #6b7a71;
+            --line: #dfe7e2;
+            --bg: #f4f8f5;
+            --card: #ffffff;
+            --danger: #b42318;
+            --danger-soft: #fdecea;
+            --radius: 18px;
+        }
+        * { box-sizing: border-box; }
+        html, body { margin: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background: var(--bg);
+            color: var(--ink);
+            -webkit-font-smoothing: antialiased;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        .hero {
+            background: linear-gradient(160deg, #003d1d 0%, var(--green) 55%, var(--green-mid) 100%);
+            color: #fff;
+            padding: calc(20px + env(safe-area-inset-top)) 22px 64px;
+        }
+        .brand {
+            display: flex; align-items: center; gap: 8px;
+            font-weight: 800; letter-spacing: .14em; font-size: 13px; text-transform: uppercase;
+            opacity: .95;
+        }
+        .brand svg { width: 20px; height: 20px; }
+        .brand .gold { color: var(--gold); }
+        .hero h1 {
+            margin: 26px 0 6px; font-size: clamp(26px, 7.4vw, 36px); line-height: 1.12;
+            font-weight: 800; letter-spacing: -.01em;
+        }
+        .hero .subtitle { margin: 0; font-size: 16px; opacity: .88; }
+        .chip {
+            display: inline-flex; align-items: center; gap: 6px; margin-top: 14px;
+            padding: 6px 12px; border-radius: 999px; background: rgba(255,255,255,.14);
+            font-size: 13px; font-weight: 600;
+        }
+        main { flex: 1; padding: 0 16px 32px; margin-top: -44px; }
+        .card {
+            background: var(--card); border-radius: var(--radius);
+            box-shadow: 0 12px 40px rgba(0, 61, 29, .14), 0 1px 3px rgba(0,0,0,.06);
+            padding: 26px 22px; max-width: 480px; margin: 0 auto;
+        }
+        .card + .card { margin-top: 16px; }
+        .card h2 { margin: 0 0 4px; font-size: 22px; font-weight: 800; }
+        .lead { margin: 0 0 22px; color: var(--ink-2); font-size: 15px; line-height: 1.45; }
+        label { display: block; font-weight: 700; font-size: 15px; margin: 0 0 8px; }
+        .field { margin-bottom: 18px; }
+        input[type=text], select {
+            width: 100%; font: inherit; font-size: 18px; color: var(--ink);
+            padding: 15px 16px; border-radius: 14px; border: 2px solid var(--line);
+            background: #fbfdfc; outline: none; appearance: none; -webkit-appearance: none;
+            transition: border-color .15s, box-shadow .15s;
+        }
+        select {
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='9' viewBox='0 0 14 9'%3E%3Cpath d='M1 1l6 6 6-6' stroke='%2344524a' stroke-width='2' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+            background-repeat: no-repeat; background-position: right 16px center; padding-right: 44px;
+        }
+        input[type=text]:focus, select:focus { border-color: var(--green-mid); box-shadow: 0 0 0 4px rgba(0,122,61,.15); }
+        .invalid input, .invalid select { border-color: var(--danger); }
+        .error { color: var(--danger); font-size: 14px; font-weight: 600; margin-top: 6px; }
+        .btn {
+            display: flex; align-items: center; justify-content: center; gap: 10px;
+            width: 100%; border: 0; border-radius: 14px; cursor: pointer;
+            font: inherit; font-size: 19px; font-weight: 800; letter-spacing: .01em;
+            padding: 18px; color: #fff; background: var(--green);
+            box-shadow: 0 8px 20px rgba(0, 90, 43, .28);
+            text-decoration: none; transition: transform .08s, background .15s;
+        }
+        .btn:active { transform: scale(.985); }
+        .btn[disabled] { opacity: .75; cursor: progress; }
+        .btn-secondary { background: #fff; color: var(--green); border: 2px solid var(--green); box-shadow: none; }
+        .spinner {
+            width: 20px; height: 20px; border-radius: 50%;
+            border: 3px solid rgba(255,255,255,.35); border-top-color: #fff;
+            animation: spin .7s linear infinite; display: none;
+        }
+        .btn.loading .spinner { display: inline-block; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .status { text-align: center; }
+        .badge-icon {
+            width: 84px; height: 84px; border-radius: 50%; margin: 4px auto 18px;
+            display: grid; place-items: center; background: var(--green-soft); color: var(--green);
+        }
+        .badge-icon svg { width: 44px; height: 44px; }
+        .badge-icon.ok { background: var(--green); color: #fff; animation: pop .45s cubic-bezier(.2,1.4,.4,1) both; }
+        .badge-icon.warn { background: #fff4d6; color: #8a5a00; }
+        .badge-icon.bad { background: var(--danger-soft); color: var(--danger); }
+        .badge-icon.ok path { stroke-dasharray: 30; stroke-dashoffset: 30; animation: draw .4s .25s ease-out forwards; }
+        @keyframes pop { from { transform: scale(.4); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+        @keyframes draw { to { stroke-dashoffset: 0; } }
+        .status h2 { font-size: 26px; }
+        .who {
+            margin: 20px 0 4px; padding: 16px; border-radius: 14px; background: var(--bg);
+            border: 1px solid var(--line);
+        }
+        .who .name { font-size: 20px; font-weight: 800; word-break: break-word; }
+        .who .dept { color: var(--ink-2); margin-top: 2px; word-break: break-word; }
+        .who .time { color: var(--ink-3); font-size: 13px; margin-top: 8px; }
+        .hub-title { font-size: 12px; font-weight: 800; letter-spacing: .14em; text-transform: uppercase; color: var(--ink-3); margin: 0 0 12px; }
+        .hub-welcome { font-size: 20px; font-weight: 800; margin: 0 0 4px; }
+        .hub-links { display: grid; gap: 10px; margin-top: 16px; }
+        .hub-link {
+            display: flex; align-items: center; justify-content: space-between; gap: 12px;
+            padding: 16px 18px; border-radius: 14px; border: 2px solid var(--line);
+            color: var(--ink); text-decoration: none; font-weight: 700; font-size: 16px;
+            background: #fff; transition: border-color .15s, background .15s;
+        }
+        .hub-link:active, .hub-link:hover { border-color: var(--green-mid); background: var(--green-soft); }
+        .hub-link svg { width: 18px; height: 18px; flex: none; color: var(--green); }
+        footer { text-align: center; color: var(--ink-3); font-size: 12px; padding: 0 16px calc(24px + env(safe-area-inset-bottom)); }
+        footer strong { color: var(--green); }
+        .note { font-size: 13px; color: var(--ink-3); text-align: center; margin: 14px 0 0; }
+    </style>
+</head>
+<body>
+    <header class="hero">
+        <div class="brand">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M4 8V5a1 1 0 0 1 1-1h3M16 4h3a1 1 0 0 1 1 1v3M20 16v3a1 1 0 0 1-1 1h-3M8 20H5a1 1 0 0 1-1-1v-3"/><path d="M8 12h8" stroke="#FFD700"/></svg>
+            <span>Scan<span class="gold">Mark</span></span>
+        </div>
+        {% if event %}
+        <h1>{{ event.title }}</h1>
+        {% if event.subtitle %}<p class="subtitle">{{ event.subtitle }}</p>{% endif %}
+        {% if event.venue %}
+        <span class="chip">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 19 9.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.5"/></svg>
+            {{ event.venue }}
+        </span>
+        {% endif %}
+        {% else %}
+        <h1>Event check-in</h1>
+        {% endif %}
+    </header>
+
+    <main>
+        {% if state == 'form' %}
+        <section class="card">
+            <h2>Check in</h2>
+            <p class="lead">Enter your details and tap Check In. No account needed.</p>
+            <form method="POST" action="{{ url_for('event_checkin_submit', token=event.public_token) }}" id="checkinForm" novalidate>
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <div class="field{% if errors.name %} invalid{% endif %}">
+                    <label for="name">Full name</label>
+                    <input type="text" id="name" name="name" value="{{ form.name or '' }}"
+                        maxlength="100" autocomplete="name" autocapitalize="words"
+                        spellcheck="false" required placeholder="e.g. Adaeze Okafor"
+                        {% if errors.name %}aria-invalid="true" aria-describedby="nameError"{% endif %}>
+                    {% if errors.name %}<div class="error" id="nameError">{{ errors.name }}</div>{% endif %}
+                </div>
+                <div class="field{% if errors.department %} invalid{% endif %}">
+                    <label for="department">Department</label>
+                    {% if event.departments %}
+                    <select id="department" name="department" required
+                        {% if errors.department %}aria-invalid="true" aria-describedby="deptError"{% endif %}>
+                        <option value="" {% if not form.department %}selected{% endif %} disabled>Select your department</option>
+                        {% for department in event.departments %}
+                        <option value="{{ department }}" {% if form.department == department %}selected{% endif %}>{{ department }}</option>
+                        {% endfor %}
+                    </select>
+                    {% else %}
+                    <input type="text" id="department" name="department" value="{{ form.department or '' }}"
+                        maxlength="100" autocapitalize="words" required placeholder="Your department"
+                        {% if errors.department %}aria-invalid="true" aria-describedby="deptError"{% endif %}>
+                    {% endif %}
+                    {% if errors.department %}<div class="error" id="deptError">{{ errors.department }}</div>{% endif %}
+                </div>
+                <button type="submit" class="btn" id="submitBtn">
+                    <span class="spinner" aria-hidden="true"></span>
+                    <span id="submitLabel">Check In</span>
+                </button>
+            </form>
+        </section>
+
+        {% elif state in ('success', 'already') %}
+        <section class="card status" aria-live="polite">
+            <div class="badge-icon {{ 'ok' if state == 'success' else '' }}">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>
+            </div>
+            {% if state == 'success' %}
+            <h2>You're checked in.</h2>
+            <p class="lead" style="margin-bottom:0">Your attendance has been recorded by ScanMark.</p>
+            {% else %}
+            <h2>You've already checked in.</h2>
+            <p class="lead" style="margin-bottom:0">This phone is already on the list. There's nothing more to do.</p>
+            {% endif %}
+            {% if checkin %}
+            <div class="who">
+                <div class="name">{{ checkin.name }}</div>
+                <div class="dept">{{ checkin.department }}</div>
+                <div class="time">Checked in at {{ checkin.checked_in_at|local_time }}</div>
+            </div>
+            {% endif %}
+        </section>
+
+        <section class="card">
+            <p class="hub-title">Explore</p>
+            <p class="hub-welcome">Welcome! 👋</p>
+            <p class="lead" style="margin:0">
+                {% if hub_links %}Everything you need for {{ event.title }}, in one place.
+                {% else %}Enjoy the event. You can close this page now.{% endif %}
+            </p>
+            {% if hub_links %}
+            <nav class="hub-links">
+                {% for link in hub_links %}
+                <a class="hub-link" href="{{ link.url }}" target="_blank" rel="noopener noreferrer">
+                    <span>{{ link.label }}</span>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M7 17L17 7M9 7h8v8"/></svg>
+                </a>
+                {% endfor %}
+            </nav>
+            {% endif %}
+        </section>
+
+        {% elif state == 'closed' %}
+        <section class="card status">
+            <div class="badge-icon warn">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>
+            </div>
+            <h2>Check-in has closed</h2>
+            <p class="lead" style="margin:0">This event is no longer accepting check-ins. Please speak to an organiser if you need help.</p>
+        </section>
+
+        {% elif state == 'expired' %}
+        <section class="card status">
+            <div class="badge-icon warn">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.3-5.7M20 4v5h-5"/></svg>
+            </div>
+            <h2>This page timed out</h2>
+            <p class="lead">You weren't checked in yet. Reload the page and try again.</p>
+            <a class="btn" href="{{ url_for('event_checkin', token=event.public_token) }}">Reload</a>
+        </section>
+
+        {% elif state == 'busy' %}
+        <section class="card status">
+            <div class="badge-icon warn">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+            </div>
+            <h2>One moment</h2>
+            <p class="lead">{{ busy_message or 'Lots of people are checking in right now.' }} You weren't checked in yet.</p>
+            <a class="btn" href="{{ url_for('event_checkin', token=event.public_token) }}">Try again</a>
+        </section>
+
+        {% else %}
+        <section class="card status">
+            <div class="badge-icon bad">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" aria-hidden="true"><path d="M7 7l10 10M17 7L7 17"/></svg>
+            </div>
+            <h2>This check-in link isn't valid</h2>
+            <p class="lead" style="margin:0">Scan the QR code on the screen again, or ask an organiser for the right link.</p>
+        </section>
+        {% endif %}
+    </main>
+
+    <footer>Check-in by <strong>ScanMark</strong></footer>
+
+    {% if state == 'form' %}
+    <script>
+        (function () {
+            var form = document.getElementById('checkinForm');
+            var button = document.getElementById('submitBtn');
+            var label = document.getElementById('submitLabel');
+            form.addEventListener('submit', function (event) {
+                var name = form.elements['name'].value.trim();
+                var department = form.elements['department'].value.trim();
+                if (!name || !department) {
+                    event.preventDefault();
+                    (name ? form.elements['department'] : form.elements['name']).focus();
+                    return;
+                }
+                if (button.disabled) { event.preventDefault(); return; }
+                // One tap, one request: the server would refuse a second
+                // check-in anyway, but a double tap should not even send one.
+                button.disabled = true;
+                button.classList.add('loading');
+                label.textContent = 'Checking in…';
+            });
+            // Coming back to this page with the browser's Back button restores
+            // it from cache with the button still disabled.
+            window.addEventListener('pageshow', function () {
+                button.disabled = false;
+                button.classList.remove('loading');
+                label.textContent = 'Check In';
+            });
+        })();
+    </script>
+    {% endif %}
+</body>
+</html>

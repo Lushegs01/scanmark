@@ -18,7 +18,8 @@ load_dotenv()
 from authlib.integrations.flask_client import OAuth
 from flask import (Flask, render_template, redirect, url_for,
                    flash, request, send_file, jsonify, make_response,
-                   Response, session)
+                   Response, session, abort, stream_with_context)
+from urllib.parse import urlparse
 from markupsafe import escape
 from flask_login import LoginManager, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -39,7 +40,7 @@ from itsdangerous import URLSafeTimedSerializer
 from flask_mail import Connection as FlaskMailConnection, Mail, Message
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
-from flask_wtf.csrf import CSRFProtect
+from flask_wtf.csrf import CSRFError, CSRFProtect
 from flask_compress import Compress
 from werkzeug.middleware.proxy_fix import ProxyFix
 from whitenoise import WhiteNoise
@@ -53,6 +54,7 @@ from academic import (
     normalize_semester,
 )
 from localtime import (
+    LOCAL_TIMEZONE,
     LOCAL_TIMEZONE_NAME,
     format_local,
     iso_utc,
@@ -61,11 +63,12 @@ from localtime import (
     local_day_bounds_utc,
     local_now,
     local_time_only,
+    to_local,
     utcnow_naive,
 )
 from models import (
     db, User, Course, Attendance, AuditLog, ClassSession, Classroom,
-    SessionRoster, course_instructors, enrollments,
+    EventCheckin, EventSession, SessionRoster, course_instructors, enrollments,
 )
 from mailconfig import BREVO, resolve_mail_settings
 from mailer import (MailSendError, check_sender_validated, describe_key_shape,
@@ -6885,6 +6888,752 @@ def course_audit(course_id):
                            entries=pagination.items, pagination=pagination)
 
 # ============================================================
+# EVENT CHECK-IN MODE
+# ============================================================
+# A walk-up event — an orientation, a seminar — where whoever is in the room
+# scans one static QR on the projector, types their name, and is counted. It
+# is deliberately a separate domain from academic attendance: no accounts, no
+# enrolment, no geofence, no rotating token, and none of it routed through
+# /mark_attendance. The two share the database, Redis, CSRF and the limiter,
+# and nothing else.
+#
+# A check-in is keyed to a random cookie on the attendee's browser. That stops
+# a phone counting twice; it is not an identity check, and nothing here
+# pretends it is.
+
+def _event_list_setting(name, separators=r'[\n;,]'):
+    raw = os.environ.get(name) or ''
+    return [part.strip() for part in re.split(separators, raw) if part.strip()]
+
+
+#: Who may create events. Set it and ONLY these addresses can; leave it unset
+#: and any staff account can (lecturer and up). Listed addresses can also run
+#: every event on the instance, not just their own.
+EVENT_ADMIN_EMAILS = frozenset(email.lower()
+                               for email in _event_list_setting('EVENT_ADMIN_EMAILS', r'[\s,;]'))
+EVENT_HOST_ROLES = (LECTURER_ROLE, COORDINATOR_ROLE, HOD_ROLE, DEAN_ROLE, DAP_ROLE)
+
+#: How long a new event runs by default; 0 leaves the end time blank, so the
+#: event stays open until the host closes it.
+EVENT_DEFAULT_DURATION_MINUTES = max(0, int(os.environ.get(
+    'EVENT_DEFAULT_DURATION_MINUTES', 480)))
+
+# Rate limits on the public POST. The per-IP one is deliberately generous: a
+# hall full of freshers is often on ONE venue Wi-Fi address, or a mobile
+# carrier's shared NAT, and a tight per-IP cap would refuse the room exactly
+# when everyone scans at once. The per-device cap is what actually stops one
+# phone hammering the form; the per-event cap bounds the database work any
+# single event can generate.
+EVENT_RATE_LIMIT = os.environ.get('EVENT_RATE_LIMIT', '600 per minute')
+EVENT_DEVICE_RATE_LIMIT = os.environ.get('EVENT_DEVICE_RATE_LIMIT', '10 per minute')
+EVENT_GLOBAL_RATE_LIMIT = os.environ.get('EVENT_GLOBAL_RATE_LIMIT', '6000 per minute')
+
+try:
+    from limits import parse_many as _parse_limits
+    for _limit_name, _limit_value in (('EVENT_RATE_LIMIT', EVENT_RATE_LIMIT),
+                                      ('EVENT_DEVICE_RATE_LIMIT', EVENT_DEVICE_RATE_LIMIT),
+                                      ('EVENT_GLOBAL_RATE_LIMIT', EVENT_GLOBAL_RATE_LIMIT)):
+        _parse_limits(_limit_value)
+except ValueError as _limit_error:
+    # A typo here would otherwise surface as a 500 on the first check-in.
+    raise StartupError(f"CRITICAL: {_limit_name} is not a valid rate limit "
+                       f"({_limit_value!r}): {_limit_error}") from _limit_error
+
+#: Pre-fills for the create form, so the same department list does not have
+#: to be typed for every event. Departments: separated by newlines, ';' or ','.
+#: Links: "Label|https://..." pairs separated by ';' or newlines.
+EVENT_DEPARTMENT_OPTIONS = _event_list_setting('EVENT_DEPARTMENT_OPTIONS')
+EVENT_RESOURCE_LINKS = _event_list_setting('EVENT_RESOURCE_LINKS', r'[\n;]')
+
+#: What the create form starts with for this deployment's first event.
+EVENT_FORM_DEFAULTS = {
+    'title': 'CCS Freshers Orientation 2026',
+    'subtitle': 'College of Computing Sciences',
+    'venue': 'FUNAAB',
+    'starts_at_local': '2026-10-07T09:00',
+}
+
+EVENT_DEVICE_COOKIE = 'scanmark_event_device'
+EVENT_DEVICE_COOKIE_MAX_AGE = 90 * 24 * 60 * 60
+EVENT_RECENT_ROWS = 12
+EVENT_ATTENDEES_PER_PAGE = 50
+EVENT_COUNT_CACHE_TTL = 2   # seconds; the projector polls every 2
+
+EVENT_NAME_MAX = 100
+EVENT_DEPARTMENT_MAX = 100
+EVENT_MAX_DEPARTMENTS = 60
+EVENT_MAX_EXTRA_LINKS = 10
+EVENT_URL_MAX = 500
+
+_EVENT_TOKEN_PATTERN = re.compile(r'^[A-Za-z0-9_-]{16,64}$')
+_EVENT_DEVICE_PATTERN = re.compile(r'^[A-Za-z0-9_-]{32,64}$')
+_DATETIME_LOCAL_FORMAT = '%Y-%m-%dT%H:%M'
+
+
+def _new_event_token():
+    return secrets.token_urlsafe(24)    # 32 characters, 192 bits
+
+
+def can_host_events(user=None):
+    user = user or current_user
+    if not getattr(user, 'is_authenticated', False):
+        return False
+    if EVENT_ADMIN_EMAILS:
+        return (user.email or '').lower() in EVENT_ADMIN_EMAILS
+    return user_has_role(user, *EVENT_HOST_ROLES)
+
+
+def can_manage_event(event_row, user=None):
+    user = user or current_user
+    if not getattr(user, 'is_authenticated', False):
+        return False
+    return (event_row.created_by_id == user.id
+            or (user.email or '').lower() in EVENT_ADMIN_EMAILS)
+
+
+@app.context_processor
+def inject_event_helpers():
+    return {'can_host_events': can_host_events}
+
+
+def _find_event(token):
+    """The event behind a public token, or None. Never reveals why."""
+    if not token or not _EVENT_TOKEN_PATTERN.match(token):
+        return None
+    return EventSession.query.filter_by(public_token=token).first()
+
+
+def _managed_event_or_abort(token):
+    event_row = _find_event(token)
+    if event_row is None:
+        abort(404)
+    if not can_manage_event(event_row):
+        abort(403)
+    return event_row
+
+
+def _event_public_url(event_row):
+    return external_url_for('event_checkin', token=event_row.public_token)
+
+
+def _event_device_token():
+    raw = request.cookies.get(EVENT_DEVICE_COOKIE) or ''
+    return raw if _EVENT_DEVICE_PATTERN.match(raw) else None
+
+
+def _event_device_rate_key():
+    return 'event-device:' + (_event_device_token() or get_remote_address())
+
+
+def _event_rate_key():
+    return 'event:' + str((request.view_args or {}).get('token', ''))[:64]
+
+
+def _set_event_device_cookie(response, device_token):
+    response.set_cookie(
+        EVENT_DEVICE_COOKIE, device_token,
+        max_age=EVENT_DEVICE_COOKIE_MAX_AGE,
+        path='/event/',
+        secure=app.config.get('SESSION_COOKIE_SECURE', False),
+        httponly=True,
+        samesite='Lax',
+    )
+    return response
+
+
+def _event_count_cache_key(event_id):
+    return f"event_count:{event_id}"
+
+
+def _event_checkin_count(event_id):
+    """
+    How many have checked in. Postgres is the answer; Redis only spares it a
+    COUNT on every projector poll, and an unhealthy Redis costs a query, never
+    the number.
+    """
+    cache_key = _event_count_cache_key(event_id)
+    if redis_client:
+        try:
+            cached = _redis_timed('get', redis_client.get, cache_key)
+            if cached is not None:
+                return int(cached)
+        except (redis.RedisError, TypeError, ValueError):
+            runtime_metrics.increment('redis.event_count_errors')
+    count = (db.session.query(func.count(EventCheckin.id))
+             .filter(EventCheckin.event_id == event_id)
+             .scalar()) or 0
+    if redis_client:
+        try:
+            _redis_timed('setex', redis_client.setex, cache_key,
+                         EVENT_COUNT_CACHE_TTL, count)
+        except redis.RedisError:
+            runtime_metrics.increment('redis.event_count_errors')
+    return count
+
+
+def _forget_event_count(event_id):
+    if redis_client:
+        try:
+            _redis_timed('delete', redis_client.delete, _event_count_cache_key(event_id))
+        except redis.RedisError:
+            # The cached figure is at most EVENT_COUNT_CACHE_TTL seconds old.
+            runtime_metrics.increment('redis.event_count_errors')
+
+
+def _insert_event_checkin_once(event_id, device_token, name, department):
+    """
+    Insert one check-in and return its id, or None if this device already
+    has one for this event. The unique (event_id, device_token) constraint
+    decides, in the same statement — two taps racing cannot both win.
+    """
+    values = {
+        'event_id': event_id,
+        'device_token': device_token,
+        'name': name,
+        'department': department,
+        'checked_in_at': utcnow_naive(),
+    }
+    dialect = db.session.get_bind().dialect.name
+    if dialect in {'postgresql', 'sqlite'}:
+        if dialect == 'postgresql':
+            from sqlalchemy.dialects.postgresql import insert as _conflict_insert
+        else:
+            from sqlalchemy.dialects.sqlite import insert as _conflict_insert
+        statement = (_conflict_insert(EventCheckin)
+                     .values(**values)
+                     .on_conflict_do_nothing(index_elements=['event_id', 'device_token'])
+                     .returning(EventCheckin.id))
+        record_id = db.session.execute(statement).scalar_one_or_none()
+        if record_id is None:
+            db.session.rollback()
+            return None
+        db.session.commit()
+        return record_id
+    try:
+        record = EventCheckin(**values)
+        db.session.add(record)
+        db.session.commit()
+        return record.id
+    except IntegrityError:
+        db.session.rollback()
+        return None
+
+
+def _has_letter(text):
+    return any(character.isalpha() for character in text)
+
+
+def _validate_checkin_form(event_row, form):
+    """Return (name, department, errors) from the public form."""
+    errors = {}
+    raw_name = _clean_text(form.get('name'), EVENT_NAME_MAX + 1)
+    if not raw_name:
+        errors['name'] = 'Please enter your full name.'
+    elif len(raw_name) > EVENT_NAME_MAX:
+        errors['name'] = f'Please keep your name under {EVENT_NAME_MAX} characters.'
+    elif len(raw_name) < 2 or not _has_letter(raw_name):
+        errors['name'] = 'Please enter your real name.'
+
+    options = event_row.departments
+    raw_department = _clean_text(form.get('department'), EVENT_DEPARTMENT_MAX + 1)
+    if not raw_department:
+        errors['department'] = 'Please choose your department.' if options else \
+            'Please enter your department.'
+    elif options and raw_department not in options:
+        errors['department'] = 'Please choose your department from the list.'
+    elif len(raw_department) > EVENT_DEPARTMENT_MAX:
+        errors['department'] = 'That department name is too long.'
+    elif not _has_letter(raw_department):
+        errors['department'] = 'Please enter your department.'
+    return raw_name, raw_department, errors
+
+
+def _event_hub_links(event_row):
+    links = []
+    for label, url in (('Orientation Schedule', event_row.schedule_url),
+                       ('College Information', event_row.info_url),
+                       ('Important Links', event_row.links_url),
+                       ('Student Community', event_row.community_url)):
+        if url:
+            links.append({'label': label, 'url': url})
+    for line in (event_row.extra_links or '').splitlines():
+        label, _, url = line.partition('|')
+        if label.strip() and url.strip():
+            links.append({'label': label.strip(), 'url': url.strip()})
+    return links
+
+
+def _render_event_public(event_row, state, status=200, **context):
+    response = make_response(render_template(
+        'event_checkin.html', event=event_row, state=state,
+        hub_links=_event_hub_links(event_row) if event_row else [],
+        **context), status)
+    # Carries a CSRF token and, after check-in, the attendee's own name.
+    response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
+def _event_not_found():
+    return _render_event_public(None, 'not_found', 404)
+
+
+@app.route('/event/<token>', methods=['GET'])
+def event_checkin(token):
+    """The page the projector QR opens. Public: no account, no login."""
+    event_row = _find_event(token)
+    if event_row is None:
+        return _event_not_found()
+
+    device_token = _event_device_token()
+    new_device = device_token is None
+    if new_device:
+        device_token = secrets.token_urlsafe(32)
+
+    existing = None if new_device else (
+        EventCheckin.query
+        .filter_by(event_id=event_row.id, device_token=device_token)
+        .first())
+    if existing is not None:
+        response = _render_event_public(event_row, 'already', checkin=existing)
+    elif not event_row.accepting_checkins():
+        response = _render_event_public(event_row, 'closed')
+    else:
+        response = _render_event_public(event_row, 'form', form={}, errors={})
+    if new_device:
+        _set_event_device_cookie(response, device_token)
+    return response
+
+
+@app.route('/event/<token>', methods=['POST'])
+@limiter.limit(lambda: EVENT_RATE_LIMIT, key_func=get_remote_address,
+               error_message='Too many check-ins from this network. Please wait a moment.')
+@limiter.limit(lambda: EVENT_DEVICE_RATE_LIMIT, key_func=_event_device_rate_key,
+               error_message='Too many attempts from this phone. Please wait a moment.')
+@limiter.limit(lambda: EVENT_GLOBAL_RATE_LIMIT, key_func=_event_rate_key,
+               error_message='Check-in is very busy right now. Please try again in a moment.')
+def event_checkin_submit(token):
+    event_row = _find_event(token)
+    if event_row is None:
+        return _event_not_found()
+
+    device_token = _event_device_token()
+    new_device = device_token is None
+    if new_device:
+        # A browser that refused the cookie set on the GET. It still checks
+        # in; it just cannot be recognised next time.
+        device_token = secrets.token_urlsafe(32)
+
+    def finish(response):
+        if new_device:
+            _set_event_device_cookie(response, device_token)
+        return response
+
+    if not new_device:
+        existing = (EventCheckin.query
+                    .filter_by(event_id=event_row.id, device_token=device_token)
+                    .first())
+        if existing is not None:
+            return finish(_render_event_public(event_row, 'already', checkin=existing))
+
+    if not event_row.accepting_checkins():
+        return finish(_render_event_public(event_row, 'closed', 409))
+
+    name, department, errors = _validate_checkin_form(event_row, request.form)
+    if errors:
+        return finish(_render_event_public(
+            event_row, 'form', 400,
+            form={'name': name, 'department': department}, errors=errors))
+
+    record_id = _insert_event_checkin_once(event_row.id, device_token, name, department)
+    if record_id is None:
+        existing = (EventCheckin.query
+                    .filter_by(event_id=event_row.id, device_token=device_token)
+                    .first())
+        return finish(_render_event_public(event_row, 'already', checkin=existing))
+
+    _forget_event_count(event_row.id)
+    runtime_metrics.increment('event.checkins')
+    checkin = db.session.get(EventCheckin, record_id)
+    return finish(_render_event_public(event_row, 'success', checkin=checkin))
+
+
+@app.route('/api/event/<token>/count')
+def event_count(token):
+    """The public live count: a number and whether the doors are open. No names."""
+    event_row = _find_event(token)
+    if event_row is None:
+        return jsonify({'status': 'error', 'message': 'Event not found.'}), 404
+    response = jsonify({
+        'status': 'success',
+        'count': _event_checkin_count(event_row.id),
+        'open': event_row.accepting_checkins(),
+    })
+    response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
+@app.route('/api/event/<token>/live')
+@login_required
+def event_live(token):
+    """The projector feed: the count plus the last few names. Hosts only."""
+    event_row = _find_event(token)
+    if event_row is None:
+        return jsonify({'status': 'error', 'message': 'Event not found.'}), 404
+    if not can_manage_event(event_row):
+        return jsonify({'status': 'error', 'message': 'Unauthorised'}), 403
+    rows = (db.session.query(EventCheckin.name, EventCheckin.department,
+                             EventCheckin.checked_in_at)
+            .filter(EventCheckin.event_id == event_row.id)
+            .order_by(EventCheckin.id.desc())
+            .limit(EVENT_RECENT_ROWS)
+            .all())
+    response = jsonify({
+        'status': 'success',
+        'count': _event_checkin_count(event_row.id),
+        'open': event_row.accepting_checkins(),
+        'recent': [{'name': name, 'department': department,
+                    'time': local_time_only(checked_in_at)}
+                   for name, department, checked_in_at in rows],
+    })
+    response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
+@app.route('/event/<token>/qr.png')
+@login_required
+def event_qr(token):
+    """A static QR for the public check-in URL, sized for a projector."""
+    event_row = _managed_event_or_abort(token)
+    import qrcode
+    from qrcode.constants import ERROR_CORRECT_M
+    qr = qrcode.QRCode(error_correction=ERROR_CORRECT_M, box_size=16, border=4)
+    qr.add_data(_event_public_url(event_row))
+    qr.make(fit=True)
+    buffer = io.BytesIO()
+    qr.make_image(fill_color='black', back_color='white').save(buffer, format='PNG')
+    buffer.seek(0)
+    download = request.args.get('download') == '1'
+    response = send_file(
+        buffer, mimetype='image/png', as_attachment=download,
+        download_name=f"{_safe_filename(event_row.title, 'event')}-checkin-qr.png")
+    response.headers['Cache-Control'] = 'private, max-age=300'
+    return response
+
+
+@app.route('/event/<token>/admin')
+@login_required
+def event_projector(token):
+    event_row = _managed_event_or_abort(token)
+    return render_template(
+        'event_projector.html', event=event_row,
+        public_url=_event_public_url(event_row),
+        count=_event_checkin_count(event_row.id))
+
+
+@app.route('/event/<token>/manage')
+@login_required
+def event_manage(token):
+    event_row = _managed_event_or_abort(token)
+    return render_template(
+        'event_manage.html', event=event_row,
+        public_url=_event_public_url(event_row),
+        projector_url=external_url_for('event_projector', token=event_row.public_token),
+        attendees_url=external_url_for('event_attendees', token=event_row.public_token),
+        count=_event_checkin_count(event_row.id),
+        just_created=request.args.get('created') == '1')
+
+
+@app.route('/event/<token>/attendees')
+@login_required
+def event_attendees(token):
+    event_row = _managed_event_or_abort(token)
+    page = max(1, request.args.get('page', default=1, type=int) or 1)
+    total = (db.session.query(func.count(EventCheckin.id))
+             .filter(EventCheckin.event_id == event_row.id).scalar()) or 0
+    pages = max(1, math.ceil(total / EVENT_ATTENDEES_PER_PAGE))
+    page = min(page, pages)
+    rows = (EventCheckin.query
+            .filter_by(event_id=event_row.id)
+            .order_by(EventCheckin.id.desc())
+            .offset((page - 1) * EVENT_ATTENDEES_PER_PAGE)
+            .limit(EVENT_ATTENDEES_PER_PAGE)
+            .all())
+    return render_template(
+        'event_attendees.html', event=event_row, rows=rows, total=total,
+        page=page, pages=pages,
+        first_number=total - (page - 1) * EVENT_ATTENDEES_PER_PAGE)
+
+
+@app.route('/event/<token>/attendees.csv')
+@login_required
+def event_attendees_csv(token):
+    event_row = _managed_event_or_abort(token)
+
+    def generate():
+        yield '"Name","Department","Checked in (' + LOCAL_TIMEZONE_NAME + ')"\r\n'
+        query = (db.session.query(EventCheckin.name, EventCheckin.department,
+                                  EventCheckin.checked_in_at)
+                 .filter(EventCheckin.event_id == event_row.id)
+                 .order_by(EventCheckin.id.asc())
+                 .yield_per(500))
+        for name, department, checked_in_at in query:
+            yield ','.join((_csv_cell(name), _csv_cell(department),
+                            _csv_cell(format_local(checked_in_at,
+                                                   '%Y-%m-%d %H:%M:%S')))) + '\r\n'
+
+    filename = f"{_safe_filename(event_row.title, 'event')}-checkins.csv"
+    return Response(stream_with_context(generate()), mimetype='text/csv',
+                    headers=_attachment_headers(filename))
+
+
+def _parse_local_datetime(value):
+    """'2026-10-07T09:00' in the university's timezone -> naive UTC."""
+    value = (value or '').strip()
+    if not value:
+        return None
+    parsed = datetime.strptime(value, _DATETIME_LOCAL_FORMAT)
+    return (parsed.replace(tzinfo=LOCAL_TIMEZONE)
+            .astimezone(timezone.utc).replace(tzinfo=None))
+
+
+def _local_datetime_value(value):
+    local_value = to_local(value)
+    return local_value.strftime(_DATETIME_LOCAL_FORMAT) if local_value else ''
+
+
+def _clean_event_url(value):
+    url = (value or '').strip()
+    if not url:
+        return '', None
+    if len(url) > EVENT_URL_MAX:
+        return url, f'Links must be under {EVENT_URL_MAX} characters.'
+    parsed = urlparse(url)
+    if (parsed.scheme not in ('http', 'https') or not parsed.netloc
+            or _CONTROL_CHARACTERS.search(url) or any(c.isspace() for c in url)):
+        return url, 'Links must be full web addresses starting with https://'
+    return url, None
+
+
+def _event_form_from(source):
+    return {key: (source.get(key) or '') for key in (
+        'title', 'subtitle', 'venue', 'starts_at_local', 'ends_at_local',
+        'department_options', 'schedule_url', 'info_url', 'links_url',
+        'community_url', 'extra_links')}
+
+
+def _validate_event_form(form):
+    """Return (cleaned values for EventSession, errors)."""
+    errors = {}
+    values = {
+        'title': _clean_text(form.get('title'), 121),
+        'subtitle': _clean_text(form.get('subtitle'), 161),
+        'venue': _clean_text(form.get('venue'), 121),
+    }
+    if not values['title']:
+        errors['title'] = 'Give the event a title.'
+    for field, limit in (('title', 120), ('subtitle', 160), ('venue', 120)):
+        if len(values[field]) > limit:
+            errors[field] = f'Keep this under {limit} characters.'
+
+    for field in ('starts_at', 'ends_at'):
+        try:
+            values[field] = _parse_local_datetime(form.get(f'{field}_local'))
+        except ValueError:
+            values[field] = None
+            errors[field] = 'Enter a valid date and time.'
+    if (values['starts_at'] and values['ends_at']
+            and values['ends_at'] <= values['starts_at']):
+        errors['ends_at'] = 'The end time must be after the start time.'
+
+    departments = []
+    for line in str(form.get('department_options') or '').splitlines():
+        department = _clean_text(line, EVENT_DEPARTMENT_MAX + 1)
+        if not department or department in departments:
+            continue
+        if len(department) > EVENT_DEPARTMENT_MAX:
+            errors['department_options'] = (
+                f'Each department must be under {EVENT_DEPARTMENT_MAX} characters.')
+        departments.append(department)
+    if len(departments) > EVENT_MAX_DEPARTMENTS:
+        errors['department_options'] = f'List at most {EVENT_MAX_DEPARTMENTS} departments.'
+    values['department_options'] = '\n'.join(departments)
+
+    for field in ('schedule_url', 'info_url', 'links_url', 'community_url'):
+        values[field], problem = _clean_event_url(form.get(field))
+        if problem:
+            errors[field] = problem
+
+    extra = []
+    for line in str(form.get('extra_links') or '').splitlines():
+        if not line.strip():
+            continue
+        label, separator, url = line.partition('|')
+        label = _clean_text(label, 61)
+        url, problem = _clean_event_url(url)
+        if not separator or not label or not url:
+            errors['extra_links'] = 'Write each extra link as: Label | https://...'
+        elif len(label) > 60:
+            errors['extra_links'] = 'Keep each link label under 60 characters.'
+        elif problem:
+            errors['extra_links'] = problem
+        else:
+            extra.append(f'{label} | {url}')
+    if len(extra) > EVENT_MAX_EXTRA_LINKS:
+        errors['extra_links'] = f'Add at most {EVENT_MAX_EXTRA_LINKS} extra links.'
+    values['extra_links'] = '\n'.join(extra)
+    return values, errors
+
+
+def _event_form_defaults():
+    starts_at_local = EVENT_FORM_DEFAULTS['starts_at_local']
+    ends_at_local = ''
+    if EVENT_DEFAULT_DURATION_MINUTES:
+        ends_at_local = (datetime.strptime(starts_at_local, _DATETIME_LOCAL_FORMAT)
+                         + timedelta(minutes=EVENT_DEFAULT_DURATION_MINUTES)
+                         ).strftime(_DATETIME_LOCAL_FORMAT)
+    extra_links = []
+    for pair in EVENT_RESOURCE_LINKS:
+        label, _, url = pair.partition('|')
+        if label.strip() and url.strip():
+            extra_links.append(f'{label.strip()} | {url.strip()}')
+    return {
+        'title': EVENT_FORM_DEFAULTS['title'],
+        'subtitle': EVENT_FORM_DEFAULTS['subtitle'],
+        'venue': EVENT_FORM_DEFAULTS['venue'],
+        'starts_at_local': starts_at_local,
+        'ends_at_local': ends_at_local,
+        'department_options': '\n'.join(EVENT_DEPARTMENT_OPTIONS),
+        'schedule_url': '', 'info_url': '', 'links_url': '', 'community_url': '',
+        'extra_links': '\n'.join(extra_links),
+    }
+
+
+def _forbid_non_hosts():
+    flash('Your account cannot host events. Ask an administrator to add you.', 'warning')
+    return redirect(url_for('dashboard'))
+
+
+@app.route('/events')
+@login_required
+def event_list():
+    query = EventSession.query
+    if (current_user.email or '').lower() not in EVENT_ADMIN_EMAILS:
+        query = query.filter(EventSession.created_by_id == current_user.id)
+    events = query.order_by(EventSession.id.desc()).limit(100).all()
+    if not events and not can_host_events():
+        return _forbid_non_hosts()
+    counts = dict(db.session.query(EventCheckin.event_id, func.count(EventCheckin.id))
+                  .filter(EventCheckin.event_id.in_([e.id for e in events] or [0]))
+                  .group_by(EventCheckin.event_id).all())
+    return render_template('event_list.html', events=events, counts=counts)
+
+
+@app.route('/events/new', methods=['GET', 'POST'])
+@login_required
+def event_create():
+    if not can_host_events():
+        return _forbid_non_hosts()
+    if request.method == 'GET':
+        return render_template('event_form.html', form=_event_form_defaults(),
+                               errors={}, editing=None)
+
+    values, errors = _validate_event_form(request.form)
+    if errors:
+        return render_template('event_form.html', form=_event_form_from(request.form),
+                               errors=errors, editing=None), 400
+
+    event_row = EventSession(public_token=_new_event_token(),
+                             created_by_id=current_user.id, active=True, **values)
+    db.session.add(event_row)
+    db.session.flush()
+    record_audit('event_created', target_type='event_session',
+                 target_id=event_row.id, target_label=event_row.title)
+    db.session.commit()
+    return redirect(url_for('event_manage', token=event_row.public_token, created=1))
+
+
+@app.route('/event/<token>/edit', methods=['GET', 'POST'])
+@login_required
+def event_edit(token):
+    event_row = _managed_event_or_abort(token)
+    if request.method == 'GET':
+        form = {column: getattr(event_row, column) or '' for column in (
+            'title', 'subtitle', 'venue', 'department_options', 'schedule_url',
+            'info_url', 'links_url', 'community_url', 'extra_links')}
+        form['starts_at_local'] = _local_datetime_value(event_row.starts_at)
+        form['ends_at_local'] = _local_datetime_value(event_row.ends_at)
+        return render_template('event_form.html', form=form, errors={},
+                               editing=event_row)
+
+    values, errors = _validate_event_form(request.form)
+    if errors:
+        return render_template('event_form.html', form=_event_form_from(request.form),
+                               errors=errors, editing=event_row), 400
+    for field, value in values.items():
+        setattr(event_row, field, value)
+    record_audit('event_updated', target_type='event_session',
+                 target_id=event_row.id, target_label=event_row.title)
+    db.session.commit()
+    flash('Event updated.', 'success')
+    return redirect(url_for('event_manage', token=event_row.public_token))
+
+
+def _event_return_redirect(token):
+    """Back to the page the button was pressed on."""
+    if request.form.get('next') == 'projector':
+        return redirect(url_for('event_projector', token=token))
+    return redirect(url_for('event_manage', token=token))
+
+
+@app.route('/event/<token>/close', methods=['POST'])
+@login_required
+def event_close(token):
+    event_row = _managed_event_or_abort(token)
+    if event_row.active:
+        event_row.active = False
+        event_row.closed_at = utcnow_naive()
+        record_audit('event_closed', target_type='event_session',
+                     target_id=event_row.id, target_label=event_row.title,
+                     checkins=_event_checkin_count(event_row.id))
+        db.session.commit()
+    flash('Check-in is closed. The QR code no longer accepts check-ins.', 'success')
+    return _event_return_redirect(token)
+
+
+@app.route('/event/<token>/open', methods=['POST'])
+@login_required
+def event_open(token):
+    event_row = _managed_event_or_abort(token)
+    event_row.active = True
+    event_row.closed_at = None
+    message = 'Check-in is open.'
+    if event_row.ends_at is not None and event_row.ends_at <= utcnow_naive():
+        # Reopening an event that has run past its end time would otherwise
+        # look open here and still refuse every scan.
+        event_row.ends_at = None
+        message = 'Check-in is open. The end time had passed, so it was cleared.'
+    record_audit('event_opened', target_type='event_session',
+                 target_id=event_row.id, target_label=event_row.title)
+    db.session.commit()
+    flash(message, 'success')
+    return _event_return_redirect(token)
+
+
+@app.errorhandler(CSRFError)
+def csrf_error_handler(error):
+    """
+    A public check-in page left open past its CSRF token's lifetime gets a
+    page that says to reload, not a bare 400. Everything else keeps Flask-WTF's
+    stock response.
+    """
+    if request.path.startswith('/event/') and request.method == 'POST':
+        event_row = _find_event((request.view_args or {}).get('token'))
+        if event_row is not None:
+            return _render_event_public(event_row, 'expired', 400)
+    return error
+
+
+# ============================================================
 # ERROR HANDLERS
 # ============================================================
 
@@ -6914,6 +7663,14 @@ def ratelimit_handler(e):
         })
         response.headers['Retry-After'] = str(retry_after)
         return response, 429
+
+    if request.path.startswith('/event/') and request.method == 'POST':
+        event_row = _find_event((request.view_args or {}).get('token'))
+        if event_row is not None:
+            response = _render_event_public(event_row, 'busy', 429,
+                                            busy_message=str(e.description))
+            response.headers['Retry-After'] = str(retry_after)
+            return response
 
     # 🚨 STOPS THE LOOP BY RENDERING HTML DIRECTLY.
     # e.description is set from each limit's error_message, which is ours — but
