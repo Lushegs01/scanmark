@@ -7619,6 +7619,27 @@ def event_open(token):
     return _event_return_redirect(token)
 
 
+@app.route('/event/<token>/delete', methods=['POST'])
+@login_required
+def event_delete(token):
+    """
+    Remove an event and every check-in it holds. There is no undo, so the
+    audit trail keeps what was deleted and how many check-ins went with it.
+    """
+    event_row = _managed_event_or_abort(token)
+    title = event_row.title
+    removed = EventCheckin.query.filter_by(event_id=event_row.id).delete(
+        synchronize_session=False)
+    record_audit('event_deleted', target_type='event_session',
+                 target_id=event_row.id, target_label=title, checkins=removed)
+    db.session.delete(event_row)
+    db.session.commit()
+    _forget_event_count(event_row.id)
+    flash(f'Deleted "{title}" and its {removed} check-in{"" if removed == 1 else "s"}.',
+          'success')
+    return redirect(url_for('event_list'))
+
+
 @app.errorhandler(CSRFError)
 def csrf_error_handler(error):
     """

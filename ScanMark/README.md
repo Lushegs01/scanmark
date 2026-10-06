@@ -129,6 +129,9 @@ never touches courses, enrolment, the geofence or `/mark_attendance`.
 4. The full list is at `/event/<token>/attendees` (paginated, with CSV export).
    **Close check-in** on the manage page or projector stops new check-ins on
    the server; so does the end time.
+5. **Delete event** on the manage page removes the event and all its
+   check-ins for good (recorded in the audit log). Download the CSV first if
+   you need the list.
 
 The tables are created by the existing startup `db.create_all()`; there is no
 migration step.

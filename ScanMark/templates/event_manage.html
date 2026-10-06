@@ -102,6 +102,23 @@
                 <a href="{{ url_for('event_checkin', token=event.public_token) }}" target="_blank" rel="noopener"
                    class="btn btn-outline-dark"><i class="fas fa-mobile-screen me-1"></i>Preview check-in page</a>
             </div>
+
+            <div class="card border-danger-subtle mt-4">
+                <div class="card-body d-flex flex-wrap align-items-center justify-content-between gap-3">
+                    <div>
+                        <div class="fw-bold text-danger">Delete this event</div>
+                        <div class="small text-muted">
+                            Removes the event and all {{ count }} check-in{{ '' if count == 1 else 's' }}. This can't be undone,
+                            so download the CSV first if you need the list.
+                        </div>
+                    </div>
+                    <form method="POST" action="{{ url_for('event_delete', token=event.public_token) }}"
+                          onsubmit="return confirm('Delete this event and all {{ count }} check-ins? This cannot be undone.');">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <button type="submit" class="btn btn-outline-danger"><i class="fas fa-trash me-1"></i>Delete event</button>
+                    </form>
+                </div>
+            </div>
         </div>
     </div>
 </div>

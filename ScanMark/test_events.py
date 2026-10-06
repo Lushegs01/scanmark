@@ -338,6 +338,54 @@ class TestLifecycle:
         assert guest.get(f'/api/event/{event_token}/count').get_json()['open'] is True
 
 
+class TestDeletion:
+    def test_a_host_deletes_an_event_and_its_check_ins(self, appmod, host, event_token):
+        from models import AuditLog, EventCheckin, EventSession
+        for name in ('First Student', 'Second Student'):
+            appmod.app.test_client().post(f'/event/{event_token}', data={
+                'name': name, 'department': 'Computer Science'})
+        assert b'Delete event' in host.get(f'/event/{event_token}/manage').data
+
+        response = host.post(f'/event/{event_token}/delete')
+        assert response.status_code == 302
+        assert response.headers['Location'].endswith('/events')
+        with appmod.app.app_context():
+            assert EventSession.query.count() == 0
+            assert EventCheckin.query.count() == 0
+            entry = AuditLog.query.filter_by(action='event_deleted').one()
+            assert entry.target_label == 'CCS Freshers Orientation 2026'
+            assert '"checkins": 2' in entry.details
+        # The QR link now goes nowhere.
+        guest = appmod.app.test_client()
+        assert guest.get(f'/event/{event_token}').status_code == 404
+        assert guest.get(f'/api/event/{event_token}/count').status_code == 404
+
+    def test_only_a_host_can_delete(self, appmod, seed, login, event_token):
+        from models import EventSession
+        assert login(seed['outsider_email']).post(
+            f'/event/{event_token}/delete').status_code == 403
+        assert login(seed['student_email']).post(
+            f'/event/{event_token}/delete').status_code == 403
+        response = appmod.app.test_client().post(f'/event/{event_token}/delete')
+        assert response.status_code == 302 and '/login' in response.headers['Location']
+        with appmod.app.app_context():
+            assert EventSession.query.count() == 1
+
+    def test_delete_is_a_post_not_a_link(self, host, event_token):
+        assert host.get(f'/event/{event_token}/delete').status_code == 405
+
+    def test_deleting_one_event_leaves_the_others(self, appmod, host, event_token):
+        from models import EventCheckin, EventSession
+        response = host.post('/events/new', data=_event_form(title='Second Event'))
+        other = re.search(r'/event/([A-Za-z0-9_-]+)/manage', response.headers['Location']).group(1)
+        appmod.app.test_client().post(f'/event/{other}', data={
+            'name': 'Stays Here', 'department': 'Computer Science'})
+        host.post(f'/event/{event_token}/delete')
+        with appmod.app.app_context():
+            assert [e.title for e in EventSession.query.all()] == ['Second Event']
+            assert [c.name for c in EventCheckin.query.all()] == ['Stays Here']
+
+
 class TestLiveFeeds:
     def test_the_public_count_has_no_names(self, appmod, event_token):
         guest = appmod.app.test_client()
