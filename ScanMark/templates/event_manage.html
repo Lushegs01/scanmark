@@ -1,0 +1,122 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container my-5" style="max-width: 980px;">
+    <a href="{{ url_for('event_list') }}" class="small text-muted text-decoration-none">
+        <i class="fas fa-arrow-left me-1"></i>Events
+    </a>
+
+    {% if just_created %}
+    <div class="alert alert-success mt-3 mb-0 d-flex align-items-center gap-2">
+        <i class="fas fa-circle-check fs-4"></i>
+        <div><strong>Event created.</strong> Put the projector screen up and attendees can start checking in.</div>
+    </div>
+    {% endif %}
+
+    <div class="d-flex flex-wrap align-items-start justify-content-between gap-3 mt-3 mb-4">
+        <div>
+            <h2 class="fw-bold mb-1">{{ event.title }}</h2>
+            <p class="text-muted mb-1">
+                {{ event.subtitle }}{% if event.subtitle and event.venue %} · {% endif %}{{ event.venue }}
+            </p>
+            <p class="small text-muted mb-0">
+                {% if event.starts_at %}Starts {{ event.starts_at|local_dt }}{% endif %}
+                {% if event.ends_at %} · Ends {{ event.ends_at|local_dt }}{% else %} · No end time{% endif %}
+            </p>
+        </div>
+        {% if event.accepting_checkins() %}
+        <span class="badge bg-success fs-6 px-3 py-2"><i class="fas fa-circle me-1 small"></i>Check-in open</span>
+        {% elif event.active %}
+        <span class="badge bg-secondary fs-6 px-3 py-2"><i class="fas fa-clock me-1"></i>Ended (past end time)</span>
+        {% else %}
+        <span class="badge bg-secondary fs-6 px-3 py-2"><i class="fas fa-lock me-1"></i>Check-in closed</span>
+        {% endif %}
+    </div>
+
+    <div class="row g-4">
+        <div class="col-12 col-lg-5">
+            <div class="card shadow-sm border-0 h-100">
+                <div class="card-body text-center">
+                    <img src="{{ url_for('event_qr', token=event.public_token) }}" alt="Check-in QR code"
+                         class="img-fluid rounded" style="max-width: 340px; image-rendering: pixelated;">
+                    <div class="d-grid gap-2 mt-3">
+                        <a href="{{ url_for('event_projector', token=event.public_token) }}" target="_blank" rel="noopener"
+                           class="btn btn-success btn-lg"><i class="fas fa-display me-2"></i>Open projector screen</a>
+                        <a href="{{ url_for('event_qr', token=event.public_token, download=1) }}" class="btn btn-outline-success">
+                            <i class="fas fa-download me-1"></i>Download QR (PNG)
+                        </a>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="col-12 col-lg-7">
+            <div class="card shadow-sm border-0 mb-4">
+                <div class="card-body d-flex align-items-center justify-content-between">
+                    <div>
+                        <div class="text-muted small fw-bold text-uppercase">Checked in</div>
+                        <div class="display-5 fw-bold">{{ count }}</div>
+                    </div>
+                    <a href="{{ url_for('event_attendees', token=event.public_token) }}" class="btn btn-outline-dark">
+                        <i class="fas fa-users me-1"></i>View attendees
+                    </a>
+                </div>
+            </div>
+
+            <div class="card shadow-sm border-0 mb-4">
+                <div class="card-body">
+                    <label class="form-label small fw-bold" for="publicUrl">Public check-in URL</label>
+                    <div class="input-group">
+                        <input type="text" class="form-control" id="publicUrl" value="{{ public_url }}" readonly>
+                        <button class="btn btn-outline-success" type="button" id="copyBtn">
+                            <i class="fas fa-copy me-1"></i><span id="copyLabel">Copy</span>
+                        </button>
+                    </div>
+                    <div class="form-text">This is what the QR code opens. Anyone with it can check in while the event is open.</div>
+
+                    <label class="form-label small fw-bold mt-3" for="projectorUrl">Projector screen (hosts only)</label>
+                    <input type="text" class="form-control" id="projectorUrl" readonly
+                           value="{{ projector_url }}">
+                    <label class="form-label small fw-bold mt-3" for="attendeesUrl">Attendee list (hosts only)</label>
+                    <input type="text" class="form-control" id="attendeesUrl" readonly
+                           value="{{ attendees_url }}">
+                </div>
+            </div>
+
+            <div class="d-flex flex-wrap gap-2">
+                {% if event.accepting_checkins() %}
+                <form method="POST" action="{{ url_for('event_close', token=event.public_token) }}"
+                      onsubmit="return confirm('Close check-in? The QR code will stop accepting check-ins.');">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <button type="submit" class="btn btn-outline-danger"><i class="fas fa-lock me-1"></i>Close check-in</button>
+                </form>
+                {% else %}
+                <form method="POST" action="{{ url_for('event_open', token=event.public_token) }}">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <button type="submit" class="btn btn-success"><i class="fas fa-lock-open me-1"></i>Open check-in</button>
+                </form>
+                {% endif %}
+                <a href="{{ url_for('event_edit', token=event.public_token) }}" class="btn btn-outline-dark">
+                    <i class="fas fa-pen me-1"></i>Edit event
+                </a>
+                <a href="{{ url_for('event_checkin', token=event.public_token) }}" target="_blank" rel="noopener"
+                   class="btn btn-outline-dark"><i class="fas fa-mobile-screen me-1"></i>Preview check-in page</a>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    document.getElementById('copyBtn').addEventListener('click', function () {
+        var input = document.getElementById('publicUrl');
+        var label = document.getElementById('copyLabel');
+        function done() { label.textContent = 'Copied'; setTimeout(function () { label.textContent = 'Copy'; }, 1800); }
+        if (navigator.clipboard && window.isSecureContext) {
+            navigator.clipboard.writeText(input.value).then(done, function () { input.select(); });
+        } else {
+            input.select();
+            try { document.execCommand('copy'); done(); } catch (e) { /* the text stays selected */ }
+        }
+    });
+</script>
+{% endblock %}

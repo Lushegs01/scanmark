@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container my-5" style="max-width: 980px;">
+    <a href="{{ url_for('event_manage', token=event.public_token) }}" class="small text-muted text-decoration-none">
+        <i class="fas fa-arrow-left me-1"></i>{{ event.title }}
+    </a>
+    <div class="d-flex flex-wrap justify-content-between align-items-end gap-3 mt-2 mb-4">
+        <div>
+            <h2 class="fw-bold mb-1">Attendees</h2>
+            <p class="text-muted mb-0">{{ total }} checked in · newest first · times in {{ local_timezone_name }}</p>
+        </div>
+        <a href="{{ url_for('event_attendees_csv', token=event.public_token) }}" class="btn btn-outline-success">
+            <i class="fas fa-file-csv me-1"></i>Download CSV
+        </a>
+    </div>
+
+    <div class="card shadow-sm border-0">
+        {% if rows %}
+        <div class="table-responsive">
+            <table class="table table-hover align-middle mb-0">
+                <thead>
+                    <tr>
+                        <th class="text-muted small" style="width: 4rem;">#</th>
+                        <th>Name</th>
+                        <th>Department</th>
+                        <th class="text-nowrap">Checked in</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for row in rows %}
+                    <tr>
+                        <td class="text-muted small">{{ first_number - loop.index0 }}</td>
+                        <td class="fw-semibold text-break">{{ row.name }}</td>
+                        <td class="text-break">{{ row.department }}</td>
+                        <td class="text-nowrap">{{ row.checked_in_at|local_dt }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <div class="card-body text-center py-5 text-muted">Nobody has checked in yet.</div>
+        {% endif %}
+    </div>
+
+    {% if pages > 1 %}
+    <nav class="d-flex justify-content-between align-items-center mt-3" aria-label="Pages">
+        {% if page > 1 %}
+        <a class="btn btn-outline-dark btn-sm" href="{{ url_for('event_attendees', token=event.public_token, page=page - 1) }}">&larr; Newer</a>
+        {% else %}<span></span>{% endif %}
+        <span class="small text-muted">Page {{ page }} of {{ pages }}</span>
+        {% if page < pages %}
+        <a class="btn btn-outline-dark btn-sm" href="{{ url_for('event_attendees', token=event.public_token, page=page + 1) }}">Older &rarr;</a>
+        {% else %}<span></span>{% endif %}
+    </nav>
+    {% endif %}
+</div>
+{% endblock %}

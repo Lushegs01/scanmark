@@ -111,3 +111,34 @@ so an entry outlives the rows it describes.
 All timestamps are stored as UTC and displayed in `SCANMARK_TIMEZONE`
 (`Africa/Lagos` by default). "Today" is a local day, so an evening class near
 midnight is filed on the date the people in the room would name.
+
+## Event check-in mode
+
+Walk-up check-in for orientations and other events where attendees have no
+ScanMark account. It is a separate domain (`EventSession`, `EventCheckin`) and
+never touches courses, enrolment, the geofence or `/mark_attendance`.
+
+1. Sign in as a host and open **Events → New event** (`/events/new`). Fill in
+   the title, times, the department list (one per line) and any links for the
+   post-check-in hub.
+2. Open the **projector screen** (`/event/<token>/admin`). It shows a static QR
+   for the public URL, the live count and the latest names.
+3. Attendees scan, enter their name and department at `/event/<token>`, and see
+   a confirmation plus the hub links. One check-in per browser, enforced by a
+   unique index on (event, device cookie).
+4. The full list is at `/event/<token>/attendees` (paginated, with CSV export).
+   **Close check-in** on the manage page or projector stops new check-ins on
+   the server; so does the end time.
+
+The tables are created by the existing startup `db.create_all()`; there is no
+migration step.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `EVENT_ADMIN_EMAILS` | unset | Comma-separated. When set, only these accounts can create events, and they can run every event. When unset, any staff account (lecturer and up) can create events and runs its own. |
+| `EVENT_DEFAULT_DURATION_MINUTES` | `480` | Pre-fills the end time; `0` leaves it blank. |
+| `EVENT_RATE_LIMIT` | `600 per minute` | Public check-in POSTs per client IP. Generous on purpose: a hall often shares one Wi-Fi or carrier NAT address. |
+| `EVENT_DEVICE_RATE_LIMIT` | `10 per minute` | Public check-in POSTs per browser. |
+| `EVENT_GLOBAL_RATE_LIMIT` | `6000 per minute` | Public check-in POSTs per event. |
+| `EVENT_DEPARTMENT_OPTIONS` | unset | Pre-fills the department list (separated by `,` `;` or newlines). |
+| `EVENT_RESOURCE_LINKS` | unset | Pre-fills extra hub links as `Label|https://…` pairs separated by `;`. |

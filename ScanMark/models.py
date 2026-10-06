@@ -384,3 +384,95 @@ class AuditLog(db.Model):
         db.Index('ix_audit_log_actor', 'actor_id'),
         db.Index('ix_audit_log_course', 'course_id', 'created_at'),
     )
+
+
+# --- EVENT MODE ---
+#
+# A walk-up event (an orientation, a seminar) is not a class: nobody is
+# enrolled, nobody has an account, and there is no room to geofence. It gets
+# its own two tables rather than borrowing ClassSession/Attendance, so nothing
+# here can change what the academic register means and nothing in the
+# academic scan path ever has to know events exist.
+
+class EventSession(db.Model):
+    __tablename__ = 'event_session'
+
+    id = db.Column(db.Integer, primary_key=True)
+    # What the public URL carries. Random and long, never the row id: an
+    # incrementing id would let anyone walk every event on the instance.
+    public_token = db.Column(db.String(64), nullable=False, unique=True)
+
+    title = db.Column(db.String(120), nullable=False)
+    subtitle = db.Column(db.String(160), nullable=False, default='')
+    venue = db.Column(db.String(120), nullable=False, default='')
+
+    # Naive UTC, like every other timestamp in the schema. `ends_at` is
+    # enforced on the server: past it the event refuses check-ins whatever
+    # `active` says. `starts_at` is shown, not enforced, so a host can open
+    # the doors early or rehearse the night before.
+    starts_at = db.Column(db.DateTime, nullable=True)
+    ends_at = db.Column(db.DateTime, nullable=True)
+
+    # Closing is a server-side switch the host flips; it is what turns the
+    # QR on the projector into a dead link.
+    active = db.Column(db.Boolean, nullable=False, default=True)
+    closed_at = db.Column(db.DateTime, nullable=True)
+
+    # One department per line, in display order. Empty means the check-in
+    # form asks for the department as free text.
+    department_options = db.Column(db.Text, nullable=False, default='')
+
+    # The post-check-in hub. Each is optional and only rendered when set.
+    schedule_url = db.Column(db.String(500), nullable=False, default='')
+    info_url = db.Column(db.String(500), nullable=False, default='')
+    links_url = db.Column(db.String(500), nullable=False, default='')
+    community_url = db.Column(db.String(500), nullable=False, default='')
+    # Further "Label | https://..." lines.
+    extra_links = db.Column(db.Text, nullable=False, default='')
+
+    created_by_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    created_by = db.relationship('User')
+    created_at = db.Column(db.DateTime, nullable=False, default=utcnow_naive)
+
+    __table_args__ = (
+        db.Index('ix_event_session_created_by', 'created_by_id'),
+    )
+
+    @property
+    def departments(self):
+        return [line.strip() for line in (self.department_options or '').splitlines()
+                if line.strip()]
+
+    def accepting_checkins(self, now=None):
+        """Open AND not past its end time — the only test the server uses."""
+        if not self.active:
+            return False
+        if self.ends_at is not None and (now or utcnow_naive()) >= self.ends_at:
+            return False
+        return True
+
+
+class EventCheckin(db.Model):
+    __tablename__ = 'event_checkin'
+
+    id = db.Column(db.Integer, primary_key=True)
+    event_id = db.Column(db.Integer, db.ForeignKey('event_session.id'),
+                         nullable=False)
+    # Random value from a cookie on the attendee's browser. It stops the same
+    # phone checking in twice; it is NOT an identity — clearing cookies or
+    # switching browsers gets a second row, and that is accepted for a
+    # walk-up event.
+    device_token = db.Column(db.String(64), nullable=False)
+    name = db.Column(db.String(100), nullable=False)
+    department = db.Column(db.String(100), nullable=False)
+    checked_in_at = db.Column(db.DateTime, nullable=False, default=utcnow_naive)
+
+    __table_args__ = (
+        # The duplicate guard. Enforced by the database so two taps of the
+        # button racing each other cannot both insert.
+        db.UniqueConstraint('event_id', 'device_token',
+                            name='uq_event_checkin_device'),
+        # Count, newest-first projector feed and paginated attendee list all
+        # walk one event's rows in id order.
+        db.Index('ix_event_checkin_event_id', 'event_id', 'id'),
+    )
