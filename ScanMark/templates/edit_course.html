@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+
+{% macro field_error(name) %}
+{% if errors.get(name) %}<div id="{{ name }}-error" class="invalid-feedback d-block">{{ errors[name] }}</div>{% endif %}
+{% endmacro %}
+
+{% block content %}
+<div class="container page-wrap" style="max-width: 760px;">
+    <div class="page-header">
+        <a href="{{ url_for('lecturer_dashboard', archived=1) if course.archived else url_for('lecturer_dashboard') }}"
+            class="small text-muted"><i class="fas fa-arrow-left me-1" aria-hidden="true"></i>My courses</a>
+        <h1 class="page-title mt-3">Edit course</h1>
+        <p class="page-subtitle">Update {{ course.code }}. Student enrolments, class sessions and attendance records stay with this course.</p>
+    </div>
+
+    <form method="POST" action="{{ url_for('edit_course', course_id=course.id) }}" class="glass-card p-4">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        {% if errors %}<div class="alert alert-danger" role="alert">Please correct the highlighted fields.</div>{% endif %}
+        <div class="row g-3">
+            <div class="col-sm-4">
+                <label for="code" class="form-label">Course code</label>
+                <input id="code" name="code" class="form-control {{ 'is-invalid' if errors.get('code') }}"
+                    value="{{ form.code }}" maxlength="10" required
+                    {% if errors.get('code') %}aria-invalid="true" aria-describedby="code-error"{% endif %}>
+                {{ field_error('code') }}
+            </div>
+            <div class="col-sm-8">
+                <label for="title" class="form-label">Course title</label>
+                <input id="title" name="title" class="form-control {{ 'is-invalid' if errors.get('title') }}"
+                    value="{{ form.title }}" maxlength="100" required
+                    {% if errors.get('title') %}aria-invalid="true" aria-describedby="title-error"{% endif %}>
+                {{ field_error('title') }}
+            </div>
+            <div class="col-sm-6">
+                <label for="academic_year" class="form-label">Academic year</label>
+                <input id="academic_year" name="academic_year" class="form-control {{ 'is-invalid' if errors.get('academic_year') }}"
+                    value="{{ form.academic_year }}" placeholder="2026/2027" maxlength="9" required
+                    {% if errors.get('academic_year') %}aria-invalid="true" aria-describedby="academic_year-error"{% endif %}>
+                {{ field_error('academic_year') }}
+            </div>
+            <div class="col-sm-6">
+                <label for="semester" class="form-label">Semester</label>
+                <select id="semester" name="semester" class="form-select {{ 'is-invalid' if errors.get('semester') }}" required
+                    {% if errors.get('semester') %}aria-invalid="true" aria-describedby="semester-error"{% endif %}>
+                    <option value="">Choose a semester</option>
+                    {% for semester in ('First', 'Second') %}
+                    <option value="{{ semester }}" {% if form.semester == semester %}selected{% endif %}>{{ semester }}</option>
+                    {% endfor %}
+                </select>
+                {{ field_error('semester') }}
+            </div>
+            <div class="col-sm-6">
+                <label for="section" class="form-label">Section <span class="text-muted small">(optional)</span></label>
+                <input id="section" name="section" class="form-control {{ 'is-invalid' if errors.get('section') }}"
+                    value="{{ form.section }}" maxlength="20" placeholder="e.g. A"
+                    {% if errors.get('section') %}aria-invalid="true" aria-describedby="section-error"{% endif %}>
+                {{ field_error('section') }}
+            </div>
+        </div>
+        <div class="d-flex justify-content-end gap-2 mt-4">
+            <a class="btn btn-glass" href="{{ url_for('lecturer_dashboard', archived=1) if course.archived else url_for('lecturer_dashboard') }}">Cancel</a>
+            <button type="submit" class="btn btn-success"><i class="fas fa-check me-1" aria-hidden="true"></i>Save changes</button>
+        </div>
+    </form>
+</div>
+{% endblock %}

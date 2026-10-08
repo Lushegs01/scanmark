@@ -4199,6 +4199,76 @@ def add_course():
     return redirect(url_for('dashboard'))
 
 
+@app.route('/course/<int:course_id>/edit', methods=['GET', 'POST'])
+@login_required
+def edit_course(course_id):
+    course = db.get_or_404(Course, course_id)
+    if not _owns_course(course):
+        abort(403)
+
+    fields = ('code', 'title', 'academic_year', 'semester', 'section')
+    form = {field: getattr(course, field) for field in fields}
+    errors = {}
+    if request.method == 'POST':
+        form = {field: request.form.get(field, '').strip() for field in fields}
+        values = {
+            'code': _clean_course_code(form['code']),
+            'title': _clean_text(form['title'], 101),
+            'academic_year': normalize_academic_year(form['academic_year']),
+            'semester': normalize_semester(form['semester']),
+            'section': _clean_text(form['section'], 21).upper(),
+        }
+        if not values['code'] or len(_clean_text(form['code'], 11)) > 10:
+            errors['code'] = 'Use 1–10 characters: letters, digits, spaces or hyphens.'
+        if not values['title'] or len(values['title']) > 100:
+            errors['title'] = 'Enter a course title of up to 100 characters.'
+        if not values['academic_year']:
+            errors['academic_year'] = 'Enter consecutive years, for example 2026/2027.'
+        if not values['semester']:
+            errors['semester'] = 'Choose First or Second semester.'
+        if len(values['section']) > 20:
+            errors['section'] = 'Use up to 20 characters for the section.'
+        if errors:
+            return render_template('edit_course.html', course=course,
+                                   form=form, errors=errors), 400
+
+        duplicate = Course.query.filter(
+            Course.id != course.id,
+            Course.institution == course.institution,
+            Course.code == values['code'],
+            Course.academic_year == values['academic_year'],
+            Course.semester == values['semester'],
+            Course.section == values['section'],
+        ).first()
+        if duplicate:
+            errors['code'] = 'A course with this code, year, semester and section already exists.'
+            return render_template('edit_course.html', course=course,
+                                   form=form, errors=errors), 409
+
+        before = {field: getattr(course, field) for field in fields}
+        if before != values:
+            for field, value in values.items():
+                setattr(course, field, value)
+            try:
+                # Detect concurrent duplicate edits before adding the audit row.
+                db.session.flush()
+                record_audit('course.update', 'course', course.id,
+                             f'{course.code} {course.title}', course_id=course.id,
+                             before=before, after=values)
+                db.session.commit()
+            except IntegrityError:
+                db.session.rollback()
+                errors['code'] = 'A course with this code, year, semester and section already exists.'
+                return render_template('edit_course.html', course=course,
+                                       form=form, errors=errors), 409
+        flash(f'Course {course.code} updated.', 'success')
+        return redirect(url_for('lecturer_dashboard', archived=1)
+                        if course.archived else url_for('lecturer_dashboard'))
+
+    return render_template('edit_course.html', course=course,
+                           form=form, errors=errors)
+
+
 @app.route('/course/<int:course_id>/archive', methods=['POST'])
 @login_required
 def archive_course(course_id):

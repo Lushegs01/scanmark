@@ -1094,6 +1094,125 @@ class TestCourseAccessControl:
             assert Course.query.get(seed['course_id']) is not None
 
 
+class TestCourseEditing:
+
+    @staticmethod
+    def form(**changes):
+        return {'code': 'CSC301', 'title': 'Algorithms', 'academic_year': '2026/2027',
+                'semester': 'Second', 'section': 'A', **changes}
+
+    def test_creator_can_edit_without_losing_records(self, appmod, seed, login):
+        import json
+        from models import db, Course, Attendance, ClassSession, AuditLog
+        with appmod.app.app_context():
+            course = db.session.get(Course, seed['course_id'])
+            original_institution = course.institution
+            student_ids = [s.id for s in course.students]
+            instructors = [s.id for s in course.instructors]
+            db.session.add(Attendance(student_id=seed['student_id'],
+                                      course_id=course.id, session_id=seed['session_id']))
+            db.session.commit()
+        client = login(seed['coordinator_email'])
+        path = f"/course/{seed['course_id']}/edit"
+        page = client.get(path)
+        assert page.status_code == 200 and b'value="CSC201"' in page.data
+        response = client.post(path, data={**self.form(code=' csc301 ', section=' a '),
+            'coordinator_id': seed['outsider_id'], 'institution': 'unilag.edu.ng'})
+        assert response.status_code == 302
+        with appmod.app.app_context():
+            course = db.session.get(Course, seed['course_id'])
+            assert (course.code, course.title, course.academic_year, course.semester,
+                    course.section) == ('CSC301', 'Algorithms', '2026/2027', 'Second', 'A')
+            assert course.coordinator_id == seed['coordinator_id']
+            assert course.institution == original_institution
+            assert [s.id for s in course.students] == student_ids
+            assert [s.id for s in course.instructors] == instructors
+            assert ClassSession.query.filter_by(course_id=course.id).count() == 1
+            assert Attendance.query.filter_by(course_id=course.id).count() == 1
+            audit = AuditLog.query.filter_by(action='course.update', course_id=course.id).one()
+            assert audit.actor_id == seed['coordinator_id']
+            details = json.loads(audit.details)
+            assert details['before']['code'] == 'CSC201'
+            assert details['after']['code'] == 'CSC301'
+
+    @pytest.mark.parametrize('identity', ['outsider_email', 'lecturer_email', 'student_email'])
+    def test_only_creator_can_read_or_submit_the_form(self, appmod, seed, login, identity):
+        from models import db, Course, User
+        if identity == 'lecturer_email':
+            with appmod.app.app_context():
+                db.session.get(Course, seed['course_id']).instructors.append(
+                    db.session.get(User, seed['lecturer_id']))
+                db.session.commit()
+        client = login(seed[identity])
+        path = f"/course/{seed['course_id']}/edit"
+        assert client.get(path).status_code == 403
+        assert client.post(path, data=self.form()).status_code == 403
+        with appmod.app.app_context():
+            assert db.session.get(Course, seed['course_id']).code == 'CSC201'
+        assert path.encode() not in client.get('/lecturer_dashboard').data
+
+    def test_other_institution_cannot_edit(self, appmod, seed, other_institution, login):
+        client = login(other_institution['coordinator_email'])
+        path = f"/course/{seed['course_id']}/edit"
+        assert client.get(path).status_code == 403
+        assert client.post(path, data=self.form()).status_code == 403
+
+    def test_requires_login_and_csrf(self, appmod, seed, login):
+        import re
+        path = f"/course/{seed['course_id']}/edit"
+        assert appmod.app.test_client().get(path).status_code == 302
+        client = login(seed['coordinator_email'])
+        appmod.app.config['WTF_CSRF_ENABLED'] = True
+        assert client.post(path, data=self.form()).status_code == 400
+        token = re.search(rb'name="csrf_token" value="([^"]+)"', client.get(path).data).group(1).decode()
+        assert client.post(path, data={**self.form(), 'csrf_token': token}).status_code == 302
+
+    @pytest.mark.parametrize('changes', [
+        {'code': 'BAD<script>'}, {'code': 'LONGCODE1234'}, {'title': ''},
+        {'title': 'x' * 101}, {'academic_year': '2026/2029'},
+        {'semester': 'Third'}, {'section': 'a' * 21},
+    ])
+    def test_invalid_details_leave_course_unchanged(self, appmod, seed, login, changes):
+        from models import db, Course, AuditLog
+        client = login(seed['coordinator_email'])
+        response = client.post(f"/course/{seed['course_id']}/edit", data=self.form(**changes))
+        assert response.status_code == 400
+        assert b'Please correct the highlighted fields' in response.data
+        assert b'value="Algorithms"' in response.data or 'title' in changes
+        with appmod.app.app_context():
+            assert db.session.get(Course, seed['course_id']).code == 'CSC201'
+            assert AuditLog.query.filter_by(action='course.update').count() == 0
+
+    def test_duplicate_offering_is_rejected(self, appmod, seed, login):
+        from models import db, Course
+        with appmod.app.app_context():
+            course = db.session.get(Course, seed['course_id'])
+            db.session.add(Course(**self.form(), coordinator_id=course.coordinator_id,
+                                  institution=course.institution))
+            db.session.commit()
+        client = login(seed['coordinator_email'])
+        response = client.post(f"/course/{seed['course_id']}/edit", data=self.form())
+        assert response.status_code == 409 and b'already exists' in response.data
+        with appmod.app.app_context():
+            assert db.session.get(Course, seed['course_id']).code == 'CSC201'
+
+    def test_unchanged_and_archived_courses_can_be_saved(self, appmod, seed, login):
+        from models import db, Course, AuditLog
+        with appmod.app.app_context():
+            course = db.session.get(Course, seed['course_id'])
+            course.archived = True
+            data = {field: getattr(course, field) for field in self.form()}
+            db.session.commit()
+        client = login(seed['coordinator_email'])
+        path = f"/course/{seed['course_id']}/edit"
+        assert path.encode() in client.get('/lecturer_dashboard?archived=1').data
+        response = client.post(path, data=data)
+        assert response.status_code == 302 and 'archived=1' in response.location
+        with appmod.app.app_context():
+            assert db.session.get(Course, seed['course_id']).archived
+            assert AuditLog.query.filter_by(action='course.update').count() == 0
+
+
 class TestSupervisoryAccess:
 
     def _promote(self, appmod, user_id, role, department=None, faculty=None):
