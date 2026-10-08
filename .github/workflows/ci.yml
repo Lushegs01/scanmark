@@ -44,13 +44,15 @@ jobs:
           python -m pyflakes app.py models.py campos_integration.py \
                              localtime.py academic.py \
                              performance.py conftest.py \
-                             test_app.py test_performance.py test_bugfixes.py \
+                             test_app.py test_performance.py test_bugfixes.py test_auth.py \
                              benchmarks/*.py loadtest/*.py
 
       - name: Check the browser JavaScript parses
         run: |
           node --check static/scanner.js
           node --check static/service-worker.js
+          node --check static/auth.js
+          node --test test_auth_browser.cjs
 
       - name: Check every Jinja template compiles
         env:

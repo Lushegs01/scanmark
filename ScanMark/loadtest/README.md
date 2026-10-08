@@ -110,6 +110,40 @@ as `st1, st2, st3…` and three processes produce one student's scans three
 times over. That fails silently — the duplicates come back `409` and count as
 success, and the run reports 2,000 scans against 667 rows.
 
+## Authentication burst
+
+`auth_burst.py` measures **signup or login**, including actual scrypt work.
+Unlike the scan burst's throttled preparation phase, it obtains all form/CSRF
+tokens first and then releases every authentication POST together. Retries
+match the browser's explicit-overload-only policy, with jitter and a 120-second
+deadline. Each simulated phone has its own cookie session. All phones share
+the load generator's public IP, exercising the carrier-NAT case without
+spoofing forwarded headers.
+
+Use a disposable **staging** database and mail sink, with the production
+configuration and all security controls enabled. Install dependencies with
+`pip install -r requirements-loadtest.txt`. Set `STUDENT_PASSWORD` securely in
+the environment. For signup, choose an email domain accepted by staging and
+delivered only to your sink; `{run}` creates a unique cohort on every run.
+
+```bash
+python loadtest/auth_burst.py --host https://staging.example --mode signup \
+  --students 2000 --email-pattern 'burst-{run}-{n}@student.example.edu' \
+  --output /tmp/signup-burst.json
+
+# Seed 2,000 email-verified accounts using the existing load-test seed tools.
+python loadtest/auth_burst.py --host https://staging.example --mode login \
+  --students 2000 --email-pattern 'st{n}@student.example.edu' \
+  --output /tmp/login-burst.json
+```
+
+The command exits nonzero unless all requested students complete successfully.
+The JSON summary includes HTTP statuses (including intermediate overloads),
+final failures and p50/p95/p99 completion times. Existing-account redirects do
+not count as newly created accounts. Check the database count and verification
+email delivery in the sink as well. Repeat through the actual staging proxy;
+local SQLite or mocked password tests are not production-capacity evidence.
+
 ## The scenarios, and why each exists
 
 | Scenario | What it answers |

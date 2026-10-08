@@ -18,7 +18,7 @@ load_dotenv()
 from authlib.integrations.flask_client import OAuth
 from flask import (Flask, render_template, redirect, url_for,
                    flash, request, send_file, jsonify, make_response,
-                   Response, session, abort, stream_with_context)
+                   Response, session, abort, stream_with_context, get_flashed_messages)
 from urllib.parse import urlparse
 from markupsafe import escape
 from flask_login import LoginManager, login_user, login_required, logout_user, current_user
@@ -413,10 +413,10 @@ class HealthcheckMiddleware:
 # `get_remote_address()` returns ONE address for the entire internet and every
 # per-IP limit becomes a single global bucket:
 #
-#   /signup            5 per hour   -> five signups a day for the whole world
-#   /forgot_password  10 per hour   -> ten resets an hour, globally
-#   /resend_verification, /reset_password: the same
-#   the anonymous default            -> one 20,000/min bucket for everybody
+#   login/signup network ceiling -> one 10,000/min bucket for everybody
+#   anonymous default            -> one 20,000/min bucket for everybody
+# Email-keyed limits still distinguish accounts; these network-wide ceilings
+# must see the real peer even though they are generous enough for carrier NAT.
 #
 # That is a capacity bug and a security bug at once. Legitimate students are
 # refused by a counter somebody else filled, and a brute-forcer's per-IP cap
@@ -495,6 +495,9 @@ def set_security_headers(response):
     not add any of these, so without them the app shipped with no HSTS, no
     clickjacking defence and no MIME-sniffing protection.
     """
+    if request.endpoint in ('login', 'signup'):
+        response.headers['Cache-Control'] = 'no-store'
+        response.vary.add('Accept')
     response.headers.setdefault('X-Content-Type-Options', 'nosniff')
     response.headers.setdefault('X-Frame-Options', 'DENY')
     response.headers.setdefault('Referrer-Policy', 'strict-origin-when-cross-origin')
@@ -682,7 +685,8 @@ def _password_hashing_overloaded(_error):
     else:
         flash('Too many people are signing in at once. '
               'Please try again in a moment.', 'warning')
-        response = make_response(render_template('login.html'), 503)
+        template = 'signup.html' if request.endpoint == 'signup' else 'login.html'
+        response = make_response(render_template(template), 503)
     response.headers['Retry-After'] = str(PASSWORD_HASH_RETRY_SECONDS)
     return response, 503
 
@@ -955,9 +959,8 @@ limiter_storage = redis_url or 'memory://'
 # of NAT addresses — so at 5000 students the default per-user allowance is the
 # wrong shape for them. One bucket per (IP, endpoint) shared by 5000 phones
 # opening /login before a 9am lecture would 429 the login page itself. The
-# endpoints where a per-IP cap actually protects something (login POST, signup,
-# password reset, verification resend) each carry their own tight limit, which
-# applies on top of this, so the shared default can afford to be generous.
+# Auth and recovery POSTs carry their own route limits instead of this
+# default. Login/signup combine email limits with a generous network ceiling.
 ANON_DEFAULT_PER_MINUTE = int(os.environ.get('ANON_RATE_LIMIT_PER_MINUTE', 20000))
 ANON_DEFAULT_PER_DAY = int(os.environ.get('ANON_RATE_LIMIT_PER_DAY', 500000))
 
@@ -984,6 +987,43 @@ limiter = Limiter(
     swallow_errors=True,
 )
 print(f"🛡️ Rate Limiter Active (Storage: {limiter_storage.split(':')[0]})")
+
+# An IP identifies a carrier/campus gateway, not a student. Keep the tight
+# signup budget per address, with a separate network ceiling for bulk abuse.
+SIGNUP_EMAIL_RATE_LIMIT = os.environ.get('SIGNUP_EMAIL_RATE_LIMIT', '5 per hour;20 per day')
+AUTH_NETWORK_RATE_LIMIT = os.environ.get('AUTH_NETWORK_RATE_LIMIT', '10000 per minute;100000 per day')
+try:
+    from limits import parse_many as _parse_auth_limits
+    for _auth_name in ('SIGNUP_EMAIL_RATE_LIMIT', 'AUTH_NETWORK_RATE_LIMIT'):
+        if not _parse_auth_limits(globals()[_auth_name]):
+            raise ValueError('at least one limit is required')
+except ValueError as _auth_error:
+    raise StartupError(f'CRITICAL: {_auth_name} is not a valid rate limit') from _auth_error
+
+
+def _signup_email_key():
+    email = (request.form.get('email') or '').strip().lower()
+    return 'signup:' + hashlib.sha256(email.encode()).hexdigest()
+
+
+def _count_auth_attempt(response):
+    # A request rejected before checking credentials must not consume the
+    # student's retry budget. The hashing semaphore still bounds actual work.
+    return response.status_code < 500
+
+
+def _auth_page(template, **context):
+    if request.method == 'POST' and request.accept_mimetypes.best == 'application/json':
+        return jsonify(outcome='form_error',
+                       messages=get_flashed_messages(),
+                       unverified_email=context.get('unverified_email'))
+    return render_template(template, **context)
+
+
+def _auth_redirect(response, **details):
+    if request.accept_mimetypes.best == 'application/json':
+        return jsonify(outcome='success', redirect=response.headers['Location'], **details)
+    return response
 
 # ============================================================
 # FLASK-MAIL CONFIGURATION
@@ -3474,11 +3514,15 @@ def complete_profile():
     "10 per minute",
     methods=["POST"],
     key_func=lambda: f"login:{get_remote_address()}:{(request.form.get('email') or '').strip().lower()}",
+    deduct_when=_count_auth_attempt,
     error_message="Too many login attempts. Please try again later."
 )
+@limiter.limit(lambda: AUTH_NETWORK_RATE_LIMIT, methods=['POST'],
+               key_func=get_remote_address, deduct_when=_count_auth_attempt,
+               error_message='This network is busy. Please wait before trying again.')
 def login():
     if current_user.is_authenticated:
-        return redirect_by_role(current_user.role)
+        return _auth_redirect(redirect_by_role(current_user.role))
 
     if request.method == 'POST':
         email = (request.form.get('email') or '').strip().lower()
@@ -3493,25 +3537,28 @@ def login():
             if account_needs_verification(user):
                 flash("Please confirm your email address first. "
                       "Check your inbox for the verification link.", "warning")
-                return render_template('login.html', unverified_email=email)
+                return _auth_page('login.html', unverified_email=email)
             login_user(user, remember=True)
-            return redirect_by_role(user.role)
+            return _auth_redirect(redirect_by_role(user.role))
         else:
             flash('Invalid email or password.', 'error')
 
-    return render_template('login.html')
+    return _auth_page('login.html')
 
 
 @app.route('/signup', methods=['GET', 'POST'])
-# Account creation is unauthenticated, so it is keyed by IP. The default
-# 1000/minute bucket let one host mint accounts faster than a human ever
-# could; a real person signs up once.
+# Different students must not share a five-attempt allowance just because
+# their mobile carrier presents the same public IP to the application.
 @limiter.limit(
-    "5 per hour;20 per day",
+    lambda: SIGNUP_EMAIL_RATE_LIMIT,
     methods=["POST"],
-    key_func=get_remote_address,
-    error_message="Too many signup attempts from this network. Please try again later."
+    key_func=_signup_email_key,
+    deduct_when=_count_auth_attempt,
+    error_message="Too many signup attempts for this email address. Please try again later."
 )
+@limiter.limit(lambda: AUTH_NETWORK_RATE_LIMIT, methods=['POST'],
+               key_func=get_remote_address, deduct_when=_count_auth_attempt,
+               error_message='This network is busy. Please wait before trying again.')
 def signup():
     if request.method == 'POST':
         name = (request.form.get('full_name') or
@@ -3524,7 +3571,7 @@ def signup():
 
         def reject(message, category='danger'):
             flash(message, category)
-            return render_template('signup.html')
+            return _auth_page('signup.html')
 
         if not name:
             return reject('Please enter your full name!')
@@ -3560,7 +3607,7 @@ def signup():
 
         if User.query.filter_by(email=email).first():
             flash('This email address is already registered!', 'warning')
-            return redirect(url_for('login'))
+            return _auth_redirect(redirect(url_for('login')))
 
         new_user = User(
             full_name=name,
@@ -3582,7 +3629,7 @@ def signup():
             # already spoken for by another account.
             db.session.rollback()
             flash('This email address is already registered!', 'warning')
-            return redirect(url_for('login'))
+            return _auth_redirect(redirect(url_for('login')))
         except Exception:
             db.session.rollback()
             app.logger.exception('Signup failed to persist the new account')
@@ -3598,7 +3645,7 @@ def signup():
         else:
             flash('Account created successfully! You can sign in now — '
                   'welcome to ScanMark.', 'success')
-        return redirect(url_for('login'))
+        return _auth_redirect(redirect(url_for('login')), created=True)
 
     return render_template('signup.html')
 
@@ -7647,6 +7694,8 @@ def csrf_error_handler(error):
     page that says to reload, not a bare 400. Everything else keeps Flask-WTF's
     stock response.
     """
+    if request.endpoint in ('login', 'signup') and request.accept_mimetypes.best == 'application/json':
+        return jsonify(outcome='csrf_expired', message='Please reload this page and try again.'), 400
     if request.path.startswith('/event/') and request.method == 'POST':
         event_row = _find_event((request.view_args or {}).get('token'))
         if event_row is not None:
@@ -7666,20 +7715,19 @@ def ratelimit_handler(e):
     # has just said it cannot take one. The scanner reads this header.
     retry_after = 1
     try:
-        reset = getattr(e, 'reset_at', None) or getattr(e, 'reset', None)
+        reset = limiter.current_limit.reset_at if limiter.current_limit else None
         if reset:
-            retry_after = max(1, int(reset - time.time()))
+            retry_after = max(1, math.ceil(reset - time.time()))
     except (TypeError, ValueError):
         retry_after = 1
-    retry_after = min(60, retry_after)
-
-    if request.is_json:
+    if request.is_json or request.accept_mimetypes.best == 'application/json':
         response = jsonify({
             "status": "error",
             # Same machine-readable contract every other rejection carries.
             # Its absence here meant a rate-limited scan was the one response
             # the client could not classify from `outcome` alone.
             "outcome": "rate_limited",
+            "retry_after": retry_after,
             "message": f"Rate limit exceeded. Please slow down. ({e.description})"
         })
         response.headers['Retry-After'] = str(retry_after)
@@ -7699,7 +7747,8 @@ def ratelimit_handler(e):
     return Response(
         "<h2>Too Many Requests!</h2>"
         f"<p>{escape(str(e.description))}</p>"
-        f"<p>Please wait a minute and <a href='{url_for('dashboard')}'>try again</a>.</p>",
+        f"<p>Please wait {retry_after} seconds before trying again.</p>"
+        f"<p><a href='{url_for(request.endpoint) if request.endpoint in ('login', 'signup') else url_for('dashboard')}'>Return to the form</a></p>",
         status=429, mimetype='text/html',
         headers={'Retry-After': str(retry_after)},
     )

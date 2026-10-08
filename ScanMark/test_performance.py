@@ -854,7 +854,9 @@ def test_every_shed_response_tells_the_client_when_to_come_back(monkeypatch):
         })
     assert last.status_code == 429
     assert last.headers.get('Retry-After'), 'a 429 must say when to return'
-    assert 1 <= int(last.headers['Retry-After']) <= 60
+    # Flask-Limiter rounds reset_at up; allow the extra second rather than
+    # advertising a retry before the actual minute bucket has reset.
+    assert 1 <= int(last.headers['Retry-After']) <= 61
     # And it must be classifiable the same way every other refusal is.
     assert last.get_json()['outcome'] == 'rate_limited'
 
