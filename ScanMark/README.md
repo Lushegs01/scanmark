@@ -103,6 +103,11 @@ roster, its own sessions and its own percentages. Finished terms are archived
 rather than deleted: they keep every record and drop off the working
 dashboards.
 
+Course creators can choose **Edit course** on their dashboard to change the
+code, title, academic year, semester or section. Existing enrolments, instructors,
+sessions and attendance stay attached. Invited instructors cannot edit course
+details, and each change records the previous and new values in the audit log.
+
 Every destructive action — deleting a course or a session, archiving, starting
 and ending meetings — is written to an **append-only audit log**, readable per
 course at `/course/<id>/audit`. The table deliberately carries no foreign keys
