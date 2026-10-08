@@ -3,6 +3,48 @@
 Deployment and rehearsal guide for the 2,000-student lecture-hall target.
 Capacity is accepted only from the staging matrix below.
 
+## Signup and login bursts
+
+Signup used to allow five POSTs per hour **per public IP**. Mobile-carrier
+NAT and campus Wi-Fi can place thousands of students behind one IP. The tight
+limit now belongs to each normalized email; a separate, configurable network
+ceiling allows a cohort through. Raising `ANON_RATE_LIMIT_PER_MINUTE` never
+changed the old route-specific signup limit.
+
+The login and signup forms preserve their fields while retrying an explicit
+`503 auth_overloaded`, with jitter and a two-minute deadline. Passwords stay
+only in the page's memory. Credential errors, 429s and ambiguous network
+failures are not automatically replayed. No-JavaScript forms still work.
+429 responses report the actual bucket reset, including hour/day waits.
+
+Before accepting a deployment for 2,000 students:
+
+1. Set `SCANMARK_ENV=production`; do not deploy the example's development
+   values. Confirm PostgreSQL and Redis are configured and healthy.
+2. Set `TRUSTED_PROXY_COUNT` to the number of trusted proxies that actually
+   rewrite forwarded headers. Check the addresses observed by the application
+   using two independently connected devices. A proxy's address must not be
+   treated as the client. Do not increase the count blindly or trust client-
+   supplied forwarded headers. Separate mobile devices may still share a real
+   public IP; the new limits accommodate that.
+3. Run the [authentication burst rehearsal](loadtest/README.md#authentication-burst)
+   against staging with the production worker count, CPU/RAM allocation,
+   PostgreSQL and Redis. Keep CSRF and rate limiting on. The regression tests
+   prove isolation between 2,000 email addresses, not password throughput.
+4. Verify 2,000 distinct successful results and inspect completion latency,
+   429s, 503s, CPU, memory and database connections. Scale instances before the
+   event if the cohort cannot finish within the two-minute browser deadline;
+   merely increasing hashing concurrency can exhaust RAM without improving
+   throughput. Set `WEB_CONCURRENCY` explicitly when sizing the hash budget.
+5. Use a mail sink for rehearsal, then verify real provider quotas and email
+   delivery separately. Signup currently enqueues both confirmation and welcome
+   mail in a bounded in-process queue. Check for `notification queue full` and
+   delivery failures; creating an account does not prove its verification email
+   arrived. Size `BACKGROUND_QUEUE_MAXSIZE`/`ACCOUNT_EMAIL_WORKERS` for the burst.
+
+No infrastructure setting can be inferred from source code alone. Record the
+deployed commit, proxy configuration and burst results when releasing.
+
 ## Required services
 
 | Service | Why it's required in production |
@@ -234,7 +276,9 @@ quietly at every phone.
 | `MAIL_PORT` | 587 | 587 negotiates STARTTLS, 465 is implicit SSL. The TLS mode follows the port, so 465 no longer opens a plaintext socket and then asks a server that only speaks TLS for STARTTLS. `MAIL_USE_TLS` / `MAIL_USE_SSL` override it. |
 | `MAIL_TIMEOUT` | 15 | Seconds to wait on the mail server. Flask-Mail passes no timeout to smtplib, so without this a host that filters outbound SMTP parks a worker thread on connect indefinitely; four of those and every later message queues and then drops, with nothing in the log because nothing ever failed. |
 | `LOG_LEVEL` | INFO | Level for the app logger. Flask inherits WARNING from the root logger unless something sets it, which silenced the audit trail, the sampled scan telemetry, and every "email sent" line. |
-| `ANON_RATE_LIMIT_PER_MINUTE` / `ANON_RATE_LIMIT_PER_DAY` | 20000 / 500000 | Default budget for *anonymous* requests, which are keyed by IP — one campus NAT is a single key for thousands of phones. Sensitive unauthenticated endpoints carry their own tight per-address limits on top of this. |
+| `ANON_RATE_LIMIT_PER_MINUTE` / `ANON_RATE_LIMIT_PER_DAY` | 20000 / 500000 | Default budget for anonymous requests keyed by IP. Explicit route limits, including login/signup POST limits, override these defaults. |
+| `SIGNUP_EMAIL_RATE_LIMIT` | `5 per hour;20 per day` | Signup POSTs per normalized email across IPs. Students on the same carrier no longer share this allowance. |
+| `AUTH_NETWORK_RATE_LIMIT` | `10000 per minute;100000 per day` | Separate per-IP ceiling on each of login and signup POSTs. Size for carrier NAT, not one phone. Login also retains 10 attempts/minute per IP + normalized email. Server-error responses do not consume these auth allowances. |
 | `BACKGROUND_QUEUE_MAXSIZE` / `BACKGROUND_WORKERS` | 500 / 4 | Sizes the account-email pool (signup links, password resets). `ACCOUNT_EMAIL_WORKERS` overrides the worker count. Nothing is queued during a class, so this pool is idle under scan load. |
 | `ATTENDANCE_TARGET_PERCENT` | 75 | Percentage shown as the target on student dashboards. Display only — nothing is sent when a student falls below it. |
 | `HSTS_MAX_AGE` | 31536000 | `Strict-Transport-Security` max-age, sent in production only. |

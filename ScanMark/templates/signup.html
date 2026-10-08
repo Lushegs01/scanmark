@@ -71,7 +71,7 @@
                     <div class="auth-divider"><span>or</span></div>
 
                     <!-- Signup Form -->
-                    <form method="POST" action="/signup" id="signupForm">
+                    <form method="POST" action="{{ url_for('signup') }}" id="signupForm" data-auth-form>
                         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 
                         <div class="auth-field">
@@ -144,6 +144,7 @@
                                 <i class="fas fa-user-plus"></i>Create Account
                             </button>
                         </div>
+                        <p data-auth-status role="status" aria-live="polite" class="mt-3" hidden></p>
                     </form>
 
                     {# Who actually has to open the confirmation link. Students do;
@@ -171,6 +172,7 @@
     </div>
 </div>
 
+<script src="{{ static_url('auth.js') }}" defer></script>
 <script>
     const emailInput = document.getElementById('emailInput');
     const detectedRoleDiv = document.getElementById('detectedRole');

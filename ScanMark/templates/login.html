@@ -70,7 +70,7 @@
 
                     <div class="auth-divider"><span>or</span></div>
 
-                    <form method="POST" action="/login">
+                    <form method="POST" action="{{ url_for('login') }}" data-auth-form>
                         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 
                         <div class="auth-field">
@@ -98,10 +98,10 @@
                                 <i class="fas fa-right-to-bracket"></i>Login to Dashboard
                             </button>
                         </div>
+                        <p data-auth-status role="status" aria-live="polite" class="mt-3" hidden></p>
                     </form>
 
-                    {% if unverified_email %}
-                    <div class="alert alert-warning auth-note" role="alert">
+                    <div class="alert alert-warning auth-note" role="alert" data-auth-verification {% if not unverified_email %}hidden{% endif %}>
                         <i class="fas fa-envelope-open-text" aria-hidden="true"></i>
                         <div class="flex-grow-1">
                             <p class="mb-2">
@@ -110,14 +110,13 @@
                             </p>
                             <form method="POST" action="{{ url_for('resend_verification') }}">
                                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                                <input type="hidden" name="email" value="{{ unverified_email }}">
+                                <input type="hidden" name="email" value="{{ unverified_email or '' }}">
                                 <button type="submit" class="btn btn-outline-success w-100">
                                     Send a new verification link
                                 </button>
                             </form>
                         </div>
                     </div>
-                    {% endif %}
 
                     <p class="auth-alt">
                         New to ScanMark? <a href="/signup">Create an Account</a>
@@ -130,6 +129,7 @@
     </div>
 </div>
 
+<script src="{{ static_url('auth.js') }}" defer></script>
 <script>
     const toggle = document.getElementById('togglePassword');
     const password = document.getElementById('passwordInput');

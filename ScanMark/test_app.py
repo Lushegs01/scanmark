@@ -218,16 +218,16 @@ class TestSignupCannotMintPrivilege:
         finally:
             appmod.REQUIRE_EMAIL_VERIFICATION = False
 
-    def test_signup_is_rate_limited_per_network(self, appmod):
-        """Only the 1000/minute default stood between one host and bulk accounts."""
+    def test_signup_is_rate_limited_per_email(self, appmod):
+        """Repeated attempts for one address remain bounded on a shared IP."""
         appmod.limiter.enabled = True
         try:
             c = appmod.app.test_client()
             codes = []
             for n in range(8):
                 r = c.post('/signup', data={
-                    'full_name': f'Bulk {n}', 'email': f'bulk{n}@student.funaab.edu.ng',
-                    'password': VALID_PASSWORD,
+                    'full_name': f'Bulk {n}', 'email': 'bulk@student.funaab.edu.ng',
+                    'password': 'too-short',
                 })
                 codes.append(r.status_code)
             assert 429 in codes, codes
