@@ -6136,8 +6136,17 @@ SCAN_LOG_SAMPLE_RATE = max(0.0, min(1.0, float(
 )))
 
 
+def _count_scan_attempt(response):
+    # Server overload is not student misuse. Retrying admission shedding or
+    # a database failure must not exhaust the student's minute allowance.
+    # Invalid QR/location submissions and duplicates still count.
+    return response.status_code < 500 and response.status_code != 429
+
+
 @app.route('/mark_attendance', methods=['POST'])
-@limiter.limit("10 per minute", error_message="Too many scan attempts. Please wait.")
+@limiter.limit("10 per minute", key_func=user_based_rate_limit_key,
+               deduct_when=_count_scan_attempt,
+               error_message="Too many scan attempts. Please wait.")
 @login_required
 def mark_attendance():
     """

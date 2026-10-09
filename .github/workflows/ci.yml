@@ -45,6 +45,7 @@ jobs:
                              localtime.py academic.py \
                              performance.py conftest.py \
                              test_app.py test_performance.py test_bugfixes.py test_auth.py \
+                             test_scan_limits.py test_scan_validation.py \
                              benchmarks/*.py loadtest/*.py
 
       - name: Check the browser JavaScript parses

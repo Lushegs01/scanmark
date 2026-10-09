@@ -3,6 +3,62 @@
 Deployment and rehearsal guide for the 2,000-student lecture-hall target.
 Capacity is accepted only from the staging matrix below.
 
+## Render free plan: 0.1 CPU / 512 MB
+
+This allocation is not validated for 2,000 simultaneous scans. Increasing
+request limits, workers, or timeouts does not increase CPU capacity. There is
+no paid infrastructure upgrade within a $0 budget.
+
+For this small instance, the following is a **conservative starting configuration**
+to rehearse, not a 2,000-student capacity claim. Set these explicitly in the
+Render service environment; `os.cpu_count()` may describe the host instead of
+the service's CPU quota, making automatic worker sizing inappropriate:
+
+```dotenv
+WEB_CONCURRENCY=1
+GUNICORN_THREADS=2
+PASSWORD_HASH_CONCURRENCY=1
+PASSWORD_HASH_MAX_WAIT_SECONDS=0.1
+DB_POOL_SIZE=3
+DB_MAX_OVERFLOW=0
+REDIS_MAX_CONNECTIONS=16
+```
+
+One process limits memory growth; it does not create more throughput. Keep the
+existing PostgreSQL and Redis URLs, secret key, security settings and proxy
+configuration. The start command is `gunicorn --config gunicorn.conf.py app:app`
+from the `ScanMark` root directory. Verify `/healthz` after changing configuration.
+Do not replace durable services with SQLite or in-memory Redis substitutes.
+
+Attendance's 10/minute limit is explicitly keyed by authenticated student, not
+by the whole class or its public IP. Invalid scans and repeated submissions
+still count. Server-side 429/5xx responses do not consume that allowance, so
+overload retries cannot add a second student-level block. This protection
+does not make an overloaded instance capable of accepting the whole class.
+
+### Rehearsal and release evidence
+
+Use a separate staging web service, PostgreSQL database and Redis service with
+the **same plans, region, versions and application settings** as production.
+Use separate credentials, synthetic verified students, a mail sink, and no
+production CampOS integration. Keep CSRF, geofencing and the rate limiter on.
+Do not connect a staging instance to the live database/Redis or load-test the
+live attendance service. Record the deployed commit, resource plans, worker
+settings and database connection limits alongside the result.
+
+Run `loadtest/scan_burst.py` as described in [the load-test guide](loadtest/README.md),
+first with a small fresh cohort to validate setup, then with 2,000 preauthenticated
+students and fresh sessions. Run the generator on another machine. Record the
+JSON report, CPU/memory peaks, restarts, database connections and Redis errors.
+Repeat with projector polling and concurrent login traffic before accepting
+the event workload. Do not reuse session/student pairs across runs.
+
+If separate matching free staging resources are unavailable, mark capacity
+**unverified**. Local unit tests or tests on a faster developer machine cannot
+substitute for it. Until measured, students should log in in advance and scan
+in staggered groups while the projector continues displaying fresh codes;
+group size must come from measurements, not a claimed safe number.
+
 ## Signup and login bursts
 
 Signup used to allow five POSTs per hour **per public IP**. Mobile-carrier

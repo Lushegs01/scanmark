@@ -39,6 +39,27 @@ describes a system nobody is running.
 concurrency. It is a regression signal and is labelled as one. Never quote it
 as user capacity.
 
+### What a passing scan burst now means
+
+`scan_burst.py` requires database access and a **fresh cohort/session pairing**.
+Preflight refuses missing/reused identities or existing attendance for that
+cohort. After the burst it checks each expected student/session pair, ignoring
+unrelated attendance in other classes. Missing or duplicate rows, unavailable
+verification, failed logins, non-200 scan responses, and failed projector polls
+all make the command exit nonzero. JSON includes `passed` and
+`acceptance_errors`.
+
+Every phone uses the same freshly projected token for its class. Each scan
+has the browser's **20-second total request deadline**, not the old harness's
+120-second socket timeout. This is a strict first-attempt rehearsal; it does
+not hide overload behind automatic retries. `--burst-concurrency` below the
+cohort size remains useful for diagnosis, but cannot pass simultaneous-burst
+acceptance. The separate latency SLO in the matrix below is stricter; passing
+this correctness/deadline check alone does not prove that SLO.
+
+The historical performance report predates these checks. Rerun on the actual
+target infrastructure before treating its numbers as release evidence.
+
 ## Which tool, and why there are two
 
 **`scan_burst.py` is the one to reach for first.** Every Locust scenario here

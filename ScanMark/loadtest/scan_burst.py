@@ -54,6 +54,10 @@ import gevent  # noqa: E402
 import requests  # noqa: E402
 import gevent.lock  # noqa: E402
 from gevent.pool import Pool  # noqa: E402
+from sqlalchemy import create_engine  # noqa: E402
+from scan_validation import (  # noqa: E402
+    acceptance_errors, attendance_counts, expected_attendance, verify_attendance,
+)
 
 _METRES_PER_DEGREE_LAT = 111_194.9266
 
@@ -287,21 +291,46 @@ def main():
                              'does. Nothing on the server is relaxed; this '
                              'keeps TLS CPU out of a measurement of the app.')
     parser.add_argument('--database-url', default=os.environ.get('DATABASE_URL', ''),
-                        help='if given, verify the rows the burst actually wrote')
+                        help='required: verify the exact student/session cohort')
     arguments = parser.parse_args()
 
     if not arguments.secret:
         parser.error('--secret (or TARGET_SECRET_KEY) is required: the tool '
                      'mints the QR tokens with the server\'s own algorithm.')
+    if not arguments.database_url:
+        parser.error('--database-url (or DATABASE_URL) is required for correctness checks')
+    if (arguments.students < 1 or arguments.login_concurrency < 1
+            or arguments.burst_concurrency < 0 or arguments.login_noise < 0
+            or arguments.projector_watchers < 0 or arguments.projector_interval <= 0):
+        parser.error('Use positive students/login concurrency/interval and nonnegative concurrency/watchers')
 
     host = arguments.host.rstrip('/')
     verify = not arguments.insecure
     proxy_headers = ({'X-Forwarded-Proto': 'https'}
                      if arguments.proxied_https else {})
-    session_ids = [int(value) for value in str(arguments.session_id).split(',')
-                   if str(value).strip()]
+    try:
+        session_ids = [int(value) for value in str(arguments.session_id).split(',')
+                       if str(value).strip()]
+        if not session_ids or min(session_ids) < 1:
+            raise ValueError()
+    except ValueError:
+        parser.error('--session-id must contain positive integer IDs')
     numbers = list(range(arguments.first_student,
                          arguments.first_student + arguments.students))
+
+    # Check BEFORE any writes. Old attendance must never masquerade as the
+    # result of this burst, and another class's rows must not affect it.
+    engine = create_engine(arguments.database_url)
+    try:
+        expected = expected_attendance(engine, [
+            arguments.email_pattern.format(n=number) for number in numbers
+        ], session_ids)
+        if attendance_counts(engine, expected):
+            parser.error('This cohort already has attendance; use fresh staging sessions')
+    except Exception as error:
+        # Database exceptions can contain credentials/connection strings.
+        parser.error(f'Staging cohort preflight failed ({type(error).__name__}); '
+                     'check database access, student emails and session IDs')
 
     print(f'== {arguments.label}: {arguments.students} students, '
           f'session(s) {session_ids}, host {host} ==')
@@ -335,9 +364,6 @@ def main():
     summarise('login', [phone.login_ms for phone in phones])
     if login_failures:
         print(f'  login failures: {dict(login_failures)}')
-    if not ready:
-        print('  nothing authenticated; aborting before the burst')
-        return 2
 
     # ---------------- Phase 2: the burst (timed) ---------------------------
     latencies = []
@@ -362,17 +388,23 @@ def main():
 
     def _run_scan(phone):
         body = phone.scan_body(arguments.secret, (8, 35), (200, 8000), (150, 2500))
+        # All phones scan the same projected token, including phones delayed
+        # by a concurrency cap. Never mint a fresher QR to conceal queueing.
+        body['qr_data'] = burst_tokens[phone.session_id]
+        body['captured_at'] = burst_captured_at
         request_started = time.perf_counter()
         try:
-            response = phone.session.post(
-                f'{host}/mark_attendance', json=body,
-                headers=proxy_headers | {
-                    'X-CSRFToken': phone.csrf,
-                    'Referer': f'{Phone.origin(host, proxy_headers)}/scan_page'},
-                timeout=120, verify=verify)
-        except requests.RequestException as error:
-            detail = str(getattr(error, 'args', [''])[0])[:70]
-            outcomes[f'transport:{type(error).__name__}: {detail}'] += 1
+            # requests' timeout alone is a socket inactivity timeout, not
+            # the browser's total AbortController deadline.
+            with gevent.Timeout(20):
+                response = phone.session.post(
+                    f'{host}/mark_attendance', json=body,
+                    headers=proxy_headers | {
+                        'X-CSRFToken': phone.csrf,
+                        'Referer': f'{Phone.origin(host, proxy_headers)}/scan_page'},
+                    timeout=20, verify=verify, allow_redirects=False)
+        except (requests.RequestException, gevent.Timeout) as error:
+            outcomes[f'transport:{type(error).__name__}'] += 1
             statuses['transport_error'] += 1
             return
         latencies.append((time.perf_counter() - request_started) * 1000)
@@ -464,9 +496,11 @@ def main():
                 if arguments.burst_concurrency else None)
     greenlets = [gevent.spawn(do_scan, phone) for phone in ready]
     gevent.sleep(0.2)                     # let every greenlet reach the gate
+    burst_tokens = {sid: make_token(arguments.secret, sid) for sid in session_ids}
+    burst_captured_at = time.time() * 1000
     burst_started = time.perf_counter()
     gate.set()                            # release the whole class at once
-    gevent.joinall(greenlets)
+    gevent.joinall(greenlets, raise_error=True)
     burst_wall = time.perf_counter() - burst_started
     noise_stop.set()
     gevent.joinall(noise, timeout=30)
@@ -504,30 +538,23 @@ def main():
 
     # ---------------- Phase 3: what actually landed in the database --------
     verified = {}
-    if arguments.database_url:
-        try:
-            import sqlalchemy
-            engine = sqlalchemy.create_engine(arguments.database_url)
-            with engine.connect() as connection:
-                rows, distinct_students, distinct_pairs = connection.execute(
-                    sqlalchemy.text(
-                        'SELECT count(*), count(DISTINCT student_id), '
-                        'count(DISTINCT (student_id, session_id)) FROM attendance'
-                    )).one()
-            verified = {'rows': rows, 'distinct_students': distinct_students,
-                        'duplicate_rows': rows - distinct_pairs}
-            print('\nPhase 3 — correctness')
-            print(f'  attendance rows      {rows}')
-            print(f'  distinct students    {distinct_students}')
-            print(f'  duplicate (student, session) rows {rows - distinct_pairs}')
-            print(f'  admitted by server   {admitted}')
-            if rows - distinct_pairs:
-                print('  *** DUPLICATE ATTENDANCE — the unique index did not hold')
-            if admitted != rows:
-                print(f'  *** {admitted - rows} scans were told success/duplicate '
-                      f'but are not on the register')
-        except Exception as error:                       # noqa: BLE001
-            print(f'\nPhase 3 — correctness check unavailable: {error}')
+    try:
+        verified = verify_attendance(engine, expected)
+        print('\nPhase 3 — correctness for this cohort only')
+        print(f'  {verified}')
+        print(f'  admitted by server   {admitted}')
+    except Exception as error:                       # noqa: BLE001
+        print(f'\nPhase 3 — correctness check failed ({type(error).__name__})')
+    finally:
+        engine.dispose()
+
+    errors = acceptance_errors(arguments.students, len(ready), outcomes,
+                               statuses, verified, latencies, feed_failures)
+    if arguments.projector_watchers and not feed_latencies:
+        errors.append('projector_not_measured')
+    if arguments.burst_concurrency and arguments.burst_concurrency < arguments.students:
+        errors.append('not_a_simultaneous_full_cohort_burst')
+    print(f'\nAcceptance: {"FAIL: " + ", ".join(errors) if errors else "PASS"}')
 
     if arguments.json_out:
         ordered = sorted(latencies)
@@ -550,12 +577,13 @@ def main():
                 'statuses': {str(key): value for key, value in statuses.items()},
                 'outcomes': dict(outcomes),
                 'verified': verified,
+                'passed': not errors,
+                'acceptance_errors': errors,
+                'projector_failures': dict(feed_failures),
             }, handle, indent=2)
         print(f'\nwrote {arguments.json_out}')
 
-    failures = sum(count for outcome, count in outcomes.items()
-                   if outcome not in ('success', 'duplicate'))
-    return 1 if failures else 0
+    return 1 if errors else 0
 
 
 if __name__ == '__main__':
