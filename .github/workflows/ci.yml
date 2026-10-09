@@ -32,6 +32,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install "gevent>=24.2,<27"
           pip install pyflakes
 
       # Every undefined name that reached main (selectinload, joinedload, json,
@@ -45,8 +46,8 @@ jobs:
                              localtime.py academic.py \
                              performance.py conftest.py \
                              test_app.py test_performance.py test_bugfixes.py test_auth.py \
-                             test_scan_limits.py test_scan_validation.py \
-                             benchmarks/*.py loadtest/*.py
+                             test_scan_limits.py test_scan_validation.py test_staging_guard.py \
+                             benchmarks/*.py loadtest/*.py loadtest/tests/*.py
 
       - name: Check the browser JavaScript parses
         run: |
@@ -128,6 +129,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install "gevent>=24.2,<27"
 
       # Production runs Postgres + Redis, and some code paths (the migration
       # DDL, the Redis-backed QR/session/limiter stores) only exist there.

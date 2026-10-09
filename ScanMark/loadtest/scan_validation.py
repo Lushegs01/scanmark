@@ -4,6 +4,24 @@ from collections import Counter
 from sqlalchemy import bindparam, text
 
 
+def validate_sessions(engine, expected):
+    """Check real, open sessions and verified enrolled students before HTTP writes."""
+    query = text(
+        'SELECT u.id, s.id FROM "user" u '
+        'JOIN enrollments e ON e.user_id = u.id '
+        'JOIN class_session s ON s.course_id = e.course_id '
+        'WHERE u.email_verified = true AND s.active = true AND s.ended_at IS NULL '
+        'AND u.id IN :students AND s.id IN :sessions'
+    ).bindparams(bindparam('students', expanding=True), bindparam('sessions', expanding=True))
+    with engine.connect() as connection:
+        eligible = {tuple(row) for row in connection.execute(query, {
+            'students': sorted({student for student, _ in expected}),
+            'sessions': sorted({session for _, session in expected}),
+        })}
+    if not expected <= eligible:
+        raise ValueError('Cohort requires verified enrollment and open sessions')
+
+
 def expected_attendance(engine, emails, session_ids):
     """Resolve the exact cohort, refusing missing or reused student identities."""
     if not emails or len(set(emails)) != len(emails):
