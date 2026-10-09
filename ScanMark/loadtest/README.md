@@ -7,6 +7,12 @@ These scenarios require seeded staging students, open session ids, the staging
 `SECRET_KEY`, and the classroom pin for those sessions. They intentionally
 create attendance and **must not run against production**.
 
+Use the [guarded benchmark procedure](STAGING_BENCHMARK.md) for the next
+2,000-scan rehearsal, including prerequisites, fresh sessions, repeated scenarios
+and evidence requirements. All `scan_burst.py` invocations now additionally require
+`--staging-manifest`, `--confirm-staging-writes` and a unique `--json-out` path.
+The latency SLO is checked automatically alongside write correctness.
+
 ## The rule this harness exists to enforce
 
 Every request it sends is the request a real phone sends:
@@ -54,8 +60,8 @@ has the browser's **20-second total request deadline**, not the old harness's
 120-second socket timeout. This is a strict first-attempt rehearsal; it does
 not hide overload behind automatic retries. `--burst-concurrency` below the
 cohort size remains useful for diagnosis, but cannot pass simultaneous-burst
-acceptance. The separate latency SLO in the matrix below is stricter; passing
-this correctness/deadline check alone does not prove that SLO.
+acceptance. The separate latency SLO is stricter and now gates `passed` and the exit code;
+`correctness_passed` reports the correctness/deadline check independently.
 
 The historical performance report predates these checks. Rerun on the actual
 target infrastructure before treating its numbers as release evidence.
@@ -79,7 +85,9 @@ once.
 ```bash
 python loadtest/scan_burst.py --host https://staging.example \
     --students 2000 --session-id 1 --secret "$TARGET_SECRET_KEY" \
-    --database-url "$DATABASE_URL"
+    --database-url "$DATABASE_URL" \
+    --staging-manifest /private/run/staging.json --confirm-staging-writes \
+    --json-out /private/run/burst-01.json
 ```
 
 Useful flags:

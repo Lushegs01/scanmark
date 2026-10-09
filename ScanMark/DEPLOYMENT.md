@@ -1,7 +1,9 @@
 # ScanMark Deployment Guide
 
 Deployment and rehearsal guide for the 2,000-student lecture-hall target.
-Capacity is accepted only from the staging matrix below.
+Capacity is accepted only from measured staging evidence. For the next concrete
+2,000-scan rehearsal use the [guarded concurrent benchmark](loadtest/STAGING_BENCHMARK.md).
+Historical scaling estimates below are not current capacity acceptance.
 
 ## Render free plan: 0.1 CPU / 512 MB
 
