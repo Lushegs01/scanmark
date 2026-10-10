@@ -1,0 +1,527 @@
+{
+  "generated_at": "2026-10-10T13:26:26.176Z",
+  "summary": {
+    "checks": 56,
+    "passed": 56,
+    "failed": 0
+  },
+  "live_session": {
+    "id": 19,
+    "course": "CSC 201",
+    "roster": 24,
+    "present": 20
+  },
+  "featured_student": {
+    "name": "Tolu Adeyemi",
+    "matric_no": "DEMO230001",
+    "checked_in_at_utc": "2026-10-10 13:22:46.232888"
+  },
+  "files": {
+    "01-product-dashboard.png": {
+      "bytes": 1017713,
+      "pixels": "3840x2160"
+    },
+    "02-lecturer-session-qr.png": {
+      "bytes": 774747,
+      "pixels": "3840x2160"
+    },
+    "02b-lecturer-live-checkins.png": {
+      "bytes": 809761,
+      "pixels": "3840x2160"
+    },
+    "03-student-checkin.png": {
+      "bytes": 449385,
+      "pixels": "1170x2532"
+    },
+    "04-attendance-confirmation.png": {
+      "bytes": 383249,
+      "pixels": "1170x2532"
+    },
+    "05-attendance-records.png": {
+      "bytes": 692346,
+      "pixels": "3840x2160"
+    },
+    "05b-attendance-records-full.png": {
+      "bytes": 1147807,
+      "pixels": "3840x3636"
+    },
+    "06-dashboard-analytics.png": {
+      "bytes": 769310,
+      "pixels": "3840x2160"
+    },
+    "06b-dashboard-analytics-full.png": {
+      "bytes": 851663,
+      "pixels": "3840x2432"
+    },
+    "07-mobile-experience.png": {
+      "bytes": 536488,
+      "pixels": "1170x2532"
+    },
+    "08-student-checkin-flow.webm": {
+      "bytes": 1349290,
+      "codec": "vp9",
+      "pixels": "1170x2532",
+      "fps": "30/1",
+      "seconds": 19.9
+    },
+    "editing-mezzanine/08-student-checkin-flow.mp4": {
+      "bytes": 1275258,
+      "codec": "h264",
+      "pixels": "1170x2532",
+      "fps": "30/1",
+      "seconds": 19.9
+    },
+    "09-lecturer-dashboard-flow.webm": {
+      "bytes": 2715266,
+      "codec": "vp9",
+      "pixels": "1920x1080",
+      "fps": "30/1",
+      "seconds": 83.6
+    },
+    "editing-mezzanine/09-lecturer-dashboard-flow.mp4": {
+      "bytes": 2774399,
+      "codec": "h264",
+      "pixels": "1920x1080",
+      "fps": "30/1",
+      "seconds": 83.6
+    }
+  },
+  "checks": [
+    {
+      "check": "capture finished without an error",
+      "expected": null,
+      "actual": null,
+      "result": "pass"
+    },
+    {
+      "check": "no failed requests, 5xx responses or page errors",
+      "expected": [],
+      "actual": [],
+      "result": "pass"
+    },
+    {
+      "check": "every account is on the reserved demo domain",
+      "expected": 0,
+      "actual": 0,
+      "result": "pass"
+    },
+    {
+      "check": "every matric number is a DEMO number",
+      "expected": 0,
+      "actual": 0,
+      "result": "pass"
+    },
+    {
+      "check": "every course offering is section DEMO",
+      "expected": 0,
+      "actual": 0,
+      "result": "pass"
+    },
+    {
+      "check": "live session belongs to the demo course",
+      "expected": 1,
+      "actual": 1,
+      "result": "pass"
+    },
+    {
+      "check": "live session was pinned to the demo classroom",
+      "expected": 1,
+      "actual": 1,
+      "result": "pass"
+    },
+    {
+      "check": "live session was ended from the projector (active, ended)",
+      "expected": [
+        0,
+        1
+      ],
+      "actual": [
+        0,
+        1
+      ],
+      "result": "pass"
+    },
+    {
+      "check": "roster snapshot of the live session",
+      "expected": 24,
+      "actual": 24,
+      "result": "pass"
+    },
+    {
+      "check": "featured student has exactly one attendance row in the live session",
+      "expected": true,
+      "actual": true,
+      "result": "pass"
+    },
+    {
+      "check": "featured check-in came from the browser scanner, not the API or the seed",
+      "expected": true,
+      "actual": true,
+      "result": "pass"
+    },
+    {
+      "check": "classmates checked in through /mark_attendance",
+      "expected": 19,
+      "actual": 19,
+      "result": "pass"
+    },
+    {
+      "check": "server answered the camera scan with success",
+      "expected": [
+        200,
+        "success"
+      ],
+      "actual": [
+        200,
+        "success"
+      ],
+      "result": "pass"
+    },
+    {
+      "check": "code the phone decoded is the code the projector showed",
+      "expected": "S19",
+      "actual": "S19",
+      "result": "pass"
+    },
+    {
+      "check": "projected code is for the live session",
+      "expected": "S19",
+      "actual": "S19",
+      "result": "pass"
+    },
+    {
+      "check": "01 dashboard tile \"total classes\"",
+      "expected": "3 total classes",
+      "actual": "3 total classes",
+      "result": "pass"
+    },
+    {
+      "check": "01 dashboard tile \"instructors\"",
+      "expected": "2 instructors",
+      "actual": "2 instructors",
+      "result": "pass"
+    },
+    {
+      "check": "01 dashboard tile \"classes running\"",
+      "expected": "0 classes running",
+      "actual": "0 classes running",
+      "result": "pass"
+    },
+    {
+      "check": "02 projector shows 0 present before anyone scans",
+      "expected": "0",
+      "actual": "0",
+      "result": "pass"
+    },
+    {
+      "check": "02 projector shows the roster size",
+      "expected": "24",
+      "actual": "24",
+      "result": "pass"
+    },
+    {
+      "check": "02 projector names the classroom",
+      "expected": true,
+      "actual": true,
+      "result": "pass"
+    },
+    {
+      "check": "02b featured student is the newest arrival on the projector",
+      "expected": true,
+      "actual": true,
+      "result": "pass"
+    },
+    {
+      "check": "02b projector headcount when the featured student arrived",
+      "expected": "15",
+      "actual": "15",
+      "result": "pass"
+    },
+    {
+      "check": "03 scanner state while the scan is in flight",
+      "expected": true,
+      "actual": true,
+      "result": "pass"
+    },
+    {
+      "check": "04 confirmation banner",
+      "expected": "Attendance marked successfully!",
+      "actual": "Attendance marked successfully!",
+      "result": "pass"
+    },
+    {
+      "check": "04 confirmation is on the featured student's screen",
+      "expected": true,
+      "actual": true,
+      "result": "pass"
+    },
+    {
+      "check": "05 records summary line",
+      "expected": "9 classes held · 24 enrolled now · avg 21 present per class · 189 scans recorded",
+      "actual": "9 classes held · 24 enrolled now · avg 21 present per class · 189 scans recorded",
+      "result": "pass"
+    },
+    {
+      "check": "05 newest session lists every scan",
+      "expected": 20,
+      "actual": 20,
+      "result": "pass"
+    },
+    {
+      "check": "05 newest session includes the featured student",
+      "expected": true,
+      "actual": true,
+      "result": "pass"
+    },
+    {
+      "check": "05 newest session header shows present / roster",
+      "expected": true,
+      "actual": true,
+      "result": "pass"
+    },
+    {
+      "check": "06 chart series = present per session",
+      "expected": [
+        22,
+        18,
+        22,
+        20,
+        23,
+        20,
+        22,
+        22,
+        20
+      ],
+      "actual": [
+        22,
+        18,
+        22,
+        20,
+        23,
+        20,
+        22,
+        22,
+        20
+      ],
+      "result": "pass"
+    },
+    {
+      "check": "06 chart rates = present / that day's roster",
+      "expected": [
+        92,
+        75,
+        92,
+        83,
+        96,
+        83,
+        92,
+        92,
+        83
+      ],
+      "actual": [
+        92,
+        75,
+        92,
+        83,
+        96,
+        83,
+        92,
+        92,
+        83
+      ],
+      "result": "pass"
+    },
+    {
+      "check": "06 peak tile",
+      "expected": "23 Students",
+      "actual": "23 Students",
+      "result": "pass"
+    },
+    {
+      "check": "06 average tile",
+      "expected": "~21 / class",
+      "actual": "~21 / class",
+      "result": "pass"
+    },
+    {
+      "check": "06 chart canvas actually drew",
+      "expected": true,
+      "actual": true,
+      "result": "pass"
+    },
+    {
+      "check": "07 student's classes-attended tile",
+      "expected": true,
+      "actual": true,
+      "result": "pass"
+    },
+    {
+      "check": "07 student's record row shows attended / held and %",
+      "expected": "8 / 9 … 89%",
+      "actual": "CSC 201 Data Structures and Algorithms 2026/2027 First Semester · Section DEMO 8 / 9 89% · On Track",
+      "result": "pass"
+    },
+    {
+      "check": "01-product-dashboard.png is a PNG of the expected size",
+      "expected": [
+        3840,
+        2160
+      ],
+      "actual": [
+        3840,
+        2160
+      ],
+      "result": "pass"
+    },
+    {
+      "check": "02-lecturer-session-qr.png is a PNG of the expected size",
+      "expected": [
+        3840,
+        2160
+      ],
+      "actual": [
+        3840,
+        2160
+      ],
+      "result": "pass"
+    },
+    {
+      "check": "02b-lecturer-live-checkins.png is a PNG of the expected size",
+      "expected": [
+        3840,
+        2160
+      ],
+      "actual": [
+        3840,
+        2160
+      ],
+      "result": "pass"
+    },
+    {
+      "check": "03-student-checkin.png is a PNG of the expected size",
+      "expected": [
+        1170,
+        2532
+      ],
+      "actual": [
+        1170,
+        2532
+      ],
+      "result": "pass"
+    },
+    {
+      "check": "04-attendance-confirmation.png is a PNG of the expected size",
+      "expected": [
+        1170,
+        2532
+      ],
+      "actual": [
+        1170,
+        2532
+      ],
+      "result": "pass"
+    },
+    {
+      "check": "05-attendance-records.png is a PNG of the expected size",
+      "expected": [
+        3840,
+        2160
+      ],
+      "actual": [
+        3840,
+        2160
+      ],
+      "result": "pass"
+    },
+    {
+      "check": "05b-attendance-records-full.png is a PNG of the expected size",
+      "expected": "any",
+      "actual": "any",
+      "result": "pass"
+    },
+    {
+      "check": "06-dashboard-analytics.png is a PNG of the expected size",
+      "expected": [
+        3840,
+        2160
+      ],
+      "actual": [
+        3840,
+        2160
+      ],
+      "result": "pass"
+    },
+    {
+      "check": "06b-dashboard-analytics-full.png is a PNG of the expected size",
+      "expected": "any",
+      "actual": "any",
+      "result": "pass"
+    },
+    {
+      "check": "07-mobile-experience.png is a PNG of the expected size",
+      "expected": [
+        1170,
+        2532
+      ],
+      "actual": [
+        1170,
+        2532
+      ],
+      "result": "pass"
+    },
+    {
+      "check": "08-student-checkin-flow.webm decodes and runs > 15 s",
+      "expected": "> 15 s",
+      "actual": 19.9,
+      "result": "pass"
+    },
+    {
+      "check": "08-student-checkin-flow.webm resolution",
+      "expected": "1170x2532",
+      "actual": "1170x2532",
+      "result": "pass"
+    },
+    {
+      "check": "08-student-checkin-flow.mp4 decodes and runs > 15 s",
+      "expected": "> 15 s",
+      "actual": 19.9,
+      "result": "pass"
+    },
+    {
+      "check": "08-student-checkin-flow.mp4 resolution",
+      "expected": "1170x2532",
+      "actual": "1170x2532",
+      "result": "pass"
+    },
+    {
+      "check": "09-lecturer-dashboard-flow.webm decodes and runs > 15 s",
+      "expected": "> 15 s",
+      "actual": 83.6,
+      "result": "pass"
+    },
+    {
+      "check": "09-lecturer-dashboard-flow.webm resolution",
+      "expected": "1920x1080",
+      "actual": "1920x1080",
+      "result": "pass"
+    },
+    {
+      "check": "09-lecturer-dashboard-flow.mp4 decodes and runs > 15 s",
+      "expected": "> 15 s",
+      "actual": 83.6,
+      "result": "pass"
+    },
+    {
+      "check": "09-lecturer-dashboard-flow.mp4 resolution",
+      "expected": "1920x1080",
+      "actual": "1920x1080",
+      "result": "pass"
+    },
+    {
+      "check": "no run password or SECRET_KEY anywhere in the package",
+      "expected": [],
+      "actual": [],
+      "result": "pass"
+    }
+  ]
+}

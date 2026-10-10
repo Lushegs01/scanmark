@@ -1,0 +1,11 @@
+{
+  "name": "scanmark-demo-capture",
+  "private": true,
+  "description": "Playwright capture of the ScanMark demo-asset package. See ../README.md.",
+  "scripts": {
+    "capture": "bash run_demo.sh"
+  },
+  "devDependencies": {
+    "playwright": "1.56.1"
+  }
+}

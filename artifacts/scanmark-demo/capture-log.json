@@ -1,0 +1,645 @@
+{
+  "started_at": "2026-10-10T13:22:07.456Z",
+  "base_url": "http://127.0.0.1:8100",
+  "assets": {
+    "01-product-dashboard.png": {
+      "kind": "screenshot",
+      "url": "/lecturer_dashboard",
+      "facts": {
+        "stat_tiles": [
+          "📚 3 TOTAL CLASSES",
+          "👥 2 INSTRUCTORS",
+          "🔴 0 CLASSES RUNNING"
+        ],
+        "courses": [
+          "CSC 201",
+          "CSC 205",
+          "CSC 211"
+        ]
+      },
+      "full_page": false
+    },
+    "02-lecturer-session-qr.png": {
+      "kind": "screenshot",
+      "url": "/session/19/qr",
+      "facts": {
+        "heading": "CSC 201 — Data Structures and Algorithms",
+        "session": "Lecture on 10 Oct 2026",
+        "roster_line": "2026/2027 First Semester · Section DEMO · 24 students on today's roster",
+        "classroom": "Lecture Theatre 2 ✅",
+        "present": "0",
+        "enrolled": "24"
+      },
+      "full_page": false
+    },
+    "03-student-checkin.png": {
+      "kind": "screenshot",
+      "url": "/scan_page",
+      "facts": {
+        "scanner_status": "Marking attendance...",
+        "camera_frame": "1280x720"
+      }
+    },
+    "04-attendance-confirmation.png": {
+      "kind": "screenshot",
+      "url": "/scan_page",
+      "facts": {
+        "banner": "Attendance marked successfully!",
+        "signed_in_as": "Welcome back, Tolu Adeyemi"
+      }
+    },
+    "07-mobile-experience.png": {
+      "kind": "screenshot",
+      "url": "/student_dashboard",
+      "facts": {
+        "stat_tiles": [
+          "📚 1 COURSES",
+          "✅ 8 CLASSES ATTENDED"
+        ],
+        "records_row": "CSC 201 Data Structures and Algorithms 2026/2027 First Semester · Section DEMO 8 / 9 89% · On Track"
+      }
+    },
+    "02b-lecturer-live-checkins.png": {
+      "kind": "screenshot",
+      "url": "/session/19/qr",
+      "facts": {
+        "present": "15",
+        "enrolled": "24",
+        "newest": "Tolu Adeyemi Matric: DEMO230001 | Level: 200 02:22 PM"
+      },
+      "full_page": false
+    },
+    "05-attendance-records.png": {
+      "kind": "screenshot",
+      "url": "/course/1/attendance",
+      "facts": {
+        "summary": "9 classes held · 24 enrolled now · avg 21 present per class · 189 scans recorded",
+        "first_session_header": "Lecture on 10 Oct 2026 Saturday, 10 October 2026, 02:22 PM 20 / 24 present (83%)",
+        "first_session_rows": 20,
+        "names_in_first_session": [
+          "1 Chiamaka Nwosu DEMO230002 200L 02:22 PM",
+          "2 Ibrahim Musa DEMO230003 200L 02:22 PM",
+          "3 Funke Adebayo DEMO230004 200L 02:22 PM",
+          "4 Emeka Eze DEMO230005 200L 02:22 PM",
+          "5 Aisha Bello DEMO230006 200L 02:22 PM",
+          "6 Daniel Okon DEMO230007 200L 02:22 PM",
+          "7 Ngozi Okeke DEMO230008 200L 02:22 PM",
+          "8 Halima Abubakar DEMO230010 200L 02:22 PM",
+          "9 Bisi Ogunleye DEMO230012 200L 02:22 PM",
+          "10 Yusuf Lawal DEMO230013 200L 02:22 PM",
+          "11 Grace Etim DEMO230014 200L 02:22 PM",
+          "12 Chidi Anyanwu DEMO230015 200L 02:22 PM",
+          "13 Zainab Sani DEMO230016 200L 02:22 PM",
+          "14 Femi Akinola DEMO230017 200L 02:22 PM",
+          "15 Tolu Adeyemi DEMO230001 200L 02:22 PM",
+          "16 Precious Udo DEMO230018 200L 02:23 PM",
+          "17 Tunde Alabi DEMO230019 200L 02:23 PM",
+          "18 Ifeoma Chukwu DEMO230020 200L 02:23 PM",
+          "19 Seun Oladipo DEMO230023 200L 02:23 PM",
+          "20 Amina Yusuf DEMO230024 200L 02:23 PM"
+        ]
+      },
+      "full_page": false
+    },
+    "05b-attendance-records-full.png": {
+      "kind": "screenshot",
+      "url": "/course/1/attendance",
+      "facts": {
+        "summary": "9 classes held · 24 enrolled now · avg 21 present per class · 189 scans recorded",
+        "first_session_header": "Lecture on 10 Oct 2026 Saturday, 10 October 2026, 02:22 PM 20 / 24 present (83%)",
+        "first_session_rows": 20,
+        "names_in_first_session": [
+          "1 Chiamaka Nwosu DEMO230002 200L 02:22 PM",
+          "2 Ibrahim Musa DEMO230003 200L 02:22 PM",
+          "3 Funke Adebayo DEMO230004 200L 02:22 PM",
+          "4 Emeka Eze DEMO230005 200L 02:22 PM",
+          "5 Aisha Bello DEMO230006 200L 02:22 PM",
+          "6 Daniel Okon DEMO230007 200L 02:22 PM",
+          "7 Ngozi Okeke DEMO230008 200L 02:22 PM",
+          "8 Halima Abubakar DEMO230010 200L 02:22 PM",
+          "9 Bisi Ogunleye DEMO230012 200L 02:22 PM",
+          "10 Yusuf Lawal DEMO230013 200L 02:22 PM",
+          "11 Grace Etim DEMO230014 200L 02:22 PM",
+          "12 Chidi Anyanwu DEMO230015 200L 02:22 PM",
+          "13 Zainab Sani DEMO230016 200L 02:22 PM",
+          "14 Femi Akinola DEMO230017 200L 02:22 PM",
+          "15 Tolu Adeyemi DEMO230001 200L 02:22 PM",
+          "16 Precious Udo DEMO230018 200L 02:23 PM",
+          "17 Tunde Alabi DEMO230019 200L 02:23 PM",
+          "18 Ifeoma Chukwu DEMO230020 200L 02:23 PM",
+          "19 Seun Oladipo DEMO230023 200L 02:23 PM",
+          "20 Amina Yusuf DEMO230024 200L 02:23 PM"
+        ]
+      },
+      "full_page": true
+    },
+    "06-dashboard-analytics.png": {
+      "kind": "screenshot",
+      "url": "/course/1/analytics",
+      "facts": {
+        "peak": "23 Students",
+        "average": "~21 / class",
+        "series": [
+          22,
+          18,
+          22,
+          20,
+          23,
+          20,
+          22,
+          22,
+          20
+        ],
+        "rates": [
+          92,
+          75,
+          92,
+          83,
+          96,
+          83,
+          92,
+          92,
+          83
+        ],
+        "labels": [
+          "Sep 14",
+          "Sep 16",
+          "Sep 21",
+          "Sep 23",
+          "Sep 28",
+          "Sep 30",
+          "Oct 05",
+          "Oct 07",
+          "Oct 10"
+        ],
+        "chart_drawn": true
+      },
+      "full_page": false
+    },
+    "06b-dashboard-analytics-full.png": {
+      "kind": "screenshot",
+      "url": "/course/1/analytics",
+      "facts": {
+        "peak": "23 Students",
+        "average": "~21 / class",
+        "series": [
+          22,
+          18,
+          22,
+          20,
+          23,
+          20,
+          22,
+          22,
+          20
+        ],
+        "rates": [
+          92,
+          75,
+          92,
+          83,
+          96,
+          83,
+          92,
+          92,
+          83
+        ],
+        "labels": [
+          "Sep 14",
+          "Sep 16",
+          "Sep 21",
+          "Sep 23",
+          "Sep 28",
+          "Sep 30",
+          "Oct 05",
+          "Oct 07",
+          "Oct 10"
+        ],
+        "chart_drawn": true
+      },
+      "full_page": true
+    },
+    "08-student-checkin-flow.webm": {
+      "kind": "video",
+      "seconds": 18.7,
+      "source_frames": 58,
+      "mezzanine": "editing-mezzanine/08-student-checkin-flow.mp4"
+    },
+    "09-lecturer-dashboard-flow.webm": {
+      "kind": "video",
+      "seconds": 83.5,
+      "source_frames": 1196,
+      "mezzanine": "editing-mezzanine/09-lecturer-dashboard-flow.mp4"
+    }
+  },
+  "events": [
+    {
+      "t": "2026-10-10T13:22:12.751Z",
+      "event": "signed_in",
+      "lecturer": "Dr. Amara Okafor",
+      "student": "Tolu Adeyemi",
+      "classmates": 19
+    },
+    {
+      "t": "2026-10-10T13:22:13.206Z",
+      "event": "recording.start",
+      "name": "09-lecturer-dashboard-flow"
+    },
+    {
+      "t": "2026-10-10T13:22:15.140Z",
+      "event": "screenshot",
+      "name": "01-product-dashboard.png",
+      "facts": {
+        "stat_tiles": [
+          "📚 3 TOTAL CLASSES",
+          "👥 2 INSTRUCTORS",
+          "🔴 0 CLASSES RUNNING"
+        ],
+        "courses": [
+          "CSC 201",
+          "CSC 205",
+          "CSC 211"
+        ]
+      }
+    },
+    {
+      "t": "2026-10-10T13:22:19.223Z",
+      "event": "screenshot",
+      "name": "02-lecturer-session-qr.png",
+      "facts": {
+        "heading": "CSC 201 — Data Structures and Algorithms",
+        "session": "Lecture on 10 Oct 2026",
+        "roster_line": "2026/2027 First Semester · Section DEMO · 24 students on today's roster",
+        "classroom": "Lecture Theatre 2 ✅",
+        "present": "0",
+        "enrolled": "24"
+      }
+    },
+    {
+      "t": "2026-10-10T13:22:21.370Z",
+      "event": "classmate.checked_in",
+      "name": "Chiamaka Nwosu",
+      "outcome": "success"
+    },
+    {
+      "t": "2026-10-10T13:22:22.036Z",
+      "event": "classmate.checked_in",
+      "name": "Ibrahim Musa",
+      "outcome": "success"
+    },
+    {
+      "t": "2026-10-10T13:22:22.842Z",
+      "event": "classmate.checked_in",
+      "name": "Funke Adebayo",
+      "outcome": "success"
+    },
+    {
+      "t": "2026-10-10T13:22:24.890Z",
+      "event": "classmate.checked_in",
+      "name": "Emeka Eze",
+      "outcome": "success"
+    },
+    {
+      "t": "2026-10-10T13:22:25.990Z",
+      "event": "classmate.checked_in",
+      "name": "Aisha Bello",
+      "outcome": "success"
+    },
+    {
+      "t": "2026-10-10T13:22:26.707Z",
+      "event": "classmate.checked_in",
+      "name": "Daniel Okon",
+      "outcome": "success"
+    },
+    {
+      "t": "2026-10-10T13:22:27.558Z",
+      "event": "classmate.checked_in",
+      "name": "Ngozi Okeke",
+      "outcome": "success"
+    },
+    {
+      "t": "2026-10-10T13:22:28.547Z",
+      "event": "classmate.checked_in",
+      "name": "Halima Abubakar",
+      "outcome": "success"
+    },
+    {
+      "t": "2026-10-10T13:22:29.701Z",
+      "event": "classmate.checked_in",
+      "name": "Bisi Ogunleye",
+      "outcome": "success"
+    },
+    {
+      "t": "2026-10-10T13:22:30.476Z",
+      "event": "classmate.checked_in",
+      "name": "Yusuf Lawal",
+      "outcome": "success"
+    },
+    {
+      "t": "2026-10-10T13:22:31.380Z",
+      "event": "classmate.checked_in",
+      "name": "Grace Etim",
+      "outcome": "success"
+    },
+    {
+      "t": "2026-10-10T13:22:32.419Z",
+      "event": "classmate.checked_in",
+      "name": "Chidi Anyanwu",
+      "outcome": "success"
+    },
+    {
+      "t": "2026-10-10T13:22:33.092Z",
+      "event": "classmate.checked_in",
+      "name": "Zainab Sani",
+      "outcome": "success"
+    },
+    {
+      "t": "2026-10-10T13:22:33.905Z",
+      "event": "classmate.checked_in",
+      "name": "Femi Akinola",
+      "outcome": "success"
+    },
+    {
+      "t": "2026-10-10T13:22:36.501Z",
+      "event": "recording.start",
+      "name": "08-student-checkin-flow"
+    },
+    {
+      "t": "2026-10-10T13:22:39.004Z",
+      "event": "student.dashboard_before",
+      "stat_tiles": [
+        "📚 1 COURSES",
+        "✅ 7 CLASSES ATTENDED"
+      ]
+    },
+    {
+      "t": "2026-10-10T13:22:43.601Z",
+      "event": "camera.feed_written",
+      "token_session": "S19",
+      "token_issued": "1791638562"
+    },
+    {
+      "t": "2026-10-10T13:22:45.017Z",
+      "event": "screenshot",
+      "name": "03-student-checkin.png",
+      "facts": {
+        "scanner_status": "Marking attendance...",
+        "camera_frame": "1280x720"
+      }
+    },
+    {
+      "t": "2026-10-10T13:22:46.275Z",
+      "event": "student.scan_response",
+      "http_status": 200,
+      "outcome": "success",
+      "message": "Attendance marked successfully!",
+      "projected_session": "S19",
+      "decoded_session": "S19",
+      "sent_location": {
+        "lat": 6.515361696011499,
+        "lon": 3.3894,
+        "accuracy_m": 9
+      },
+      "request_held_for_screenshot": true
+    },
+    {
+      "t": "2026-10-10T13:22:47.351Z",
+      "event": "screenshot",
+      "name": "04-attendance-confirmation.png",
+      "facts": {
+        "banner": "Attendance marked successfully!",
+        "signed_in_as": "Welcome back, Tolu Adeyemi"
+      }
+    },
+    {
+      "t": "2026-10-10T13:22:55.334Z",
+      "event": "recording.stop",
+      "name": "08-student-checkin-flow",
+      "frames": 58
+    },
+    {
+      "t": "2026-10-10T13:22:56.313Z",
+      "event": "screenshot",
+      "name": "07-mobile-experience.png",
+      "facts": {
+        "stat_tiles": [
+          "📚 1 COURSES",
+          "✅ 8 CLASSES ATTENDED"
+        ],
+        "records_row": "CSC 201 Data Structures and Algorithms 2026/2027 First Semester · Section DEMO 8 / 9 89% · On Track"
+      }
+    },
+    {
+      "t": "2026-10-10T13:23:01.176Z",
+      "event": "screenshot",
+      "name": "02b-lecturer-live-checkins.png",
+      "facts": {
+        "present": "15",
+        "enrolled": "24",
+        "newest": "Tolu Adeyemi Matric: DEMO230001 | Level: 200 02:22 PM"
+      }
+    },
+    {
+      "t": "2026-10-10T13:23:02.699Z",
+      "event": "classmate.checked_in",
+      "name": "Precious Udo",
+      "outcome": "success"
+    },
+    {
+      "t": "2026-10-10T13:23:04.170Z",
+      "event": "classmate.checked_in",
+      "name": "Tunde Alabi",
+      "outcome": "success"
+    },
+    {
+      "t": "2026-10-10T13:23:05.254Z",
+      "event": "classmate.checked_in",
+      "name": "Ifeoma Chukwu",
+      "outcome": "success"
+    },
+    {
+      "t": "2026-10-10T13:23:06.569Z",
+      "event": "classmate.checked_in",
+      "name": "Seun Oladipo",
+      "outcome": "success"
+    },
+    {
+      "t": "2026-10-10T13:23:08.071Z",
+      "event": "classmate.checked_in",
+      "name": "Amina Yusuf",
+      "outcome": "success"
+    },
+    {
+      "t": "2026-10-10T13:23:15.932Z",
+      "event": "screenshot",
+      "name": "05-attendance-records.png",
+      "facts": {
+        "summary": "9 classes held · 24 enrolled now · avg 21 present per class · 189 scans recorded",
+        "first_session_header": "Lecture on 10 Oct 2026 Saturday, 10 October 2026, 02:22 PM 20 / 24 present (83%)",
+        "first_session_rows": 20,
+        "names_in_first_session": [
+          "1 Chiamaka Nwosu DEMO230002 200L 02:22 PM",
+          "2 Ibrahim Musa DEMO230003 200L 02:22 PM",
+          "3 Funke Adebayo DEMO230004 200L 02:22 PM",
+          "4 Emeka Eze DEMO230005 200L 02:22 PM",
+          "5 Aisha Bello DEMO230006 200L 02:22 PM",
+          "6 Daniel Okon DEMO230007 200L 02:22 PM",
+          "7 Ngozi Okeke DEMO230008 200L 02:22 PM",
+          "8 Halima Abubakar DEMO230010 200L 02:22 PM",
+          "9 Bisi Ogunleye DEMO230012 200L 02:22 PM",
+          "10 Yusuf Lawal DEMO230013 200L 02:22 PM",
+          "11 Grace Etim DEMO230014 200L 02:22 PM",
+          "12 Chidi Anyanwu DEMO230015 200L 02:22 PM",
+          "13 Zainab Sani DEMO230016 200L 02:22 PM",
+          "14 Femi Akinola DEMO230017 200L 02:22 PM",
+          "15 Tolu Adeyemi DEMO230001 200L 02:22 PM",
+          "16 Precious Udo DEMO230018 200L 02:23 PM",
+          "17 Tunde Alabi DEMO230019 200L 02:23 PM",
+          "18 Ifeoma Chukwu DEMO230020 200L 02:23 PM",
+          "19 Seun Oladipo DEMO230023 200L 02:23 PM",
+          "20 Amina Yusuf DEMO230024 200L 02:23 PM"
+        ]
+      }
+    },
+    {
+      "t": "2026-10-10T13:23:18.718Z",
+      "event": "screenshot",
+      "name": "05b-attendance-records-full.png",
+      "facts": {
+        "summary": "9 classes held · 24 enrolled now · avg 21 present per class · 189 scans recorded",
+        "first_session_header": "Lecture on 10 Oct 2026 Saturday, 10 October 2026, 02:22 PM 20 / 24 present (83%)",
+        "first_session_rows": 20,
+        "names_in_first_session": [
+          "1 Chiamaka Nwosu DEMO230002 200L 02:22 PM",
+          "2 Ibrahim Musa DEMO230003 200L 02:22 PM",
+          "3 Funke Adebayo DEMO230004 200L 02:22 PM",
+          "4 Emeka Eze DEMO230005 200L 02:22 PM",
+          "5 Aisha Bello DEMO230006 200L 02:22 PM",
+          "6 Daniel Okon DEMO230007 200L 02:22 PM",
+          "7 Ngozi Okeke DEMO230008 200L 02:22 PM",
+          "8 Halima Abubakar DEMO230010 200L 02:22 PM",
+          "9 Bisi Ogunleye DEMO230012 200L 02:22 PM",
+          "10 Yusuf Lawal DEMO230013 200L 02:22 PM",
+          "11 Grace Etim DEMO230014 200L 02:22 PM",
+          "12 Chidi Anyanwu DEMO230015 200L 02:22 PM",
+          "13 Zainab Sani DEMO230016 200L 02:22 PM",
+          "14 Femi Akinola DEMO230017 200L 02:22 PM",
+          "15 Tolu Adeyemi DEMO230001 200L 02:22 PM",
+          "16 Precious Udo DEMO230018 200L 02:23 PM",
+          "17 Tunde Alabi DEMO230019 200L 02:23 PM",
+          "18 Ifeoma Chukwu DEMO230020 200L 02:23 PM",
+          "19 Seun Oladipo DEMO230023 200L 02:23 PM",
+          "20 Amina Yusuf DEMO230024 200L 02:23 PM"
+        ]
+      }
+    },
+    {
+      "t": "2026-10-10T13:23:30.250Z",
+      "event": "screenshot",
+      "name": "06-dashboard-analytics.png",
+      "facts": {
+        "peak": "23 Students",
+        "average": "~21 / class",
+        "series": [
+          22,
+          18,
+          22,
+          20,
+          23,
+          20,
+          22,
+          22,
+          20
+        ],
+        "rates": [
+          92,
+          75,
+          92,
+          83,
+          96,
+          83,
+          92,
+          92,
+          83
+        ],
+        "labels": [
+          "Sep 14",
+          "Sep 16",
+          "Sep 21",
+          "Sep 23",
+          "Sep 28",
+          "Sep 30",
+          "Oct 05",
+          "Oct 07",
+          "Oct 10"
+        ],
+        "chart_drawn": true
+      }
+    },
+    {
+      "t": "2026-10-10T13:23:36.778Z",
+      "event": "screenshot",
+      "name": "06b-dashboard-analytics-full.png",
+      "facts": {
+        "peak": "23 Students",
+        "average": "~21 / class",
+        "series": [
+          22,
+          18,
+          22,
+          20,
+          23,
+          20,
+          22,
+          22,
+          20
+        ],
+        "rates": [
+          92,
+          75,
+          92,
+          83,
+          96,
+          83,
+          92,
+          92,
+          83
+        ],
+        "labels": [
+          "Sep 14",
+          "Sep 16",
+          "Sep 21",
+          "Sep 23",
+          "Sep 28",
+          "Sep 30",
+          "Oct 05",
+          "Oct 07",
+          "Oct 10"
+        ],
+        "chart_drawn": true
+      }
+    },
+    {
+      "t": "2026-10-10T13:23:36.788Z",
+      "event": "recording.stop",
+      "name": "09-lecturer-dashboard-flow",
+      "frames": 1196
+    }
+  ],
+  "live_session_id": 19,
+  "featured_scan": {
+    "http_status": 200,
+    "outcome": "success",
+    "message": "Attendance marked successfully!",
+    "projected_session": "S19",
+    "decoded_session": "S19",
+    "sent_location": {
+      "lat": 6.515361696011499,
+      "lon": 3.3894,
+      "accuracy_m": 9
+    },
+    "request_held_for_screenshot": true
+  },
+  "failures": [],
+  "finished_at": "2026-10-10T13:26:26.176Z"
+}
