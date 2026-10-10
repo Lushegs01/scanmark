@@ -2,6 +2,7 @@
 
 Product screenshots and screen recordings of the **real ScanMark application**, captured by Playwright for a 30-second launch film. Nothing in the image and video assets is a mock-up. Each one comes from the Flask app in `ScanMark/` (commit `2e5e488`), booted locally with its own Procfile command against an isolated, fictional dataset. Every figure on screen was checked against the database it came from (see `verification.json`).
 
+- **The finished film:** [`../scanmark-launch-film.mp4`](../scanmark-launch-film.mp4), 30 s, 1920×1080, built from these captures by the Remotion project in [`../../video`](../../video). Its cut follows the 30-second brief rather than every beat of this shot list.
 - **Shot list for the film:** [`SHOT_LIST.md`](SHOT_LIST.md)
 - **Proof the figures are right:** [`verification.json`](verification.json) (checks against the database) and [`capture-log.json`](capture-log.json) (what was on screen at each still, plus a timestamped event log)
 - **Rebuild everything:** [`tooling/run_demo.sh`](tooling/run_demo.sh)

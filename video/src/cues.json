@@ -1,0 +1,97 @@
+{
+  "_comment": "Every timed event in the film, in frames at 30 fps. The scenes (src/scenes) and the soundtrack (audio/make_soundtrack.py) both read this file, so picture and sound cannot drift apart.",
+  "fps": 30,
+  "durationInFrames": 900,
+  "scenes": {
+    "problem": [0, 120],
+    "brand": [120, 240],
+    "signature": [240, 450],
+    "credibility": [450, 660],
+    "impact": [660, 810],
+    "endCard": [810, 900]
+  },
+  "problem": {
+    "rowsWrite": [8, 22, 36, 50, 64, 78],
+    "rowWriteDuration": 13,
+    "clockTicksFrom": 6,
+    "clockTicksTo": 104,
+    "clockTickEvery": 15,
+    "words": [16, 22, 30, 38, 45],
+    "slowStretch": [30, 96],
+    "riser": [94, 120],
+    "exit": [96, 116]
+  },
+  "brand": {
+    "impact": 120,
+    "tileIn": 124,
+    "modules": [128, 162],
+    "glassHit": 164,
+    "sweep": [164, 186],
+    "words": [172, 182],
+    "zoomOut": [214, 238]
+  },
+  "signature": {
+    "cardSettle": [240, 256],
+    "wordScan": 250,
+    "beam": [258, 296],
+    "lock": 300,
+    "phoneIn": [316, 340],
+    "wordVerify": 330,
+    "phoneFootage": {
+      "from": 322,
+      "to": 386,
+      "sourceSeconds": 7.4
+    },
+    "chips": [344, 355, 366],
+    "success": 386,
+    "successFootage": {
+      "from": 386,
+      "sourceSeconds": 9.86
+    },
+    "wordPresent": 392,
+    "listIn": [402, 426],
+    "highlight": 420,
+    "exit": [434, 450]
+  },
+  "credibility": {
+    "whoosh": 448,
+    "rtFootage": {
+      "from": 450,
+      "to": 524,
+      "sourceSeconds": 15.5,
+      "rate": 1.5
+    },
+    "rtArrivals": [467, 489, 508],
+    "line1": 462,
+    "records": [520, 594],
+    "line2": 526,
+    "recordsHighlight": 560,
+    "analytics": [590, 656],
+    "line3": 596,
+    "chartReveal": [600, 632],
+    "csvChip": 630,
+    "exit": [644, 660]
+  },
+  "impact": {
+    "softImpact": 662,
+    "cards": [662, 670, 678, 686],
+    "headline": 672,
+    "connector": [700, 760],
+    "exit": [784, 804],
+    "riser": [790, 810]
+  },
+  "endCard": {
+    "hit": 810,
+    "tileIn": 810,
+    "wordmark": 822,
+    "tagline": 838,
+    "rule": [845, 872],
+    "sweep": [852, 870]
+  },
+  "music": {
+    "startFrame": 120,
+    "bpm": 120,
+    "chordFrames": [120, 180, 240, 300, 360, 420, 480, 540, 600, 660, 720, 780, 810],
+    "chords": ["Fmaj7", "G6", "Am9", "Fmaj7", "Cadd9", "G6", "Am9", "Fmaj7", "Cadd9", "G6", "Am9", "Fmaj7", "Cmaj9"]
+  }
+}
