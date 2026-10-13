@@ -6,6 +6,7 @@ executed app.py. The first class below is the cheap generic guard that would
 have caught all six undefined names on its own; the rest pin down the specific
 behaviours that were wrong.
 """
+import re
 import time
 
 import pytest
@@ -1116,26 +1117,44 @@ class TestLiveAttendanceOnTheDashboard:
         assert self.feed_url(seed) not in page
         assert 'Present Today' not in page
 
-    def test_the_dashboard_watches_each_running_class(self, appmod, seed, login):
-        ada = login(seed['coordinator_email'])
-        ada.post('/add_instructor', data={'course_id': seed['course_id'],
-                                          'lecturer_email': seed['lecturer_email']})
+    # The eye that opens the live window, straight after the Edit course link.
+    EYE_BESIDE_EDIT = re.compile(
+        r'Edit course\s*</a>\s*<button type="button"[^>]*'
+        r'data-bs-target="#liveAttendanceModal"[^>]*>\s*'
+        r'<i class="fas fa-eye"')
 
-        for email in ('coordinator_email', 'lecturer_email'):
-            body = login(seed[email]).get('/lecturer_dashboard').get_data(as_text=True)
-            assert 'Live Attendance' in body
-            assert f'data-feed-url="{self.feed_url(seed)}"' in body
-            assert f"/session/{seed['session_id']}/attendance" in body
+    def test_the_eye_sits_beside_edit_course(self, appmod, seed, login):
+        body = login(seed['coordinator_email']).get(
+            '/lecturer_dashboard').get_data(as_text=True)
+        assert self.EYE_BESIDE_EDIT.search(body)
+        assert f'data-feed-url="{self.feed_url(seed)}"' in body
+        assert f'data-sheet-url="/session/{seed["session_id"]}/attendance"' in body
+        assert 'id="liveAttendanceModal"' in body
+        # One window opened from the course, not a card per class above it.
+        assert 'card live-feed' not in body
 
-        # A coordinator who does not run this course gets no window onto it.
+    def test_an_invited_lecturer_gets_the_eye_with_its_label(self, appmod, seed, login):
+        """No edit button to sit beside, so a bare icon would be a riddle."""
+        login(seed['coordinator_email']).post(
+            '/add_instructor', data={'course_id': seed['course_id'],
+                                     'lecturer_email': seed['lecturer_email']})
+        body = login(seed['lecturer_email']).get(
+            '/lecturer_dashboard').get_data(as_text=True)
+        assert 'Edit course' not in body
+        assert f'data-feed-url="{self.feed_url(seed)}"' in body
+        assert '<span>Live attendance</span>' in body
+
+    def test_an_outsider_gets_no_window_onto_the_class(self, appmod, seed, login):
         eve = login(seed['outsider_email']).get('/lecturer_dashboard')
         assert self.feed_url(seed).encode() not in eve.data
 
-    def test_no_live_panel_once_the_class_has_ended(self, appmod, seed, login):
+    def test_no_eye_once_the_class_has_ended(self, appmod, seed, login):
         ada = login(seed['coordinator_email'])
         ada.post(f"/session/{seed['session_id']}/end")
         body = ada.get('/lecturer_dashboard').get_data(as_text=True)
-        assert 'data-live-session' not in body
+        assert 'Edit course' in body
+        assert 'fa-eye' not in body
+        assert 'liveAttendanceModal' not in body
         assert self.feed_url(seed) not in body
 
     def test_the_feed_says_when_the_class_has_ended(self, appmod, seed, login):

@@ -87,57 +87,6 @@
     </div>
     {% endif %}
 
-    <!-- ===== LIVE ATTENDANCE ===== -->
-    {# Who has scanned into each class that is running right now. It lives
-       here, on the lecturer's own screen, rather than on the QR page: that
-       page goes up on the projector, in front of the whole room.
-
-       The headcount is the answer; the names are the "did mine go through?"
-       reassurance, and only the most recent ones are useful for that, so the
-       list is a bounded window. The full sheet is its own page. #}
-    {% if live_sessions %}
-    <div class="section-label mb-3">
-        <i class="fas fa-circle-dot me-1"></i> Live Attendance
-    </div>
-    <div class="row g-3 mb-4">
-        {% for live, course in live_sessions %}
-        <div class="{{ 'col-12' if live_sessions | length == 1 else 'col-12 col-lg-6' }}">
-            <div class="card live-feed h-100" data-live-session
-                data-feed-url="{{ url_for('get_session_attendees', session_id=live.id) }}">
-                <div class="card-header d-flex align-items-center gap-2">
-                    <div class="me-auto">
-                        <div class="d-flex align-items-center flex-wrap gap-2">
-                            <span class="course-code">{{ course.code }}</span>
-                            <span class="badge bg-success">{{ live.title }}</span>
-                            <span class="live-dot" data-live-dot title="Live connection active"></span>
-                        </div>
-                        <div class="course-title mb-0">{{ course.title }}</div>
-                    </div>
-                    <span class="badge bg-success fs-6 text-nowrap">
-                        <span data-live-present>0</span> / <span data-live-enrolled>0</span> enrolled
-                    </span>
-                </div>
-                <div class="card-body p-0 live-feed-body">
-                    <ul class="list-group list-group-flush" data-live-list>
-                        <li class="list-group-item text-muted text-center py-4" data-live-waiting>
-                            Waiting for students to scan…
-                        </li>
-                    </ul>
-                </div>
-                <div class="card-footer small text-muted d-flex flex-wrap gap-2 justify-content-between">
-                    <span data-live-note>Showing the {{ live_recent_rows }} most recent scans</span>
-                    <span class="d-flex gap-3">
-                        <a href="{{ url_for('session_qr', session_id=live.id) }}" data-live-qr>QR screen</a>
-                        <a href="{{ url_for('session_attendance', session_id=live.id) }}"
-                            target="_blank" rel="noopener">Full sheet →</a>
-                    </span>
-                </div>
-            </div>
-        </div>
-        {% endfor %}
-    </div>
-    {% endif %}
-
     <!-- ===== COURSE CARDS GRID ===== -->
     <div class="section-label mb-3">
         <i class="fas fa-layer-group me-1"></i> Your Courses
@@ -169,7 +118,7 @@
                        merge into the morning's lecture. #}
                     {% set live_session = open_sessions.get(course.id) %}
                     {% if live_session %}
-                    <a href="{{ url_for('session_qr', session_id=live_session) }}"
+                    <a href="{{ url_for('session_qr', session_id=live_session.id) }}"
                         class="btn btn-danger w-100 d-flex align-items-center justify-content-center gap-2 mb-2">
                         <i class="fas fa-circle fa-xs"></i>
                         <span>Resume Live Class</span>
@@ -212,15 +161,43 @@
                     </form>
                     {% endif %}
 
-                    {% if course.coordinator_id == current_user.id %}
-                    <a href="{{ url_for('edit_course', course_id=course.id) }}"
-                        class="btn btn-glass btn-sm w-100 mb-2">
-                        <i class="fas fa-pen me-1" aria-hidden="true"></i>Edit course
-                    </a>
+                    {% set can_edit = course.coordinator_id == current_user.id %}
+                    {% if can_edit or live_session %}
+                    <div class="d-flex gap-2 mb-2">
+                        {% if can_edit %}
+                        <a href="{{ url_for('edit_course', course_id=course.id) }}"
+                            class="btn btn-glass btn-sm flex-fill">
+                            <i class="fas fa-pen me-1" aria-hidden="true"></i>Edit course
+                        </a>
+                        {% endif %}
+                        {# Who has scanned into the running class. It is watched
+                           from here, on the lecturer's own screen, not on the QR
+                           page: that one goes up on the projector, in front of
+                           the whole room. An invited lecturer has no edit button
+                           beside it, so a bare icon would be all alone — it
+                           carries its label then. #}
+                        {% if live_session %}
+                        <button type="button"
+                            class="btn btn-outline-success btn-sm d-flex align-items-center justify-content-center gap-1 {{ '' if can_edit else 'flex-fill' }}"
+                            data-bs-toggle="modal" data-bs-target="#liveAttendanceModal"
+                            data-feed-url="{{ url_for('get_session_attendees', session_id=live_session.id) }}"
+                            data-qr-url="{{ url_for('session_qr', session_id=live_session.id) }}"
+                            data-sheet-url="{{ url_for('session_attendance', session_id=live_session.id) }}"
+                            data-course-code="{{ course.code }}"
+                            data-course-title="{{ course.title }}"
+                            data-session-title="{{ live_session.title }}"
+                            title="Live attendance" aria-label="Live attendance for {{ course.code }}">
+                            <i class="fas fa-eye" aria-hidden="true"></i>
+                            {% if not can_edit %}<span>Live attendance</span>{% endif %}
+                        </button>
+                        {% endif %}
+                    </div>
                     {% endif %}
 
-                    <!-- Secondary Actions -->
-                    <div class="d-flex gap-2 mb-2">
+                    <!-- Secondary Actions. They wrap rather than run off the
+                         card: five buttons do not fit side by side in a course
+                         card, and the one the card clipped off was Delete. -->
+                    <div class="d-flex flex-wrap gap-2 mb-2">
                         <a href="{{ url_for('view_attendance', course_id=course.id) }}"
                             class="btn btn-glass btn-sm flex-fill d-flex align-items-center justify-content-center gap-1">
                             <i class="fas fa-list fa-xs"></i> List
@@ -238,21 +215,23 @@
                            Coordinator'. An exact-string test hid these controls
                            from half the coordinators who own the course. #}
                         {% if is_coordinator %}
-                        <form method="POST" action="{{ url_for('archive_course', course_id=course.id) }}" class="m-0">
-                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                            {% if course.archived %}<input type="hidden" name="unarchive" value="1">{% endif %}
-                            <button type="submit" class="btn btn-outline-secondary btn-sm"
-                                title="{{ 'Restore this course' if course.archived else 'Archive this finished term' }}">
-                                <i class="fas fa-box-archive fa-xs"></i>
-                            </button>
-                        </form>
-                        <form method="POST" action="/delete_course/{{ course.id }}"
-                            onsubmit="return confirm('Delete {{ course.code }} and every attendance record in it? This cannot be undone. Archive it instead if the term has simply ended.')" class="m-0">
-                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                            <button type="submit" class="btn btn-outline-danger btn-sm" title="Delete course">
-                                <i class="fas fa-trash fa-xs"></i>
-                            </button>
-                        </form>
+                        <div class="d-flex gap-2 ms-auto">
+                            <form method="POST" action="{{ url_for('archive_course', course_id=course.id) }}" class="m-0">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                {% if course.archived %}<input type="hidden" name="unarchive" value="1">{% endif %}
+                                <button type="submit" class="btn btn-outline-secondary btn-sm"
+                                    title="{{ 'Restore this course' if course.archived else 'Archive this finished term' }}">
+                                    <i class="fas fa-box-archive fa-xs"></i>
+                                </button>
+                            </form>
+                            <form method="POST" action="/delete_course/{{ course.id }}"
+                                onsubmit="return confirm('Delete {{ course.code }} and every attendance record in it? This cannot be undone. Archive it instead if the term has simply ended.')" class="m-0">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <button type="submit" class="btn btn-outline-danger btn-sm" title="Delete course">
+                                    <i class="fas fa-trash fa-xs"></i>
+                                </button>
+                            </form>
+                        </div>
                         {% endif %}
                     </div>
 
@@ -352,15 +331,66 @@
     </div>
 </div>
 
-{% if live_sessions %}
+{% if open_sessions %}
+<!-- ===== LIVE ATTENDANCE MODAL ===== -->
+{# One window shared by every running class; the eye button that opens it
+   says which class to show. The headcount is the answer, the names are the
+   "did mine go through?" reassurance — and only the most recent ones are
+   useful for that, so the list is a bounded window. The full sheet is its
+   own page. #}
+<div class="modal fade" id="liveAttendanceModal" tabindex="-1" aria-labelledby="liveAttendanceModalLabel"
+    aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered modal-dialog-scrollable">
+        <div class="modal-content live-feed">
+            <div class="modal-header align-items-start gap-2">
+                <div class="me-auto">
+                    <h5 class="modal-title d-flex align-items-center flex-wrap gap-2" id="liveAttendanceModalLabel">
+                        <span class="course-code" data-live-code></span>
+                        <span class="badge bg-success" data-live-session></span>
+                        <span class="live-dot" data-live-dot title="Live connection active"></span>
+                    </h5>
+                    <div class="course-title mb-0" data-live-course></div>
+                </div>
+                <span class="badge bg-success fs-6 text-nowrap">
+                    <span data-live-present>…</span> / <span data-live-enrolled>…</span> enrolled
+                </span>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body p-0">
+                <ul class="list-group list-group-flush" data-live-list></ul>
+            </div>
+            <div class="modal-footer small text-muted d-flex flex-wrap gap-2 justify-content-between">
+                <span data-live-note></span>
+                <span class="d-flex gap-3">
+                    <a href="#" data-live-qr>QR screen</a>
+                    <a href="#" data-live-sheet target="_blank" rel="noopener">Full sheet →</a>
+                </span>
+            </div>
+        </div>
+    </div>
+</div>
+
 <script>
     (function () {
-        // Hard ceiling on DOM rows per panel. The feed still drains every
-        // scan so the cursor stays correct and the count is right; only the
-        // rendered window is bounded, so browser cost is independent of
-        // class size.
+        // Hard ceiling on DOM rows. The feed still drains every scan so the
+        // cursor stays correct and the count is right; only the rendered
+        // window is bounded, so browser cost is independent of class size.
         const RECENT_ROWS = {{ live_recent_rows }};
         const POLL_MS = 1000;
+        const modal = document.getElementById('liveAttendanceModal');
+        const part = name => modal.querySelector(`[data-live-${name}]`);
+        const list = part('list');
+        // Only the class whose window is open is polled, and only while it
+        // is open: a dashboard left on a desk costs the server nothing.
+        let feed = null;
+
+        function waitingItem() {
+            const li = document.createElement('li');
+            li.className = 'list-group-item text-muted text-center py-4';
+            li.dataset.liveWaiting = '';
+            li.textContent = 'Waiting for students to scan…';
+            return li;
+        }
 
         function attendeeListItem(student) {
             const li = document.createElement('li');
@@ -385,35 +415,49 @@
             return li;
         }
 
-        function liveFeed(panel) {
-            const feedUrl = panel.dataset.feedUrl;
-            const presentEl = panel.querySelector('[data-live-present]');
-            const enrolledEl = panel.querySelector('[data-live-enrolled]');
-            const list = panel.querySelector('[data-live-list]');
+        function showClass(source) {
+            part('code').textContent = source.courseCode;
+            part('session').textContent = source.sessionTitle;
+            part('course').textContent = source.courseTitle;
+            const dot = part('dot');
+            dot.className = 'live-dot';
+            dot.title = 'Live connection active';
+            dot.textContent = '';
+            part('present').textContent = '…';
+            part('enrolled').textContent = '…';
+            part('qr').href = source.qrUrl;
+            part('qr').classList.remove('d-none');
+            part('sheet').href = source.sheetUrl;
+            part('note').textContent = `Showing the ${RECENT_ROWS} most recent scans`;
+            list.replaceChildren(waitingItem());
+        }
+
+        function liveFeed(feedUrl) {
             let lastAttendanceId = 0;
             let timer = null;
-            let active = false;
+            let busy = false;
             let stopped = false;
+
+            function stop() {
+                stopped = true;
+                clearTimeout(timer);
+            }
 
             // The class was ended (from the QR screen, or another device) or
             // is gone. Stop polling and stop claiming to be live.
-            function stop(message) {
-                stopped = true;
-                clearTimeout(timer);
-                const dot = panel.querySelector('[data-live-dot]');
-                if (dot) {
-                    dot.className = 'badge bg-secondary';
-                    dot.title = '';
-                    dot.textContent = 'Ended';
-                }
-                const qrLink = panel.querySelector('[data-live-qr]');
-                if (qrLink) qrLink.remove();
-                panel.querySelector('[data-live-note]').textContent = message;
+            function ended(message) {
+                stop();
+                const dot = part('dot');
+                dot.className = 'badge bg-secondary';
+                dot.title = '';
+                dot.textContent = 'Ended';
+                part('qr').classList.add('d-none');
+                part('note').textContent = message;
             }
 
             async function poll() {
-                if (stopped || active || document.hidden) return;
-                active = true;
+                if (stopped || busy || document.hidden) return;
+                busy = true;
                 try {
                     let hasMore = true;
                     while (hasMore) {
@@ -421,16 +465,20 @@
                             `${feedUrl}?after=${lastAttendanceId}&limit=250`,
                             { cache: 'no-store' }
                         );
+                        // Closed, or switched to another class, while this
+                        // request was in flight: it no longer owns the window.
+                        if (stopped) return;
                         if (response.status === 403 || response.status === 404) {
-                            stop('This class is no longer available.');
+                            ended('This class is no longer available.');
                             return;
                         }
                         if (!response.ok) throw new Error(`HTTP ${response.status}`);
                         const data = await response.json();
+                        if (stopped) return;
                         if (data.status !== 'success') break;
 
-                        presentEl.textContent = data.present;
-                        enrolledEl.textContent = data.enrolled;
+                        part('present').textContent = data.present;
+                        part('enrolled').textContent = data.enrolled;
                         if (data.new_attendees.length) {
                             const waiting = list.querySelector('[data-live-waiting]');
                             if (waiting) waiting.remove();
@@ -451,14 +499,14 @@
                         }
                         hasMore = data.has_more;
                         if (!hasMore && data.active === false) {
-                            stop('This class has ended. No further scans will be accepted.');
+                            ended('This class has ended. No further scans will be accepted.');
                             return;
                         }
                     }
                 } catch (error) {
                     console.error('Error fetching live attendance:', error);
                 } finally {
-                    active = false;
+                    busy = false;
                     if (!stopped) {
                         clearTimeout(timer);
                         timer = setTimeout(poll, POLL_MS);
@@ -466,13 +514,23 @@
                 }
             }
 
-            return poll;
+            return { poll, stop };
         }
 
-        const pollers = Array.from(document.querySelectorAll('[data-live-session]'), liveFeed);
-        pollers.forEach(poll => poll());
+        modal.addEventListener('show.bs.modal', event => {
+            const source = event.relatedTarget && event.relatedTarget.dataset;
+            if (!source || !source.feedUrl) return;
+            if (feed) feed.stop();
+            showClass(source);
+            feed = liveFeed(source.feedUrl);
+            feed.poll();
+        });
+        modal.addEventListener('hidden.bs.modal', () => {
+            if (feed) feed.stop();
+            feed = null;
+        });
         document.addEventListener('visibilitychange', () => {
-            if (!document.hidden) pollers.forEach(poll => poll());
+            if (!document.hidden && feed) feed.poll();
         });
     })();
 </script>

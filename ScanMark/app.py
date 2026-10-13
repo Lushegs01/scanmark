@@ -1177,11 +1177,11 @@ ATTENDANCE_PREVIEW_ROWS = max(1, int(os.environ.get('ATTENDANCE_PREVIEW_ROWS', 2
 # save at most this many seconds on a number that is visibly moving anyway.
 ATTENDEE_SUMMARY_TTL = max(1, int(os.environ.get('ATTENDEE_SUMMARY_TTL', 2)))
 
-# Rows each live-attendance panel on the lecturer dashboard keeps in the DOM.
-# The panel answers "how many are in, and who just scanned"; the full sheet
-# is its own paginated page. Without a bound, a 2,000-student class ends with
-# 2,000 <li> nodes per running class on the lecturer's phone. (The name is
-# from when this list lived on the projector screen; deployments set it.)
+# Rows the live-attendance window on the lecturer dashboard keeps in the DOM.
+# It answers "how many are in, and who just scanned"; the full sheet is its
+# own paginated page. Without a bound, a 2,000-student class ends with 2,000
+# <li> nodes on the lecturer's phone. (The name is from when this list lived
+# on the projector screen; deployments set it.)
 PROJECTOR_RECENT_ROWS = max(5, int(os.environ.get('PROJECTOR_RECENT_ROWS', 50)))
 
 
@@ -3802,11 +3802,12 @@ def lecturer_dashboard():
         instructor_total = len(invited | coordinator_ids)
 
     # Live sessions, so the dashboard button can say "Resume" rather than
-    # opening a second meeting the lecturer did not ask for.
+    # opening a second meeting the lecturer did not ask for, and so each
+    # running class gets its live roll call — watched here, on the lecturer's
+    # own screen, not on the QR page that goes up on the projector.
     open_sessions = {}
-    live_sessions = []
     if course_ids:
-        latest_open = {
+        open_sessions = {
             row.course_id: row for row in
             ClassSession.query
             .filter(ClassSession.course_id.in_(course_ids),
@@ -3815,18 +3816,11 @@ def lecturer_dashboard():
             .order_by(ClassSession.date_created.asc())
             .all()
         }
-        open_sessions = {course_id: row.id for course_id, row in latest_open.items()}
-        # The live roll call for each running class, in the same order as the
-        # course grid. It is watched here, on the lecturer's own screen, not
-        # on the QR page that goes up on the projector.
-        live_sessions = [(latest_open[course.id], course) for course in my_courses
-                         if course.id in latest_open]
 
     return render_template('lecturer_dashboard.html', courses=my_courses,
                            can_create=can_create,
                            instructor_total=instructor_total,
                            open_sessions=open_sessions,
-                           live_sessions=live_sessions,
                            live_recent_rows=PROJECTOR_RECENT_ROWS,
                            show_archived=show_archived,
                            is_coordinator=can_create,
@@ -4987,8 +4981,8 @@ def get_session_attendees(session_id):
     if not _is_course_authorized(course):
         return jsonify({"error": "Unauthorised"}), 403
 
-    # Every open dashboard polls this once a second per running class, so it
-    # has to stay cheap even with 2000 scans in one session: a short shared cache
+    # An open live-attendance window polls this once a second, so it has to
+    # stay cheap even with 2000 scans in one session: a short shared cache
     # plus one JOINed query (the old version lazy-loaded each row's student
     # — 2000 extra queries per poll — and loaded every enrolled User just
     # to count them).
@@ -5054,7 +5048,7 @@ def get_session_attendees(session_id):
         "last_id": attendees[-1]['id'] if attendees else after_id,
         "has_more": has_more,
         # The class can be ended from the QR screen or another device; the
-        # dashboard panel needs to stop calling itself live when it is.
+        # dashboard's live window needs to stop calling itself live when it is.
         "active": session_row.is_open,
     }
     runtime_metrics.observe_ms(
