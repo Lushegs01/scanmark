@@ -312,7 +312,7 @@ quietly at every phone.
 | `SCAN_ADMISSION_RETRY_SECONDS` | 0.5 | `Retry-After` on a shed scan. Deliberately sub-second: this smooths microbursts, it does not queue attendance. |
 | `BUDGET_*_MS` / `BUDGET_SCAN_TOTAL_MS` | see below | Per-stage response budget. Breaches increment `scan_budget_exceeded_<stage>_total`, which is what turns "scans are slow" into "db_insert is over budget and nothing else is". |
 | `ATTENDEE_SUMMARY_TTL` | 2 | Seconds the lecturer's headcount is cached. This is the *only* thing bounding how stale the counter is — nothing invalidates it per scan any more. |
-| `PROJECTOR_RECENT_ROWS` | 50 | Rows the live screen keeps in the DOM. The screen answers "how many are in, and who just scanned"; the full sheet is its own page. |
+| `PROJECTOR_RECENT_ROWS` | 50 | Rows each live-attendance panel on the lecturer dashboard keeps in the DOM. The panel answers "how many are in, and who just scanned"; the full sheet is its own page. |
 | `REDIS_MAX_CONNECTIONS` | `WEB_CONCURRENCY x GUNICORN_THREADS + 8` | Explicit Redis pool ceiling. Left implicit, every thread opens connections on demand with no limit, which multiplies against the Redis plan exactly when the class needs them. |
 | `REDIS_CONNECT_TIMEOUT` / `REDIS_SOCKET_TIMEOUT` | 2 / 2 | Well inside the platform router timeout, so a scan never waits on a Redis command that will not answer. |
 | `REDIS_HEALTH_CHECK_INTERVAL` | 30 | Recycles a connection idle across a proxy's idle cut. |

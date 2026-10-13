@@ -310,7 +310,8 @@ def test_incremental_attendee_feed_is_bounded_and_cursor_based():
     payload = response.get_json()
     assert response.status_code == 200
     assert set(payload) == {
-        'status', 'present', 'enrolled', 'new_attendees', 'last_id', 'has_more'
+        'status', 'present', 'enrolled', 'new_attendees', 'last_id', 'has_more',
+        'active',
     }
     assert payload['present'] == 300
     assert len(payload['new_attendees']) == 50
