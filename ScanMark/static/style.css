@@ -270,24 +270,13 @@ h1, h2, h3, h4, h5, h6 { font-weight: 700; }
   font-weight: 600;
 }
 
-/* --- LIVE ATTENDANCE (lecturer dashboard) --- */
-.live-feed-body {
-  max-height: 420px;
-  overflow-y: auto;
-}
-
-/* Bootstrap paints list rows and card footers white; on the dark theme that
-   left a bright band of names across the page. */
+/* --- LIVE ATTENDANCE (lecturer dashboard window) --- */
+/* Bootstrap paints list rows white; on the dark theme that left a bright
+   band of names across the window. */
 .live-feed .list-group-item {
   background: transparent;
   color: var(--text);
   border-color: var(--divider);
-}
-
-.live-feed .card-footer {
-  background: transparent;
-  border-top: 1px solid var(--divider);
-  padding: 0.75rem 1.4rem;
 }
 
 .live-dot {
@@ -570,7 +559,10 @@ h1, h2, h3, h4, h5, h6 { font-weight: 700; }
 [data-theme="dark"] .btn-close { filter: invert(1); }
 
 /* --- PAGE LAYOUT --- */
-.page-wrap { padding: 1.5rem 0 3rem; }
+/* Vertical only. The container's own side padding is what absorbs a
+   Bootstrap `.row`'s negative margins; zeroing it here pushed every row on
+   these pages 8px past the screen edge, so phones scrolled sideways. */
+.page-wrap { padding-top: 1.5rem; padding-bottom: 3rem; }
 
 .page-header {
   margin-bottom: 1.8rem;
