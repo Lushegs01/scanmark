@@ -162,7 +162,12 @@
                     {% endif %}
 
                     {% set can_edit = course.coordinator_id == current_user.id %}
-                    {% if can_edit or live_session %}
+                    {# The eye is always there, so a lecturer knows where to look
+                       before the class starts — not only once it is running.
+                       An archived course can no longer start one, so it has
+                       nothing to watch unless a class is somehow still open. #}
+                    {% set show_eye = live_session or not course.archived %}
+                    {% if can_edit or show_eye %}
                     <div class="d-flex gap-2 mb-2">
                         {% if can_edit %}
                         <a href="{{ url_for('edit_course', course_id=course.id) }}"
@@ -173,22 +178,29 @@
                         {# Who has scanned into the running class. It is watched
                            from here, on the lecturer's own screen, not on the QR
                            page: that one goes up on the projector, in front of
-                           the whole room. An invited lecturer has no edit button
-                           beside it, so a bare icon would be all alone — it
-                           carries its label then. #}
-                        {% if live_session %}
+                           the whole room. Green with a live dot while a class is
+                           running; muted when there is nothing to watch yet. An
+                           invited lecturer has no edit button beside it, so a
+                           bare icon would be all alone — it carries its label
+                           then. #}
+                        {% if show_eye %}
                         <button type="button"
-                            class="btn btn-outline-success btn-sm d-flex align-items-center justify-content-center gap-1 {{ '' if can_edit else 'flex-fill' }}"
+                            class="btn {{ 'btn-outline-success' if live_session else 'btn-glass' }} btn-sm d-flex align-items-center justify-content-center gap-1 {{ '' if can_edit else 'flex-fill' }}"
                             data-bs-toggle="modal" data-bs-target="#liveAttendanceModal"
+                            data-course-code="{{ course.code }}"
+                            data-course-title="{{ course.title }}"
+                            data-register-url="{{ url_for('view_attendance', course_id=course.id) }}"
+                            {% if live_session %}
                             data-feed-url="{{ url_for('get_session_attendees', session_id=live_session.id) }}"
                             data-qr-url="{{ url_for('session_qr', session_id=live_session.id) }}"
                             data-sheet-url="{{ url_for('session_attendance', session_id=live_session.id) }}"
-                            data-course-code="{{ course.code }}"
-                            data-course-title="{{ course.title }}"
                             data-session-title="{{ live_session.title }}"
-                            title="Live attendance" aria-label="Live attendance for {{ course.code }}">
+                            {% endif %}
+                            title="{{ 'Live attendance' if live_session else 'Live attendance — no class running' }}"
+                            aria-label="Live attendance for {{ course.code }}">
                             <i class="fas fa-eye" aria-hidden="true"></i>
                             {% if not can_edit %}<span>Live attendance</span>{% endif %}
+                            {% if live_session %}<span class="live-dot live-dot-sm" aria-hidden="true"></span>{% endif %}
                         </button>
                         {% endif %}
                     </div>
@@ -331,13 +343,13 @@
     </div>
 </div>
 
-{% if open_sessions %}
+{% if courses %}
 <!-- ===== LIVE ATTENDANCE MODAL ===== -->
-{# One window shared by every running class; the eye button that opens it
-   says which class to show. The headcount is the answer, the names are the
-   "did mine go through?" reassurance — and only the most recent ones are
-   useful for that, so the list is a bounded window. The full sheet is its
-   own page. #}
+{# One window shared by every course; the eye button that opens it says
+   which class to show, or that none is running. The headcount is the
+   answer, the names are the "did mine go through?" reassurance — and only
+   the most recent ones are useful for that, so the list is a bounded
+   window. The full sheet is its own page. #}
 <div class="modal fade" id="liveAttendanceModal" tabindex="-1" aria-labelledby="liveAttendanceModalLabel"
     aria-hidden="true">
     <div class="modal-dialog modal-dialog-centered modal-dialog-scrollable">
@@ -351,7 +363,7 @@
                     </h5>
                     <div class="course-title mb-0" data-live-course></div>
                 </div>
-                <span class="badge bg-success fs-6 text-nowrap">
+                <span class="badge bg-success fs-6 text-nowrap" data-live-count>
                     <span data-live-present>…</span> / <span data-live-enrolled>…</span> enrolled
                 </span>
                 <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
@@ -364,6 +376,7 @@
                 <span class="d-flex gap-3">
                     <a href="#" data-live-qr>QR screen</a>
                     <a href="#" data-live-sheet target="_blank" rel="noopener">Full sheet →</a>
+                    <a href="#" data-live-register>Attendance list →</a>
                 </span>
             </div>
         </div>
@@ -415,21 +428,42 @@
             return li;
         }
 
+        function messageItem(text) {
+            const li = document.createElement('li');
+            li.className = 'list-group-item text-muted text-center py-4';
+            li.textContent = text;
+            return li;
+        }
+
+        const show = (name, visible) => part(name).classList.toggle('d-none', !visible);
+
+        // Fill the window for the course whose eye was pressed. With no class
+        // running there is nothing to poll; say so, and point at what to do.
         function showClass(source) {
+            const live = Boolean(source.feedUrl);
             part('code').textContent = source.courseCode;
-            part('session').textContent = source.sessionTitle;
             part('course').textContent = source.courseTitle;
+            part('session').textContent = source.sessionTitle || '';
             const dot = part('dot');
             dot.className = 'live-dot';
             dot.title = 'Live connection active';
             dot.textContent = '';
             part('present').textContent = '…';
             part('enrolled').textContent = '…';
-            part('qr').href = source.qrUrl;
-            part('qr').classList.remove('d-none');
-            part('sheet').href = source.sheetUrl;
-            part('note').textContent = `Showing the ${RECENT_ROWS} most recent scans`;
-            list.replaceChildren(waitingItem());
+            part('register').href = source.registerUrl;
+            if (live) {
+                part('qr').href = source.qrUrl;
+                part('sheet').href = source.sheetUrl;
+                part('note').textContent = `Showing the ${RECENT_ROWS} most recent scans`;
+                list.replaceChildren(waitingItem());
+            } else {
+                part('note').textContent = 'No class running';
+                list.replaceChildren(messageItem(
+                    `No class is running for ${source.courseCode} right now. ` +
+                    'Start attendance and students will appear here as they scan.'));
+            }
+            ['session', 'dot', 'count', 'qr', 'sheet'].forEach(name => show(name, live));
+            show('register', !live);
         }
 
         function liveFeed(feedUrl) {
@@ -519,11 +553,14 @@
 
         modal.addEventListener('show.bs.modal', event => {
             const source = event.relatedTarget && event.relatedTarget.dataset;
-            if (!source || !source.feedUrl) return;
+            if (!source || !source.courseCode) return;
             if (feed) feed.stop();
+            feed = null;
             showClass(source);
-            feed = liveFeed(source.feedUrl);
-            feed.poll();
+            if (source.feedUrl) {
+                feed = liveFeed(source.feedUrl);
+                feed.poll();
+            }
         });
         modal.addEventListener('hidden.bs.modal', () => {
             if (feed) feed.stop();

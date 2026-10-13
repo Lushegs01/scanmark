@@ -1148,14 +1148,40 @@ class TestLiveAttendanceOnTheDashboard:
         eve = login(seed['outsider_email']).get('/lecturer_dashboard')
         assert self.feed_url(seed).encode() not in eve.data
 
-    def test_no_eye_once_the_class_has_ended(self, appmod, seed, login):
+    def test_the_eye_stays_when_no_class_is_running(self, appmod, seed, login):
+        """
+        It used to vanish with no class running, which is exactly when a
+        lecturer first goes looking for it.
+        """
         ada = login(seed['coordinator_email'])
         ada.post(f"/session/{seed['session_id']}/end")
         body = ada.get('/lecturer_dashboard').get_data(as_text=True)
+        assert self.EYE_BESIDE_EDIT.search(body)
+        assert 'id="liveAttendanceModal"' in body
+        # Nothing to poll: the window says no class is running instead.
+        assert self.feed_url(seed) not in body
+        assert 'live-dot-sm' not in body
+        assert f'data-register-url="/course/{seed["course_id"]}/attendance"' in body
+
+    def test_an_invited_lecturer_sees_the_eye_before_the_class_starts(
+            self, appmod, seed, login):
+        ada = login(seed['coordinator_email'])
+        ada.post('/add_instructor', data={'course_id': seed['course_id'],
+                                          'lecturer_email': seed['lecturer_email']})
+        ada.post(f"/session/{seed['session_id']}/end")
+        body = login(seed['lecturer_email']).get(
+            '/lecturer_dashboard').get_data(as_text=True)
+        assert '<span>Live attendance</span>' in body
+        assert self.feed_url(seed) not in body
+
+    def test_an_archived_course_with_nothing_running_has_no_eye(
+            self, appmod, seed, login):
+        ada = login(seed['coordinator_email'])
+        ada.post(f"/session/{seed['session_id']}/end")
+        ada.post(f"/course/{seed['course_id']}/archive")
+        body = ada.get('/lecturer_dashboard?archived=1').get_data(as_text=True)
         assert 'Edit course' in body
         assert 'fa-eye' not in body
-        assert 'liveAttendanceModal' not in body
-        assert self.feed_url(seed) not in body
 
     def test_the_feed_says_when_the_class_has_ended(self, appmod, seed, login):
         """An open panel has to learn the class was ended from another screen."""
