@@ -270,6 +270,45 @@ h1, h2, h3, h4, h5, h6 { font-weight: 700; }
   font-weight: 600;
 }
 
+/* --- LIVE ATTENDANCE (lecturer dashboard) --- */
+.live-feed-body {
+  max-height: 420px;
+  overflow-y: auto;
+}
+
+/* Bootstrap paints list rows and card footers white; on the dark theme that
+   left a bright band of names across the page. */
+.live-feed .list-group-item {
+  background: transparent;
+  color: var(--text);
+  border-color: var(--divider);
+}
+
+.live-feed .card-footer {
+  background: transparent;
+  border-top: 1px solid var(--divider);
+  padding: 0.75rem 1.4rem;
+}
+
+.live-dot {
+  height: 12px;
+  width: 12px;
+  background-color: #28a745;
+  border-radius: 50%;
+  display: inline-block;
+  animation: live-dot-pulse 1.5s infinite;
+}
+
+@keyframes live-dot-pulse {
+  0%   { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(40, 167, 69, 0.7); }
+  70%  { transform: scale(1);    box-shadow: 0 0 0 8px rgba(40, 167, 69, 0); }
+  100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(40, 167, 69, 0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .live-dot { animation: none; }
+}
+
 /* --- BUTTONS --- */
 .btn {
   border-radius: 12px;

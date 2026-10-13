@@ -1177,10 +1177,11 @@ ATTENDANCE_PREVIEW_ROWS = max(1, int(os.environ.get('ATTENDANCE_PREVIEW_ROWS', 2
 # save at most this many seconds on a number that is visibly moving anyway.
 ATTENDEE_SUMMARY_TTL = max(1, int(os.environ.get('ATTENDEE_SUMMARY_TTL', 2)))
 
-# Rows the live projector screen keeps in the DOM. The screen answers "how
-# many are in, and who just scanned"; the full sheet is its own paginated
-# page. Without a bound, a 2,000-student class ends with 2,000 <li> nodes on
-# a laptop that is also driving a projector.
+# Rows each live-attendance panel on the lecturer dashboard keeps in the DOM.
+# The panel answers "how many are in, and who just scanned"; the full sheet
+# is its own paginated page. Without a bound, a 2,000-student class ends with
+# 2,000 <li> nodes per running class on the lecturer's phone. (The name is
+# from when this list lived on the projector screen; deployments set it.)
 PROJECTOR_RECENT_ROWS = max(5, int(os.environ.get('PROJECTOR_RECENT_ROWS', 50)))
 
 
@@ -3803,9 +3804,10 @@ def lecturer_dashboard():
     # Live sessions, so the dashboard button can say "Resume" rather than
     # opening a second meeting the lecturer did not ask for.
     open_sessions = {}
+    live_sessions = []
     if course_ids:
-        open_sessions = {
-            row.course_id: row.id for row in
+        latest_open = {
+            row.course_id: row for row in
             ClassSession.query
             .filter(ClassSession.course_id.in_(course_ids),
                     ClassSession.active.is_(True),
@@ -3813,11 +3815,19 @@ def lecturer_dashboard():
             .order_by(ClassSession.date_created.asc())
             .all()
         }
+        open_sessions = {course_id: row.id for course_id, row in latest_open.items()}
+        # The live roll call for each running class, in the same order as the
+        # course grid. It is watched here, on the lecturer's own screen, not
+        # on the QR page that goes up on the projector.
+        live_sessions = [(latest_open[course.id], course) for course in my_courses
+                         if course.id in latest_open]
 
     return render_template('lecturer_dashboard.html', courses=my_courses,
                            can_create=can_create,
                            instructor_total=instructor_total,
                            open_sessions=open_sessions,
+                           live_sessions=live_sessions,
+                           live_recent_rows=PROJECTOR_RECENT_ROWS,
                            show_archived=show_archived,
                            is_coordinator=can_create,
                            classrooms=_my_classrooms(),
@@ -4875,7 +4885,6 @@ def session_qr(session_id):
     return render_template('generate_qr.html', course=course, session=session_row,
                            qr_token_ttl=QR_TOKEN_TTL,
                            expected_total=expected,
-                           projector_recent_rows=PROJECTOR_RECENT_ROWS,
                            geofence_required=GEOFENCE_REQUIRED,
                            classroom=room, classrooms=_my_classrooms(),
                            max_pin_accuracy_m=GEOFENCE_MAX_PIN_ACCURACY_M)
@@ -4978,8 +4987,8 @@ def get_session_attendees(session_id):
     if not _is_course_authorized(course):
         return jsonify({"error": "Unauthorised"}), 403
 
-    # Every open projector screen polls this every 3 seconds, so it has to
-    # stay cheap even with 2000 scans in one session: a short shared cache
+    # Every open dashboard polls this once a second per running class, so it
+    # has to stay cheap even with 2000 scans in one session: a short shared cache
     # plus one JOINed query (the old version lazy-loaded each row's student
     # — 2000 extra queries per poll — and loaded every enrolled User just
     # to count them).
@@ -5044,6 +5053,9 @@ def get_session_attendees(session_id):
         "new_attendees": attendees,
         "last_id": attendees[-1]['id'] if attendees else after_id,
         "has_more": has_more,
+        # The class can be ended from the QR screen or another device; the
+        # dashboard panel needs to stop calling itself live when it is.
+        "active": session_row.is_open,
     }
     runtime_metrics.observe_ms(
         'attendee_feed.response', (time.perf_counter() - feed_started) * 1000

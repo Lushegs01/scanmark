@@ -1094,6 +1094,61 @@ class TestCourseAccessControl:
             assert Course.query.get(seed['course_id']) is not None
 
 
+class TestLiveAttendanceOnTheDashboard:
+    """
+    Who has scanned in is watched from the lecturer's dashboard. The QR page
+    goes up on the projector, in front of the whole room, so it carries the
+    code and nothing about who is or is not in yet.
+    """
+
+    @staticmethod
+    def feed_url(seed):
+        return f"/api/session/{seed['session_id']}/attendees"
+
+    def test_the_qr_page_no_longer_lists_who_scanned(self, appmod, seed, login):
+        kemi = login(seed['student_email'])
+        assert kemi.post('/mark_attendance', json=scan_body(
+            appmod, seed['session_id'])).get_json()['status'] == 'success'
+
+        page = login(seed['coordinator_email']).get(
+            f"/session/{seed['session_id']}/qr").get_data(as_text=True)
+        assert 'id="qrImage"' in page
+        assert self.feed_url(seed) not in page
+        assert 'Present Today' not in page
+
+    def test_the_dashboard_watches_each_running_class(self, appmod, seed, login):
+        ada = login(seed['coordinator_email'])
+        ada.post('/add_instructor', data={'course_id': seed['course_id'],
+                                          'lecturer_email': seed['lecturer_email']})
+
+        for email in ('coordinator_email', 'lecturer_email'):
+            body = login(seed[email]).get('/lecturer_dashboard').get_data(as_text=True)
+            assert 'Live Attendance' in body
+            assert f'data-feed-url="{self.feed_url(seed)}"' in body
+            assert f"/session/{seed['session_id']}/attendance" in body
+
+        # A coordinator who does not run this course gets no window onto it.
+        eve = login(seed['outsider_email']).get('/lecturer_dashboard')
+        assert self.feed_url(seed).encode() not in eve.data
+
+    def test_no_live_panel_once_the_class_has_ended(self, appmod, seed, login):
+        ada = login(seed['coordinator_email'])
+        ada.post(f"/session/{seed['session_id']}/end")
+        body = ada.get('/lecturer_dashboard').get_data(as_text=True)
+        assert 'data-live-session' not in body
+        assert self.feed_url(seed) not in body
+
+    def test_the_feed_says_when_the_class_has_ended(self, appmod, seed, login):
+        """An open panel has to learn the class was ended from another screen."""
+        ada = login(seed['coordinator_email'])
+        assert ada.get(self.feed_url(seed)).get_json()['active'] is True
+
+        ada.post(f"/session/{seed['session_id']}/end")
+        payload = ada.get(self.feed_url(seed)).get_json()
+        assert payload['status'] == 'success'
+        assert payload['active'] is False
+
+
 class TestCourseEditing:
 
     @staticmethod
