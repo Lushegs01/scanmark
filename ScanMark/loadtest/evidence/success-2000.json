@@ -1,0 +1,87 @@
+{
+  "schema_version": 2,
+  "passed": false,
+  "capacity_accepted": false,
+  "acceptance_errors": [],
+  "started_at_utc": "2026-10-09T10:57:32Z",
+  "manifest": {
+    "mode": "local-harness-check",
+    "origin": "http://127.0.0.1:36061",
+    "database": {
+      "host": null,
+      "port": null,
+      "database": "/tmp/pytest-of-agent/pytest-6/test_cli_success_None_0/fixture.db"
+    }
+  },
+  "label": "burst",
+  "finished_at_utc": "2026-10-09T10:57:45Z",
+  "peak_in_flight": 2000,
+  "login_concurrency": 32,
+  "projector_ms": {
+    "p50": 0.0,
+    "p95": 0.0,
+    "p99": 0.0,
+    "max": 0.0
+  },
+  "session_ids": [
+    10
+  ],
+  "first_student": 1,
+  "burst_concurrency": 0,
+  "projector_watchers": 0,
+  "login_noise": 0,
+  "projector_polls": 0,
+  "projector_polls_by_watcher": {},
+  "noise_attempts": 0,
+  "noise_failures": {},
+  "warm_connections": false,
+  "completion_ms": {
+    "p50": 2053.3425510000143,
+    "p95": 2860.262519999992,
+    "p99": 2903.8994040000716,
+    "max": 2915.2916919999825
+  },
+  "dispatch_ms": {
+    "p50": 666.3496119999763,
+    "p95": 1214.1758720000553,
+    "max": 1271.7747789999976
+  },
+  "slo_errors": [
+    "scan_p50_slo_exceeded",
+    "scan_p95_slo_exceeded",
+    "scan_p99_slo_exceeded"
+  ],
+  "students": 2000,
+  "authenticated": 2000,
+  "login_wall_s": 8.951068107000083,
+  "login_failures": {},
+  "burst_wall_s": 2.9160705310000594,
+  "scans_per_second": 685.8544670776893,
+  "client_ms": {
+    "p50": 1304.4420960000025,
+    "p75": 1867.4601940000457,
+    "p90": 2079.912820000004,
+    "p95": 2134.1463730000214,
+    "p99": 2199.4699730000775,
+    "max": 2223.333615999991
+  },
+  "server_stage_ms": {
+    "p50": 0.0,
+    "p95": 0.0,
+    "p99": 0.0
+  },
+  "statuses": {
+    "200": 2000
+  },
+  "outcomes": {
+    "success": 2000
+  },
+  "verified": {
+    "rows": 2000,
+    "distinct_students": 2000,
+    "duplicate_rows": 0,
+    "missing_pairs": 0
+  },
+  "correctness_passed": true,
+  "projector_failures": {}
+}

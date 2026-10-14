@@ -1,0 +1,90 @@
+{
+  "schema_version": 2,
+  "passed": false,
+  "capacity_accepted": false,
+  "acceptance_errors": [
+    "not_all_students_authenticated",
+    "not_all_scans_succeeded",
+    "unexpected_http_or_transport_result",
+    "attendance_not_verified_exactly_once",
+    "browser_deadline_exceeded_or_missing_results"
+  ],
+  "started_at_utc": "2026-10-09T10:58:45Z",
+  "manifest": {
+    "mode": "local-harness-check",
+    "origin": "http://127.0.0.1:40497",
+    "database": {
+      "host": null,
+      "port": null,
+      "database": "/tmp/pytest-of-agent/pytest-7/test_cli_redirect_not_all_stud0/fixture.db"
+    }
+  },
+  "label": "burst",
+  "finished_at_utc": "2026-10-09T10:58:45Z",
+  "peak_in_flight": 0,
+  "login_concurrency": 32,
+  "projector_ms": {
+    "p50": 0.0,
+    "p95": 0.0,
+    "p99": 0.0,
+    "max": 0.0
+  },
+  "session_ids": [
+    10
+  ],
+  "first_student": 1,
+  "burst_concurrency": 0,
+  "projector_watchers": 0,
+  "login_noise": 0,
+  "projector_polls": 0,
+  "projector_polls_by_watcher": {},
+  "noise_attempts": 0,
+  "noise_failures": {},
+  "warm_connections": false,
+  "completion_ms": {
+    "p50": 0.0,
+    "p95": 0.0,
+    "p99": 0.0,
+    "max": 0.0
+  },
+  "dispatch_ms": {
+    "p50": 0.0,
+    "p95": 0.0,
+    "max": 0.0
+  },
+  "slo_errors": [
+    "missing_or_invalid_completion_latency",
+    "incomplete_completion_samples"
+  ],
+  "students": 20,
+  "authenticated": 0,
+  "login_wall_s": 0.05310460099997272,
+  "login_failures": {
+    "login_error:RequestException": 20
+  },
+  "burst_wall_s": 4.921699996884854e-05,
+  "scans_per_second": 0.0,
+  "client_ms": {
+    "p50": 0.0,
+    "p75": 0.0,
+    "p90": 0.0,
+    "p95": 0.0,
+    "p99": 0.0,
+    "max": 0
+  },
+  "server_stage_ms": {
+    "p50": 0.0,
+    "p95": 0.0,
+    "p99": 0.0
+  },
+  "statuses": {},
+  "outcomes": {},
+  "verified": {
+    "rows": 0,
+    "distinct_students": 0,
+    "duplicate_rows": 0,
+    "missing_pairs": 20
+  },
+  "correctness_passed": false,
+  "projector_failures": {}
+}

@@ -1,0 +1,93 @@
+{
+  "schema_version": 2,
+  "passed": false,
+  "capacity_accepted": false,
+  "acceptance_errors": [
+    "not_all_students_authenticated",
+    "not_all_scans_succeeded",
+    "unexpected_http_or_transport_result",
+    "attendance_not_verified_exactly_once",
+    "browser_deadline_exceeded_or_missing_results"
+  ],
+  "started_at_utc": "2026-10-09T10:58:39Z",
+  "manifest": {
+    "mode": "local-harness-check",
+    "origin": "http://127.0.0.1:36427",
+    "database": {
+      "host": null,
+      "port": null,
+      "database": "/tmp/pytest-of-agent/pytest-7/test_cli_partial_login_not_all0/fixture.db"
+    }
+  },
+  "label": "burst",
+  "finished_at_utc": "2026-10-09T10:58:40Z",
+  "peak_in_flight": 19,
+  "login_concurrency": 32,
+  "projector_ms": {
+    "p50": 0.0,
+    "p95": 0.0,
+    "p99": 0.0,
+    "max": 0.0
+  },
+  "session_ids": [
+    10
+  ],
+  "first_student": 1,
+  "burst_concurrency": 0,
+  "projector_watchers": 0,
+  "login_noise": 0,
+  "projector_polls": 0,
+  "projector_polls_by_watcher": {},
+  "noise_attempts": 0,
+  "noise_failures": {},
+  "warm_connections": false,
+  "completion_ms": {
+    "p50": 22.357159000080173,
+    "p95": 27.06564499999331,
+    "p99": 27.06564499999331,
+    "max": 27.06564499999331
+  },
+  "dispatch_ms": {
+    "p50": 7.4610130000110075,
+    "p95": 14.138979999984258,
+    "max": 14.138979999984258
+  },
+  "slo_errors": [
+    "incomplete_completion_samples"
+  ],
+  "students": 20,
+  "authenticated": 19,
+  "login_wall_s": 0.17158245400003125,
+  "login_failures": {
+    "login_http_403": 1
+  },
+  "burst_wall_s": 0.02711987300006058,
+  "scans_per_second": 700.5932513016398,
+  "client_ms": {
+    "p50": 14.48291999997764,
+    "p75": 16.584910000005948,
+    "p90": 17.973528000084116,
+    "p95": 19.257597999967402,
+    "p99": 19.257597999967402,
+    "max": 19.257597999967402
+  },
+  "server_stage_ms": {
+    "p50": 0.0,
+    "p95": 0.0,
+    "p99": 0.0
+  },
+  "statuses": {
+    "200": 19
+  },
+  "outcomes": {
+    "success": 19
+  },
+  "verified": {
+    "rows": 19,
+    "distinct_students": 19,
+    "duplicate_rows": 0,
+    "missing_pairs": 1
+  },
+  "correctness_passed": false,
+  "projector_failures": {}
+}

@@ -28,7 +28,9 @@ every admitted scan is in the database exactly once.
 
     python loadtest/scan_burst.py --host https://staging.example \\
         --students 2000 --session-id 1 --secret "$TARGET_SECRET_KEY" \\
-        --database-url "$DATABASE_URL"
+        --database-url "$DATABASE_URL" \
+        --staging-manifest staging.json --confirm-staging-writes \
+        --json-out burst-01.json
 
 Never point it at production: successful runs create attendance.
 """
@@ -48,6 +50,7 @@ import statistics  # noqa: E402
 import sys  # noqa: E402
 import time  # noqa: E402
 import uuid  # noqa: E402
+from urllib.parse import urljoin, urlsplit  # noqa: E402
 from collections import Counter  # noqa: E402
 
 import gevent  # noqa: E402
@@ -57,7 +60,10 @@ from gevent.pool import Pool  # noqa: E402
 from sqlalchemy import create_engine  # noqa: E402
 from scan_validation import (  # noqa: E402
     acceptance_errors, attendance_counts, expected_attendance, verify_attendance,
+    validate_sessions,
 )
+
+from staging_guard import validate_target, latency_errors  # noqa: E402
 
 _METRES_PER_DEGREE_LAT = 111_194.9266
 
@@ -118,6 +124,19 @@ class _AcceptSecureCookies(requests.cookies.RequestsCookieJar):
         return super().set_cookie(cookie, *args, **kwargs)
 
 
+class SameOriginSession(requests.Session):
+    """Refuse redirects off the reviewed target, including during login."""
+
+    def get_redirect_target(self, response):
+        location = super().get_redirect_target(response)
+        if location:
+            source = urlsplit(response.url)
+            target = urlsplit(urljoin(response.url, location))
+            if (source.scheme, source.netloc) != (target.scheme, target.netloc):
+                raise requests.RequestException('Cross-origin redirect refused')
+        return location
+
+
 class Phone:
     """One student's browser: a cookie jar, a CSRF token, a seat."""
 
@@ -127,7 +146,7 @@ class Phone:
     def __init__(self, number, session_id, lat, lon):
         self.number = number
         self.session_id = session_id
-        self.session = requests.Session()
+        self.session = SameOriginSession()
         self.csrf = None
         self.marker = None
         self.lat = lat
@@ -239,7 +258,7 @@ def main():
     parser.add_argument('--lon', type=float,
                         default=float(os.environ.get('CLASS_LON', '3.4372')))
     parser.add_argument('--spread-m', type=float, default=25.0)
-    parser.add_argument('--login-concurrency', type=int, default=32,
+    parser.add_argument('--login-concurrency', type=int, default=1,
                         help='Phase 1 only. Kept low on purpose: password '
                              'verification is CPU-bound, and saturating it '
                              'here would just be the login stampede test.')
@@ -278,7 +297,9 @@ def main():
                              'measures that case; turning it on measures the '
                              'best case.')
     parser.add_argument('--label', default='burst')
-    parser.add_argument('--json-out', default='')
+    parser.add_argument('--json-out', required=True)
+    parser.add_argument('--staging-manifest', required=True)
+    parser.add_argument('--confirm-staging-writes', action='store_true')
     parser.add_argument('--insecure', action='store_true',
                         help='skip TLS verification (self-signed rehearsal certs)')
     parser.add_argument('--proxied-https', action='store_true',
@@ -293,6 +314,27 @@ def main():
     parser.add_argument('--database-url', default=os.environ.get('DATABASE_URL', ''),
                         help='required: verify the exact student/session cohort')
     arguments = parser.parse_args()
+
+    if not arguments.confirm_staging_writes:
+        parser.error('--confirm-staging-writes is required; attendance will be created')
+    try:
+        manifest = validate_target(arguments.staging_manifest, arguments.host,
+                                   arguments.database_url)
+        if manifest['mode'] == 'staging' and (arguments.insecure or arguments.proxied_https):
+            raise ValueError('Staging must use verified TLS through its real ingress')
+    except Exception as error:
+        parser.error(f'Target manifest rejected ({type(error).__name__}); check staging prerequisites')
+    # Exclusive creation prevents overwriting a previous measurement. Even a
+    # crash leaves explicit non-passing evidence, never a stale success report.
+    initial_report = {'schema_version': 2, 'passed': False, 'capacity_accepted': False,
+                      'acceptance_errors': ['run_incomplete'],
+                      'started_at_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                      'manifest': manifest}
+    try:
+        with open(arguments.json_out, 'x', encoding='utf-8') as handle:
+            json.dump(initial_report, handle, indent=2)
+    except OSError:
+        parser.error('Results path must be writable and must not already exist')
 
     if not arguments.secret:
         parser.error('--secret (or TARGET_SECRET_KEY) is required: the tool '
@@ -320,11 +362,12 @@ def main():
 
     # Check BEFORE any writes. Old attendance must never masquerade as the
     # result of this burst, and another class's rows must not affect it.
-    engine = create_engine(arguments.database_url)
     try:
+        engine = create_engine(arguments.database_url)
         expected = expected_attendance(engine, [
             arguments.email_pattern.format(n=number) for number in numbers
         ], session_ids)
+        validate_sessions(engine, expected)
         if attendance_counts(engine, expected):
             parser.error('This cohort already has attendance; use fresh staging sessions')
     except Exception as error:
@@ -366,7 +409,11 @@ def main():
         print(f'  login failures: {dict(login_failures)}')
 
     # ---------------- Phase 2: the burst (timed) ---------------------------
+    in_flight = 0
+    peak_in_flight = 0
     latencies = []
+    completion_ms = []
+    dispatch_ms = []
     outcomes = Counter()
     statuses = Counter()
     server_ms = []
@@ -374,15 +421,19 @@ def main():
     gate = gevent.event.Event()
 
     def do_scan(phone):
+        nonlocal in_flight, peak_in_flight
         gate.wait()
         # Concurrency, when capped, is capped AFTER the gate. Capping it by
         # sizing the spawn pool instead would block the main greenlet inside
         # the spawn loop and it would never reach gate.set().
         if throttle is not None:
             throttle.acquire()
+        in_flight += 1
+        peak_in_flight = max(peak_in_flight, in_flight)
         try:
             _run_scan(phone)
         finally:
+            in_flight -= 1
             if throttle is not None:
                 throttle.release()
 
@@ -393,6 +444,7 @@ def main():
         body['qr_data'] = burst_tokens[phone.session_id]
         body['captured_at'] = burst_captured_at
         request_started = time.perf_counter()
+        dispatch_ms.append((request_started - burst_started) * 1000)
         try:
             # requests' timeout alone is a socket inactivity timeout, not
             # the browser's total AbortController deadline.
@@ -406,8 +458,10 @@ def main():
         except (requests.RequestException, gevent.Timeout) as error:
             outcomes[f'transport:{type(error).__name__}'] += 1
             statuses['transport_error'] += 1
+            completion_ms.append((time.perf_counter() - burst_started) * 1000)
             return
         latencies.append((time.perf_counter() - request_started) * 1000)
+        completion_ms.append((time.perf_counter() - burst_started) * 1000)
         statuses[response.status_code] += 1
         # Server-Timing carries the per-stage numbers the app measured for
         # THIS request, which is how client-observed queueing is told apart
@@ -430,6 +484,7 @@ def main():
     noise_shed = Counter()
 
     def login_noise(seed):
+        gate.wait()
         number = arguments.first_student + arguments.students + seed
         while not noise_stop.is_set():
             phone = Phone(number, session_ids[0], arguments.lat, arguments.lon)
@@ -451,8 +506,11 @@ def main():
     feed_latencies = []
     feed_bytes = []
     feed_failures = Counter()
+    feed_counts = Counter()
 
-    def projector(session_id):
+    projector_ready = [gevent.event.Event() for _ in range(arguments.projector_watchers)]
+
+    def projector(index, session_id):
         lecturer = Phone(0, session_id, arguments.lat, arguments.lon)
         if proxy_headers:
             lecturer.session.cookies = _AcceptSecureCookies()
@@ -465,6 +523,8 @@ def main():
             feed_failures[f'projector_login:{reason}'] += 1
             return
         watcher = lecturer.session
+        projector_ready[index].set()
+        gate.wait()
         cursor = 0
         while not noise_stop.is_set():
             started = time.perf_counter()
@@ -475,16 +535,25 @@ def main():
                     headers=proxy_headers, timeout=60, verify=verify)
                 feed_latencies.append((time.perf_counter() - started) * 1000)
                 feed_bytes.append(len(response.content))
+                feed_counts[index] += 1
                 if response.status_code == 200:
                     cursor = response.json().get('last_id', cursor)
                 else:
                     feed_failures[response.status_code] += 1
-            except requests.RequestException as error:
+            except (requests.RequestException, ValueError, TypeError, AttributeError) as error:
                 feed_failures[type(error).__name__] += 1
             gevent.sleep(arguments.projector_interval)
 
-    watchers = [gevent.spawn(projector, session_ids[index % len(session_ids)])
+    watchers = [gevent.spawn(projector, index, session_ids[index % len(session_ids)])
                 for index in range(arguments.projector_watchers)]
+
+    # Authenticate projectors before timing the scan burst, then release their
+    # polls at the same barrier. A missing watcher cannot silently pass.
+    with gevent.Timeout(60, False):
+        for event in projector_ready:
+            event.wait()
+    if any(not event.is_set() for event in projector_ready):
+        feed_failures['projector_not_ready'] += 1
 
     if not arguments.warm_connections:
         # Drop the sockets Phase 1 left open, so the burst pays for the
@@ -505,6 +574,11 @@ def main():
     noise_stop.set()
     gevent.joinall(noise, timeout=30)
     gevent.joinall(watchers, timeout=30)
+    for task in noise + watchers:
+        if not task.ready() or not task.successful():
+            feed_failures['background_task_incomplete_or_crashed'] += 1
+        if not task.ready():
+            task.kill(block=True)
 
     admitted = outcomes.get('success', 0) + outcomes.get('duplicate', 0)
     print(f'\nPhase 2 — the burst ({len(ready)} simultaneous scans)')
@@ -550,17 +624,48 @@ def main():
 
     errors = acceptance_errors(arguments.students, len(ready), outcomes,
                                statuses, verified, latencies, feed_failures)
-    if arguments.projector_watchers and not feed_latencies:
+    if any(not feed_counts[index] for index in range(arguments.projector_watchers)):
         errors.append('projector_not_measured')
     if arguments.burst_concurrency and arguments.burst_concurrency < arguments.students:
         errors.append('not_a_simultaneous_full_cohort_burst')
-    print(f'\nAcceptance: {"FAIL: " + ", ".join(errors) if errors else "PASS"}')
+    slo_errors = latency_errors(completion_ms)
+    if len(completion_ms) != arguments.students:
+        slo_errors.append('incomplete_completion_samples')
+    if arguments.login_noise and not noise_logins:
+        errors.append('login_interference_not_measured')
+    if any(key not in ('login_http_429_after_retries', 'login_http_503_after_retries')
+           for key in noise_shed):
+        errors.append('invalid_login_interference')
+    print(f'\nAcceptance: {"FAIL: " + ", ".join(errors + slo_errors) if errors or slo_errors else "PASS"}')
 
     if arguments.json_out:
         ordered = sorted(latencies)
         with open(arguments.json_out, 'w', encoding='utf-8') as handle:
             json.dump({
+                **initial_report,
                 'label': arguments.label,
+                'finished_at_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                'peak_in_flight': peak_in_flight,
+                'login_concurrency': arguments.login_concurrency,
+                'projector_ms': {stat: percentile(sorted(feed_latencies), ratio)
+                    for stat, ratio in (('p50', .50), ('p95', .95), ('p99', .99), ('max', 1))},
+                'session_ids': session_ids,
+                'first_student': arguments.first_student,
+                'burst_concurrency': arguments.burst_concurrency,
+                'projector_watchers': arguments.projector_watchers,
+                'login_noise': arguments.login_noise,
+                'projector_polls': len(feed_latencies),
+                'projector_polls_by_watcher': dict(feed_counts),
+                'noise_attempts': len(noise_logins),
+                'noise_failures': dict(noise_shed),
+                'warm_connections': arguments.warm_connections,
+                'completion_ms': {stat: percentile(sorted(completion_ms), ratio)
+                    for stat, ratio in (('p50', .50), ('p95', .95), ('p99', .99), ('max', 1))},
+                'dispatch_ms': {stat: percentile(sorted(dispatch_ms), ratio)
+                    for stat, ratio in (('p50', .50), ('p95', .95), ('max', 1))},
+                'slo_errors': slo_errors,
+                'capacity_accepted': (not errors and not slo_errors
+                    and arguments.students == 2000 and manifest['mode'] == 'staging'),
                 'students': arguments.students,
                 'authenticated': len(ready),
                 'login_wall_s': login_wall,
@@ -577,13 +682,14 @@ def main():
                 'statuses': {str(key): value for key, value in statuses.items()},
                 'outcomes': dict(outcomes),
                 'verified': verified,
-                'passed': not errors,
+                'passed': not errors and not slo_errors,
+                'correctness_passed': not errors,
                 'acceptance_errors': errors,
                 'projector_failures': dict(feed_failures),
             }, handle, indent=2)
         print(f'\nwrote {arguments.json_out}')
 
-    return 1 if errors else 0
+    return 1 if errors or slo_errors else 0
 
 
 if __name__ == '__main__':

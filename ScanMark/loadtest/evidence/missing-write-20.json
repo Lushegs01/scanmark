@@ -1,0 +1,85 @@
+{
+  "schema_version": 2,
+  "passed": false,
+  "capacity_accepted": false,
+  "acceptance_errors": [
+    "attendance_not_verified_exactly_once"
+  ],
+  "started_at_utc": "2026-10-09T10:58:36Z",
+  "manifest": {
+    "mode": "local-harness-check",
+    "origin": "http://127.0.0.1:45523",
+    "database": {
+      "host": null,
+      "port": null,
+      "database": "/tmp/pytest-of-agent/pytest-7/test_cli_missing_write_attenda0/fixture.db"
+    }
+  },
+  "label": "burst",
+  "finished_at_utc": "2026-10-09T10:58:37Z",
+  "peak_in_flight": 20,
+  "login_concurrency": 32,
+  "projector_ms": {
+    "p50": 0.0,
+    "p95": 0.0,
+    "p99": 0.0,
+    "max": 0.0
+  },
+  "session_ids": [
+    10
+  ],
+  "first_student": 1,
+  "burst_concurrency": 0,
+  "projector_watchers": 0,
+  "login_noise": 0,
+  "projector_polls": 0,
+  "projector_polls_by_watcher": {},
+  "noise_attempts": 0,
+  "noise_failures": {},
+  "warm_connections": false,
+  "completion_ms": {
+    "p50": 21.239514999933817,
+    "p95": 26.469266999924912,
+    "p99": 27.43647499994495,
+    "max": 27.43647499994495
+  },
+  "dispatch_ms": {
+    "p50": 6.6267909999169206,
+    "p95": 12.086341999975048,
+    "max": 12.690498999972988
+  },
+  "slo_errors": [],
+  "students": 20,
+  "authenticated": 20,
+  "login_wall_s": 0.17067182400001002,
+  "login_failures": {},
+  "burst_wall_s": 0.02747636699996292,
+  "scans_per_second": 727.8982698122715,
+  "client_ms": {
+    "p50": 14.628711999989719,
+    "p75": 15.10372899997492,
+    "p90": 18.859758999951737,
+    "p95": 19.48443399999178,
+    "p99": 20.405102000040642,
+    "max": 20.405102000040642
+  },
+  "server_stage_ms": {
+    "p50": 0.0,
+    "p95": 0.0,
+    "p99": 0.0
+  },
+  "statuses": {
+    "200": 20
+  },
+  "outcomes": {
+    "success": 20
+  },
+  "verified": {
+    "rows": 19,
+    "distinct_students": 19,
+    "duplicate_rows": 0,
+    "missing_pairs": 1
+  },
+  "correctness_passed": false,
+  "projector_failures": {}
+}

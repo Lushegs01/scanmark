@@ -1,0 +1,89 @@
+{
+  "schema_version": 2,
+  "passed": false,
+  "capacity_accepted": false,
+  "acceptance_errors": [
+    "projector_failed"
+  ],
+  "started_at_utc": "2026-10-09T10:58:41Z",
+  "manifest": {
+    "mode": "local-harness-check",
+    "origin": "http://127.0.0.1:38669",
+    "database": {
+      "host": null,
+      "port": null,
+      "database": "/tmp/pytest-of-agent/pytest-7/test_cli_bad_projector_project0/fixture.db"
+    }
+  },
+  "label": "burst",
+  "finished_at_utc": "2026-10-09T10:58:42Z",
+  "peak_in_flight": 20,
+  "login_concurrency": 32,
+  "projector_ms": {
+    "p50": 16.789538000011817,
+    "p95": 16.789538000011817,
+    "p99": 16.789538000011817,
+    "max": 16.789538000011817
+  },
+  "session_ids": [
+    10
+  ],
+  "first_student": 1,
+  "burst_concurrency": 0,
+  "projector_watchers": 1,
+  "login_noise": 0,
+  "projector_polls": 1,
+  "projector_polls_by_watcher": {
+    "0": 1
+  },
+  "noise_attempts": 0,
+  "noise_failures": {},
+  "warm_connections": false,
+  "completion_ms": {
+    "p50": 20.827776000032827,
+    "p95": 25.331109000035212,
+    "p99": 26.289492000046266,
+    "max": 26.289492000046266
+  },
+  "dispatch_ms": {
+    "p50": 7.517064000012397,
+    "p95": 13.03185000006124,
+    "max": 13.618928000028063
+  },
+  "slo_errors": [],
+  "students": 20,
+  "authenticated": 20,
+  "login_wall_s": 0.18199937500003216,
+  "login_failures": {},
+  "burst_wall_s": 0.026339351000046918,
+  "scans_per_second": 759.3201518125627,
+  "client_ms": {
+    "p50": 12.9114200000231,
+    "p75": 15.948412000057033,
+    "p90": 16.640674999962357,
+    "p95": 16.81184699998539,
+    "p99": 17.816237000033652,
+    "max": 17.816237000033652
+  },
+  "server_stage_ms": {
+    "p50": 0.0,
+    "p95": 0.0,
+    "p99": 0.0
+  },
+  "statuses": {
+    "200": 20
+  },
+  "outcomes": {
+    "success": 20
+  },
+  "verified": {
+    "rows": 20,
+    "distinct_students": 20,
+    "duplicate_rows": 0,
+    "missing_pairs": 0
+  },
+  "correctness_passed": false,
+  "projector_failures": {
+    "JSONDecodeError": 1
+  }
+}
