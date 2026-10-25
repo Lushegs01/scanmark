@@ -1,0 +1,12 @@
+# Nightly database backup, started by scanmark-backup.timer. Installed by
+# setup.sh. Run it by hand with: sudo systemctl start scanmark-backup
+[Unit]
+Description=ScanMark database backup
+After=postgresql.service
+
+[Service]
+Type=oneshot
+User=scanmark
+Group=scanmark
+EnvironmentFile=/etc/scanmark/backup.env
+ExecStart=/opt/scanmark/src/ScanMark/deploy/oracle/backup.sh

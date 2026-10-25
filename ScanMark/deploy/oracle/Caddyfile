@@ -1,0 +1,21 @@
+# Caddy serves ScanMark over HTTPS. It gets and renews the Let's Encrypt
+# certificate for the domain by itself, redirects HTTP to HTTPS, and passes
+# requests to gunicorn on localhost. setup.sh fills in the domain.
+{
+	servers {
+		# UDP 443 is not opened, so don't advertise HTTP/3.
+		protocols h1 h2
+	}
+}
+
+SCANMARK_DOMAIN {
+	reverse_proxy 127.0.0.1:8000 {
+		transport http {
+			# gunicorn closes idle connections after GUNICORN_KEEPALIVE (75 s).
+			# Caddy keeps them for 2 minutes by default, so it would reuse a
+			# socket gunicorn has already closed and answer 502. The proxy
+			# has to hang up first.
+			keepalive 60s
+		}
+	}
+}

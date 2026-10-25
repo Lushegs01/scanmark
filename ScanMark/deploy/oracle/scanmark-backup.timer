@@ -1,0 +1,12 @@
+# Installed by setup.sh.
+[Unit]
+Description=Nightly ScanMark database backup
+
+[Timer]
+# 02:00 in Lagos, outside class hours.
+OnCalendar=*-*-* 01:00:00 UTC
+# Catch up at boot if the VM was off, or stopped by Oracle, at that time.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

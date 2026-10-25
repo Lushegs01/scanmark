@@ -30,6 +30,13 @@ configuration. The start command is `gunicorn --config gunicorn.conf.py app:app`
 from the `ScanMark` root directory. Verify `/healthz` after changing configuration.
 Do not replace durable services with SQLite or in-memory Redis substitutes.
 
+## Oracle Cloud Always Free
+
+One Ampere A1 VM (2 CPUs, 12 GB) can run the app, PostgreSQL and Redis
+together. `deploy/oracle/README.md` covers the move from Render and Neon,
+and the scripts beside it set the VM up. It is more headroom than Render
+free, not a validated 2,000-student capacity: rehearse it as below.
+
 Attendance's 10/minute limit is explicitly keyed by authenticated student, not
 by the whole class or its public IP. Invalid scans and repeated submissions
 still count. Server-side 429/5xx responses do not consume that allowance, so

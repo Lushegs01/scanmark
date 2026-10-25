@@ -1,0 +1,27 @@
+# ScanMark under gunicorn, behind Caddy. Installed by setup.sh.
+[Unit]
+Description=ScanMark
+After=network-online.target postgresql.service redis-server.service
+Wants=network-online.target postgresql.service redis-server.service
+
+[Service]
+User=scanmark
+Group=scanmark
+WorkingDirectory=/opt/scanmark/src/ScanMark
+EnvironmentFile=/etc/scanmark/scanmark.env
+# Localhost only: Caddy is the way in. Everything else comes from
+# gunicorn.conf.py, the same file Render runs.
+ExecStart=/opt/scanmark/venv/bin/gunicorn --config gunicorn.conf.py --bind 127.0.0.1:8000 app:app
+Restart=always
+RestartSec=5
+# SIGTERM to the gunicorn master, which drains its workers within its 30 s
+# graceful timeout; anything left after that is killed.
+KillMode=mixed
+TimeoutStopSec=40
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
