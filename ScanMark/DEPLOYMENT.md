@@ -109,6 +109,60 @@ deployed commit, proxy configuration and burst results when releasing.
 | **Redis** (`REDIS_URL`) | Sessions, rate limits, class locations, QR token + attendee-feed + QR-image caches. Production **refuses to boot** without it, and pings it at startup so a broken URL fails immediately rather than on the first request (override: `ALLOW_MISSING_REDIS=true`). Without Redis the pinned classroom lives in one worker's memory, so a scan is geofenced only if it happens to land on the same worker. Provision enough memory and prefer eviction policy `volatile-lru` (or `noeviction`) — arbitrary eviction of session keys logs people out mid-class. |
 | **SMTP** (`MAIL_*`) | Signup confirmation links and password resets. That is all ScanMark sends — nothing goes out during a class, so provider quotas are no longer a capacity concern. Verify the settings with `python mail_selftest.py` (below) rather than by signing up and waiting. |
 
+### Moving PostgreSQL from Neon to Render
+
+ScanMark finds its database through `DATABASE_URL` and nothing else — there
+is no provider-specific code, and both the `postgres://` and `postgresql://`
+spellings Render hands out are accepted. Moving providers is a data copy and
+one variable change.
+
+**Render's free database expires.** A free Render Postgres database becomes
+inaccessible 30 days after it is created and is deleted, with its data, 14
+days after that unless it is upgraded. It also has no backups, a fixed 1 GB of
+storage, and only one may exist per workspace. That is not somewhere to keep a
+term of attendance: use a paid Render Postgres plan, or stay on Neon if the
+budget is $0.
+
+1. **Create the database** (Render dashboard → New → Postgres) in the **same
+   region as the web service** — its internal hostname only resolves from
+   services in that region. Choose a PostgreSQL major version at least as new
+   as Neon's (`SHOW server_version;` on Neon).
+2. **Stop writes.** Pick a time with no class running and suspend the web
+   service, so no scan lands in Neon after the copy is taken.
+3. **Dump Neon** using its *direct* connection string (the host without
+   `-pooler`), with a `pg_dump` at least as new as the Neon server:
+
+   ```sh
+   pg_dump --format=custom --no-owner --no-acl "$NEON_DIRECT_URL" --file scanmark.dump
+   ```
+
+4. **Restore into Render** using the database's *External Database URL* (the
+   internal one does not resolve outside Render):
+
+   ```sh
+   pg_restore --no-owner --no-acl --dbname "$RENDER_EXTERNAL_URL" scanmark.dump
+   ```
+
+   Do this **before** the app is pointed at the new database. Every boot runs
+   `db.create_all()` and the idempotent migrations, so an app that reaches the
+   empty database first creates empty tables, and the restore then collides
+   with them. If that has already happened, add `--clean --if-exists` to drop
+   them first. `--no-owner --no-acl` leaves out Neon's own roles, which do not
+   exist on Render. If anything failed, the last line reads `errors ignored on
+   restore: N`.
+5. **Check the copy.** Compare `SELECT count(*) FROM attendance;` and
+   `SELECT count(*) FROM "user";` on both databases.
+6. **Switch.** Set the web service's `DATABASE_URL` to the *Internal Database
+   URL*. Traffic stays on Render's private network, so do not carry over
+   Neon's `?sslmode=require&channel_binding=require` suffix. Resume the
+   service and confirm `/healthz` returns `204`.
+7. **Keep Neon for a few days.** Rolling back is setting `DATABASE_URL` back,
+   but only until new attendance has been written to Render.
+
+The connection budget is unchanged: keep `instances × workers × (pool +
+overflow)` below the Render plan's connection limit (`SHOW max_connections;`).
+The free-plan settings above use 3.
+
 ### Which universities can sign up
 
 ScanMark is not tied to one university. An address is classified from its
@@ -286,7 +340,7 @@ quietly at every phone.
 | `SCANMARK_TIMEZONE` | `Africa/Lagos` | Timezone every displayed time is converted to, and the one "today" is decided in. Storage stays UTC. |
 | `ACADEMIC_YEAR_START_MONTH` / `SECOND_SEMESTER_START_MONTH` | 9 / 2 | Where the academic calendar turns over. Courses carry a year, semester and optional section, so `CSC201` can run again next term without colliding with this term's offering or inheriting its class sessions. |
 | `SECRET_KEY` | — | Required; app refuses to boot in production without it. |
-| `DATABASE_URL` | SQLite (dev only) | Postgres URL in production. |
+| `DATABASE_URL` | SQLite (dev only) | Postgres URL in production. On Render Postgres, the database's *Internal Database URL*. |
 | `REDIS_URL` | — (dev fallback) | Required in production. |
 | `WEB_CONCURRENCY` | `2 × CPUs`, capped at 12 | Gunicorn workers. A scan is CPU-bound Python, so parallelism comes from processes. |
 | `GUNICORN_THREADS` | 2 | Threads per worker — to overlap the wait on Postgres, not to add request slots. Measured: raising this to 8 or 16 *lowers* throughput and roughly doubles p95. See `loadtest/gunicorn-matrix.md`. |
