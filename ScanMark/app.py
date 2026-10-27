@@ -3817,10 +3817,23 @@ def lecturer_dashboard():
             .all()
         }
 
+    # How many students have joined each course: the live attendance
+    # window's headline, class running or not. One grouped COUNT for the
+    # page rather than one per card.
+    enrolled_counts = {}
+    if course_ids:
+        enrolled_counts = dict(
+            db.session.query(enrollments.c.course_id,
+                             func.count(enrollments.c.user_id))
+            .filter(enrollments.c.course_id.in_(course_ids))
+            .group_by(enrollments.c.course_id)
+            .all())
+
     return render_template('lecturer_dashboard.html', courses=my_courses,
                            can_create=can_create,
                            instructor_total=instructor_total,
                            open_sessions=open_sessions,
+                           enrolled_counts=enrolled_counts,
                            live_recent_rows=PROJECTOR_RECENT_ROWS,
                            show_archived=show_archived,
                            is_coordinator=can_create,
@@ -4974,6 +4987,26 @@ def get_qr_image(session_id):
         return send_file(io.BytesIO(png_bytes), mimetype='image/png')
     except ImportError:
         return "QR code library not installed", 500
+
+
+@app.route('/api/course/<int:course_id>/enrolled')
+@login_required
+@limiter.exempt
+def get_course_enrolled(course_id):
+    """
+    How many students have joined a course, for the live attendance window
+    while no class is running. It polls this every few seconds while open,
+    so a lecturer telling the room "join CSC201 now" watches it climb. One
+    indexed COUNT; exempt from the per-user limit like the attendees feed
+    that takes over once a class starts.
+    """
+    course = db.get_or_404(Course, course_id)
+    if not _is_course_authorized(course):
+        return jsonify({"error": "Unauthorised"}), 403
+    response = jsonify({"status": "success",
+                        "enrolled": _enrolled_count(course.id)})
+    response.headers['Cache-Control'] = 'no-store'
+    return response
 
 
 @app.route('/api/session/<int:session_id>/attendees')

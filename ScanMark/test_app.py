@@ -1183,6 +1183,37 @@ class TestLiveAttendanceOnTheDashboard:
         assert 'Edit course' in body
         assert 'fa-eye' not in body
 
+    def test_the_window_shows_how_many_have_joined_the_course(
+            self, appmod, seed, login):
+        """Class running or not: it is what a lecturer checks before starting."""
+        ada = login(seed['coordinator_email'])
+        enrolled_url = f"/api/course/{seed['course_id']}/enrolled"
+        for running in (True, False):
+            if not running:
+                ada.post(f"/session/{seed['session_id']}/end")
+            body = ada.get('/lecturer_dashboard').get_data(as_text=True)
+            assert 'data-enrolled="1"' in body
+            assert f'data-enrolled-url="{enrolled_url}"' in body
+            assert 'data-live-joined' in body
+
+    def test_the_joined_count_follows_students_joining(self, appmod, seed, login):
+        ada = login(seed['coordinator_email'])
+        url = f"/api/course/{seed['course_id']}/enrolled"
+        assert ada.get(url).get_json() == {'status': 'success', 'enrolled': 1}
+
+        tayo = login(seed['other_student_email'])
+        tayo.post('/register_course', data={'course_code': 'CSC201'})
+        response = ada.get(url)
+        assert response.get_json()['enrolled'] == 2
+        assert response.headers['Cache-Control'] == 'no-store'
+
+    def test_only_the_courses_teachers_can_read_the_joined_count(
+            self, appmod, seed, login):
+        url = f"/api/course/{seed['course_id']}/enrolled"
+        assert login(seed['outsider_email']).get(url).status_code == 403
+        assert login(seed['student_email']).get(url).status_code == 403
+        assert appmod.app.test_client().get(url).status_code in (302, 401)
+
     def test_the_feed_says_when_the_class_has_ended(self, appmod, seed, login):
         """An open panel has to learn the class was ended from another screen."""
         ada = login(seed['coordinator_email'])
