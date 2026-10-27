@@ -294,6 +294,13 @@ h1, h2, h3, h4, h5, h6 { font-weight: 700; }
   width: 8px;
 }
 
+/* Present / joined counts. Where the window has the room, the title wraps
+   its session badge before the counts break mid-phrase; on a phone the
+   counts may wrap too, or they push the close button off the screen. */
+@media (min-width: 576px) {
+  .live-feed .live-tally { flex-shrink: 0; }
+}
+
 @keyframes live-dot-pulse {
   0%   { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(40, 167, 69, 0.7); }
   70%  { transform: scale(1);    box-shadow: 0 0 0 8px rgba(40, 167, 69, 0); }
