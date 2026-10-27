@@ -61,20 +61,31 @@
     // catch a code that is already large or off-centre, and does not need the
     // full working resolution to do it; spending it there doubled the cost of
     // the most common frame for nothing.
-    const HUNT_REGIONS = [
-        { fraction: 1, width: 512 },
-        { fraction: 0.55, width: 720 },
-        { fraction: 0.32, width: 720 },
-        { fraction: 0.55, width: 720 }
-    ];
+    const WIDE = { fraction: 1, width: 512 };
+    const MIDDLE = { fraction: 0.55, width: 720 };
+    const CENTRE = { fraction: 0.32, width: 720 };
+    // The back of a lecture hall. From 14m a projected code lands on one or
+    // two camera pixels per module, which no decoder's finder-pattern scan
+    // locks onto. Rendered 3x it gets edges it can place between pixels; the
+    // detail is not new, but the decoder could not use it at 1x. Only this
+    // pass pays for that, and it is small: a fifth of the short edge.
+    const FAR = { fraction: 0.2, width: 720, upscale: 3 };
+    const HUNT_REGIONS = [WIDE, MIDDLE, CENTRE, MIDDLE, FAR];
     const TARGET_INTERVAL_MS = 70;
     // Consecutive frames that find nothing before the scanner changes
     // something about how it is looking. Roughly a second of not finding it.
     const ESCALATE_AFTER_MISSES = 10;
-    // Transitions per sampled pixel above which the middle of the frame holds
-    // something finely striped — a code too small or too blurred to decode,
-    // rather than a wall. Calibrated well above sensor noise.
+    // Light/dark crossings per sampled pixel, in the busiest patch of the
+    // middle of the frame, above which it holds something finely striped — a
+    // code too small or too blurred to decode, rather than a wall.
     const PATTERN_THRESHOLD = 0.03;
+    // How far either side of the middle of a patch's range a pixel must be to
+    // count as light or dark. Well above sensor noise, well below the
+    // black-to-white swing of even a washed-out projected code.
+    const PATTERN_HYSTERESIS = 16;
+    // Patches per side of the region judged. A distant code fills one of
+    // them; averaged over the whole middle it would vanish into the wall.
+    const PATTERN_TILES = 5;
     // How old a fix may be before we look for a better one. Deliberately
     // tighter than the server's limit, so there is room to get a fresh fix
     // and still post inside it.
@@ -132,6 +143,21 @@
     let enhancing = false;
     let adapting = false;
     let resolutionRaised = false;
+    // The zoom the page wants the camera at: null when it cannot zoom. Kept
+    // here rather than read back from the track, because a camera restarted
+    // for a new resolution comes back at its default and has to be told again.
+    let zoomLevel = null;
+    // Where this camera starts. Not necessarily the minimum: a phone that
+    // exposes its ultra-wide lens as 0.5x opens at 1x, and "undoing" a zoom
+    // to 0.5x would swap to the soft, fixed-focus lens.
+    let zoomDefault = null;
+    // The student moved the zoom slider. Like the torch, the hunt then leaves
+    // zoom alone: it used to put the camera back at 1x a couple of seconds
+    // after every drag, which is exactly when someone at the back had just
+    // framed the code.
+    let zoomManual = false;
+    let zoomPending = null;
+    let zoomApplying = false;
 
     function status(message, type) {
         statusBadge.textContent = message;
@@ -261,22 +287,62 @@
     }
 
     async function applyCameraSettings() {
-        if (!track || !track.getCapabilities) return;
-        capabilities = track.getCapabilities() || {};
-        const settings = {};
+        capabilities = (track && track.getCapabilities && track.getCapabilities()) || {};
+        zoomLevel = zoomDefault = capabilities.zoom
+            ? clampZoom(trackSetting('zoom', capabilities.zoom.min || 1)) : null;
         if (capabilities.focusMode && capabilities.focusMode.includes('continuous')) {
-            settings.focusMode = 'continuous';
+            await applyAdvanced({ focusMode: 'continuous' });
         }
-        if (Object.keys(settings).length) {
-            try { await track.applyConstraints({ advanced: [settings] }); } catch (_) {}
-        }
-        if (capabilities.zoom) {
-            const current = track.getSettings().zoom || capabilities.zoom.min || 1;
-            zoomSlider.min = capabilities.zoom.min;
-            zoomSlider.max = capabilities.zoom.max;
-            zoomSlider.step = capabilities.zoom.step || 0.1;
-            zoomSlider.value = current;
-            zoomLabel.textContent = `${Number(current).toFixed(1)}x`;
+        syncZoomSlider();
+    }
+
+    function clampZoom(level) {
+        const range = capabilities.zoom;
+        return Math.min(range.max, Math.max(range.min, Number(level)));
+    }
+
+    function showZoom(level, moveSlider) {
+        // Not while the student is dragging it: the value just applied is
+        // already behind their finger, and writing it back yanks the thumb.
+        if (moveSlider) zoomSlider.value = level;
+        zoomLabel.textContent = `${Number(level).toFixed(1)}x`;
+    }
+
+    /**
+     * Fit the slider to the camera's zoom range, or hide it when there is
+     * none: a slider that moves while the picture does not reads as broken.
+     */
+    function syncZoomSlider() {
+        const range = capabilities.zoom;
+        zoomSlider.parentElement.style.display = range ? '' : 'none';
+        if (!range) return;
+        zoomSlider.min = range.min;
+        zoomSlider.max = range.max;
+        zoomSlider.step = range.step || 0.1;
+        if (zoomLevel !== null) showZoom(zoomLevel, true);
+    }
+
+    /**
+     * Apply the newest slider position, coalescing the rest.
+     *
+     * One drag fires dozens of input events. Awaiting each in turn queues
+     * constraint changes the camera is still working through long after the
+     * finger has stopped; only the last position matters.
+     */
+    async function requestZoom(level) {
+        zoomLevel = clampZoom(level);
+        zoomPending = zoomLevel;
+        showZoom(zoomLevel, false);
+        if (zoomApplying) return;
+        zoomApplying = true;
+        try {
+            while (zoomPending !== null && track) {
+                const next = zoomPending;
+                zoomPending = null;
+                await applyAdvanced({ zoom: next });
+            }
+        } finally {
+            zoomApplying = false;
         }
     }
 
@@ -298,6 +364,8 @@
         resolutionRaised = false;
         torchManual = false;
         torchEnabled = false;
+        zoomManual = false;
+        zoomPending = null;
         cameraStartedAt = performance.now();
         startWatchingLocation();
         container.style.display = 'block';
@@ -355,6 +423,7 @@
         if (stream) stream.getTracks().forEach(mediaTrack => mediaTrack.stop());
         stream = track = null;
         video.srcObject = null;
+        video.style.width = '';
         loader.style.display = 'none';
         container.style.display = 'none';
         document.body.style.overflow = '';
@@ -376,7 +445,8 @@
             Math.floor(Math.min(sourceWidth, sourceHeight) * region.fraction));
         const sourceX = Math.floor((sourceWidth - cropSize) / 2);
         const sourceY = Math.floor((sourceHeight - cropSize) / 2);
-        const output = Math.min(region.width, Math.floor(cropSize * MAX_UPSCALE));
+        const output = Math.min(region.width,
+            Math.floor(cropSize * (region.upscale || MAX_UPSCALE)));
         if (analysisCanvas.width !== output || analysisCanvas.height !== output) {
             analysisCanvas.width = output;
             analysisCanvas.height = output;
@@ -413,27 +483,69 @@
      * Roughly: is there something finely striped in the middle of this?
      *
      * A QR code is dense black-and-white transitions; a wall, a face or an
-     * empty screen is not. Counting transitions along a few sampled rows is
-     * cheap and separates the two well enough to steer the camera. Lots of
+     * empty screen is not. Counting them along a few sampled rows is cheap
+     * and separates the two well enough to steer the camera. Lots of
      * transitions and still no decode means a real code that is too small or
      * too blurred — worth zooming into. None means there is nothing here, and
      * zooming would only narrow the search.
+     *
+     * Judged per patch, and the busiest patch wins: a code at the back of the
+     * hall fills one patch, and averaged over the whole middle it used to
+     * read as a blank wall — so the hunt never zoomed for exactly the scan
+     * that needed it. A crossing is a swing from the dark side of the patch's
+     * range to the light side, which still counts the soft, upscaled edges
+     * of a distant code and the grey "black" of a projector, where a fixed
+     * step between neighbouring pixels did not.
      */
     function patternEnergy(grey, width, height) {
-        const rows = 16;
-        let transitions = 0;
-        let sampled = 0;
-        for (let row = 1; row <= rows; row++) {
-            const y = Math.floor(height * row / (rows + 1)) * width;
-            let previous = grey[y];
-            for (let x = 1; x < width; x++) {
-                const value = grey[y + x];
-                if (Math.abs(value - previous) > 40) transitions++;
-                previous = value;
+        const size = Math.floor(Math.min(width, height) / PATTERN_TILES);
+        if (size < 8) return 0;
+        // Patches overlap by half, so a code sitting where four of them meet
+        // still lands whole in one.
+        const stride = size >> 1;
+        const rowsPerTile = 6;
+        const sampled = rowsPerTile * size;
+        let best = 0;
+        for (let y0 = 0; y0 + size <= height; y0 += stride) {
+            const rows = [];
+            for (let r = 1; r <= rowsPerTile; r++) {
+                rows.push((y0 + Math.floor(size * r / (rowsPerTile + 1))) * width);
             }
-            sampled += width;
+            for (let x0 = 0; x0 + size <= width; x0 += stride) {
+                let low = 255;
+                let high = 0;
+                for (const y of rows) {
+                    for (let x = x0; x < x0 + size; x++) {
+                        const value = grey[y + x];
+                        if (value < low) low = value;
+                        if (value > high) high = value;
+                    }
+                }
+                if (high - low < 2 * PATTERN_HYSTERESIS) continue;   // flat: noise only
+                // The middle of the patch's own range, not its mean: a code
+                // on a white slide is mostly white, and its mean sits so close
+                // to white that nothing in it reads as lighter.
+                const middle = (low + high) / 2;
+                const dark = middle - PATTERN_HYSTERESIS;
+                const light = middle + PATTERN_HYSTERESIS;
+                let crossings = 0;
+                for (const y of rows) {
+                    let state = 0;
+                    for (let x = x0; x < x0 + size; x++) {
+                        const value = grey[y + x];
+                        if (value > light && state !== 1) {
+                            if (state) crossings++;
+                            state = 1;
+                        } else if (value < dark && state !== -1) {
+                            if (state) crossings++;
+                            state = -1;
+                        }
+                    }
+                }
+                best = Math.max(best, crossings / sampled);
+            }
         }
-        return sampled ? transitions / sampled : 0;
+        return best;
     }
 
     /**
@@ -468,10 +580,20 @@
         return true;
     }
 
+    /**
+     * Change some camera settings without losing the zoom.
+     *
+     * applyConstraints REPLACES the track's constraints; it does not add to
+     * them. A torch or focus change that leaves zoom out of the set leaves the
+     * browser free to put the lens back at its default — which some do — so
+     * every change here carries the zoom the page wants along with it.
+     */
     async function applyAdvanced(settings) {
         if (!track) return false;
+        const merged = zoomLevel !== null && settings.zoom === undefined
+            ? Object.assign({ zoom: zoomLevel }, settings) : settings;
         try {
-            await track.applyConstraints({ advanced: [settings] });
+            await track.applyConstraints({ advanced: [merged] });
             return true;
         } catch (_) {
             return false;
@@ -486,14 +608,19 @@
 
     async function stepZoom(direction) {
         const range = capabilities.zoom;
-        if (!range) return false;
+        if (!range || zoomManual || zoomLevel === null) return false;
         const step = (range.max - range.min) / 4 || range.step || 0.5;
-        const current = trackSetting('zoom', range.min || 1);
-        const next = Math.min(range.max, Math.max(range.min, current + direction * step));
-        if (Math.abs(next - current) < 1e-3) return false;
+        const next = clampZoom(zoomLevel + direction * step);
+        if (Math.abs(next - zoomLevel) < 1e-3) return false;
         if (!await applyAdvanced({ zoom: next })) return false;
-        zoomSlider.value = next;
-        zoomLabel.textContent = `${Number(next).toFixed(1)}x`;
+        if (zoomManual) {
+            // The student grabbed the slider while that was applying: theirs
+            // is the zoom that has to end up on the camera.
+            await requestZoom(zoomLevel);
+            return true;
+        }
+        zoomLevel = next;
+        showZoom(next, true);
         return true;
     }
 
@@ -532,7 +659,7 @@
      * torch, for a code printed on paper. Then optical zoom, but only when
      * there is something patterned in the middle worth zooming into.
      */
-    async function escalate(frame, energy) {
+    async function escalate(frame) {
         if (adapting) return;
         adapting = true;
         try {
@@ -556,7 +683,7 @@
                 announce('flashlight on');
                 return;
             }
-            if (energy > PATTERN_THRESHOLD && await stepZoom(1)) {
+            if (canZoomIn() && centreEnergy() > PATTERN_THRESHOLD && await stepZoom(1)) {
                 announce('zooming in');
                 return;
             }
@@ -584,6 +711,10 @@
         if (resolutionRaised || !track) return false;
         const range = capabilities.width;
         if (!range || !range.max || range.max <= 1280) return false;
+        // The preview is drawn at the stream's own size, so more pixels would
+        // otherwise make it jump bigger on screen just as the student has the
+        // code lined up. Keep it where it is.
+        const shownWidth = video.getBoundingClientRect().width;
         try {
             await track.applyConstraints({
                 width: { ideal: Math.min(1920, range.max) },
@@ -592,20 +723,49 @@
         } catch (_) {
             return false;
         }
+        if (!track) return false;            // closed while that was applying
         resolutionRaised = true;
+        if (shownWidth) video.style.width = `${shownWidth}px`;
+        // A new resolution can mean a restarted camera, back at its default
+        // zoom with the slider still showing the old one. Its zoom range can
+        // differ at the new size, too.
+        capabilities = (track.getCapabilities && track.getCapabilities()) || capabilities;
+        if (capabilities.zoom && zoomLevel !== null) {
+            zoomLevel = clampZoom(zoomLevel);
+            await applyAdvanced({ zoom: zoomLevel });
+        }
+        syncZoomSlider();
         return true;
     }
 
     async function resetOptics() {
-        if (capabilities.zoom) {
-            const min = capabilities.zoom.min || 1;
-            if (await applyAdvanced({ zoom: min })) {
-                zoomSlider.value = min;
-                zoomLabel.textContent = `${Number(min).toFixed(1)}x`;
-            }
+        if (capabilities.zoom && !zoomManual && zoomDefault !== null
+            && await applyAdvanced({ zoom: zoomDefault })) {
+            zoomLevel = zoomDefault;
+            showZoom(zoomDefault, true);
         }
         if (capabilities.exposureCompensation) await applyAdvanced({ exposureCompensation: 0 });
         await setTorch(false);
+    }
+
+    function canZoomIn() {
+        return Boolean(capabilities.zoom) && !zoomManual && zoomLevel !== null
+            && zoomLevel < capabilities.zoom.max - 1e-3;
+    }
+
+    /**
+     * Pattern energy in the middle fifth of the view, which every zoom step
+     * keeps in frame.
+     *
+     * Measured on its own crop rather than on whichever hunt region the
+     * deciding frame happened to be: on the wide pass a code at the back of
+     * the hall is a speck, and the hunt would conclude there is nothing to
+     * zoom into. Only computed when zoom is the next thing to try.
+     */
+    function centreEnergy() {
+        drawRegion(FAR);
+        const image = context.getImageData(0, 0, analysisCanvas.width, analysisCanvas.height);
+        return patternEnergy(readFrame(image).grey, image.width, image.height);
     }
 
     /**
@@ -627,7 +787,6 @@
         }
 
         let frame = null;
-        let energy = 0;
         if (!value && typeof window.jsQR === 'function') {
             const image = context.getImageData(0, 0, analysisCanvas.width, analysisCanvas.height);
             const plain = window.jsQR(image.data, image.width, image.height,
@@ -641,7 +800,6 @@
                 const deciding = (missStreak + 1) % ESCALATE_AFTER_MISSES === 0;
                 if (enhancing || deciding) {
                     frame = readFrame(image);
-                    if (deciding) energy = patternEnergy(frame.grey, image.width, image.height);
                     if (enhancing && enhance(image, frame)) {
                         // Both polarities now: a code shown white-on-dark is a
                         // real thing, and the extra pass has earned itself by
@@ -664,7 +822,7 @@
         if (value) return value;
 
         missStreak += 1;
-        if (missStreak % ESCALATE_AFTER_MISSES === 0) await escalate(frame, energy);
+        if (missStreak % ESCALATE_AFTER_MISSES === 0) await escalate(frame);
         return null;
     }
 
@@ -916,18 +1074,15 @@
 
     async function triggerFocus() {
         if (!track || !capabilities.focusMode) return;
-        try {
-            if (capabilities.focusMode.includes('continuous')) {
-                await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] });
-            }
-        } catch (_) {}
+        if (capabilities.focusMode.includes('continuous')) {
+            await applyAdvanced({ focusMode: 'continuous' });
+        }
     }
 
-    zoomSlider.addEventListener('input', async event => {
+    zoomSlider.addEventListener('input', () => {
         if (!track || !capabilities.zoom) return;
-        const zoom = Number(event.target.value);
-        zoomLabel.textContent = `${zoom.toFixed(1)}x`;
-        try { await track.applyConstraints({ advanced: [{ zoom }] }); } catch (_) {}
+        zoomManual = true;
+        requestZoom(Number(zoomSlider.value));
     });
 
     torchButton.addEventListener('click', async () => {
@@ -939,10 +1094,11 @@
         // chose, they can see the result and the code cannot.
         torchManual = true;
         torchEnabled = !torchEnabled;
-        try {
-            await track.applyConstraints({ advanced: [{ torch: torchEnabled }] });
+        if (await applyAdvanced({ torch: torchEnabled })) {
             torchButton.classList.toggle('active', torchEnabled);
-        } catch (_) { torchEnabled = !torchEnabled; }
+        } else {
+            torchEnabled = !torchEnabled;
+        }
     });
 
     focusButton.addEventListener('click', triggerFocus);

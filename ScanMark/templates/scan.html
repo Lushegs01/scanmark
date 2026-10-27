@@ -33,7 +33,7 @@
 
             <div class="scanner-header">
                 <h1>📸 ScanMark Scanner</h1>
-                <p>Point camera at QR code - works from 1-3 meters!</p>
+                <p>Point at the QR code. At the back of the room? Slide to zoom in.</p>
             </div>
 
             <div class="status-badge scanning" id="status-badge">
@@ -337,7 +337,12 @@
     }
 
     .zoom-slider {
-        writing-mode: bt-lr;
+        /* Vertical, zoomed-out at the bottom. writing-mode is the standard
+           way (Chrome 124+, Safari 17.4+, Firefox 120+); slider-vertical is
+           the older WebKit/Blink one, which current Chrome no longer
+           honours and draws an 8px-wide horizontal slider instead. */
+        writing-mode: vertical-lr;
+        direction: rtl;
         -webkit-appearance: slider-vertical;
         width: 8px;
         height: 200px;
