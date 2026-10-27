@@ -3029,3 +3029,68 @@ class TestScanPageLocationRules:
         """It used to fall into the transient-retry path: "Network busy"."""
         scanner = open('static/scanner.js', encoding='utf-8').read()
         assert 'locationProblem' in scanner
+
+
+class TestScannerZoomStaysPut:
+    """
+    The hunt's "nothing left to try" step put the camera back at its minimum
+    zoom about two seconds after every drag of the slider, and raising the
+    resolution could restart the camera at 1x behind the slider's back. From
+    the back of a lecture hall the student's zoom IS the scan.
+    """
+
+    @staticmethod
+    def scanner():
+        return open('static/scanner.js', encoding='utf-8').read()
+
+    @staticmethod
+    def function(source, name):
+        start = source.index(f'function {name}(')
+        return source[start:source.index('\n    }\n', start)]
+
+    def test_moving_the_slider_takes_zoom_away_from_the_hunt(self):
+        scanner = self.scanner()
+        handler = scanner[scanner.index("zoomSlider.addEventListener('input'"):]
+        assert 'zoomManual = true' in handler[:200]
+        for name in ('stepZoom', 'resetOptics', 'canZoomIn'):
+            assert 'zoomManual' in self.function(scanner, name), name
+
+    def test_every_constraint_change_carries_the_zoom(self):
+        """applyConstraints replaces the set: a torch change can drop zoom."""
+        scanner = self.scanner()
+        assert 'zoom: zoomLevel' in self.function(scanner, 'applyAdvanced')
+        assert scanner.count('advanced: [') == 1, \
+            'something sets advanced constraints without going through applyAdvanced'
+
+    def test_a_resolution_change_puts_the_zoom_back(self):
+        raised = self.function(self.scanner(), 'raiseResolution')
+        assert 'applyAdvanced({ zoom: zoomLevel })' in raised
+
+    def test_undoing_a_zoom_returns_to_where_the_camera_started(self):
+        """Not the minimum: on some phones that is the 0.5x ultra-wide lens."""
+        reset = self.function(self.scanner(), 'resetOptics')
+        assert 'zoomDefault' in reset
+        assert 'zoom.min' not in reset
+
+
+class TestProjectorCodeReadsFromTheBack:
+    """A 300px code is a few camera pixels per module from 14m away."""
+
+    def test_the_code_can_fill_the_projector(self, seed, login):
+        page = login(seed['coordinator_email']).get(
+            f"/session/{seed['session_id']}/qr").get_data(as_text=True)
+        assert 'id="qrFullscreenBtn"' in page
+        assert 'requestFullscreen' in page
+        # Scaled up, smoothing turns module edges into grey ramps.
+        assert 'image-rendering: pixelated' in page
+        assert 'width: 300px; height: 300px' not in page
+
+    def test_the_image_is_drawn_large_enough_to_scale_cleanly(self, seed, login):
+        import io
+        from PIL import Image
+
+        response = login(seed['coordinator_email']).get(
+            f"/session/{seed['session_id']}/live")
+        assert response.status_code == 200
+        assert response.mimetype == 'image/png'
+        assert Image.open(io.BytesIO(response.data)).width >= 700

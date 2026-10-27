@@ -14,10 +14,18 @@
             {{ course.term_label }} · {{ expected_total }} student{{ '' if expected_total == 1 else 's' }} on today's roster
         </p>
 
-        <!-- QR Code Image -->
+        <!-- QR Code Image. Click it, or the button, to fill the projector:
+             from the back of a large hall the inline size is a few camera
+             pixels per module, too few for any phone to decode. -->
         <div class="my-3">
-            <img id="qrImage" src="{{ url_for('get_qr_image', session_id=session.id) }}" alt="QR Code"
-                style="width: 300px; height: 300px; border: 5px solid #198754; border-radius: 10px;">
+            <div id="qrStage" class="qr-stage" title="Show the code full screen">
+                <img id="qrImage" class="qr-image" src="{{ url_for('get_qr_image', session_id=session.id) }}"
+                    alt="QR Code">
+                <p class="qr-stage-hint">Click or press Esc to return</p>
+            </div>
+            <button type="button" id="qrFullscreenBtn" class="btn btn-outline-success btn-sm mt-2">
+                <i class="fas fa-expand"></i> Full screen for large rooms
+            </button>
         </div>
 
         <!-- FIX #1: Removed stray </button> tag. Clean timer display -->
@@ -100,6 +108,49 @@
 
     </div>
 </div>
+<style>
+    .qr-image {
+        /* As big as the card and the screen's height allow, not a fixed
+           300px: every centimetre on the projector is range at the back. */
+        width: min(100%, 60vh);
+        height: auto;
+        aspect-ratio: 1;
+        border: 5px solid #198754;
+        border-radius: 10px;
+        /* Scaled up, a QR must keep hard module edges. Smoothing turns them
+           into grey ramps that a phone at the back cannot threshold. */
+        image-rendering: pixelated;
+        cursor: zoom-in;
+    }
+
+    .qr-stage-hint {
+        display: none;
+    }
+
+    .qr-stage.is-full {
+        position: fixed;
+        inset: 0;
+        z-index: 2000;
+        background: #fff;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+    }
+
+    .qr-stage.is-full .qr-image {
+        width: min(96vw, 90vh);
+        border: none;
+        border-radius: 0;
+        cursor: zoom-out;
+    }
+
+    .qr-stage.is-full .qr-stage-hint {
+        display: block;
+        margin: 0.5rem 0 0;
+        color: #6c757d;
+    }
+</style>
 <script>
     // --- 1. QR CODE AUTO-REFRESH ---
     // The server caches each token for QR_TOKEN_TTL seconds. Refresh one
@@ -116,6 +167,7 @@
     // the lecturer's phone are both signed in. When that happens the image
     // endpoint answers 409 and this screen has to stop claiming to be live.
     qrImage.addEventListener('error', () => {
+        showFullScreen(false);
         if (qrTimer) clearInterval(qrTimer);
         timerEl.innerText = '—';
         qrImage.alt = 'This class has ended.';
@@ -136,6 +188,35 @@
             timeLeft = QR_TOKEN_TTL;
         }
     }, 1000);
+
+
+    // --- 1b. FULL-SCREEN CODE ---
+    // The same <img>, so the refresh above keeps working while it is big.
+    const qrStage = document.getElementById('qrStage');
+
+    async function showFullScreen(on) {
+        qrStage.classList.toggle('is-full', on);
+        // The class alone fills the window. Real full screen also drops the
+        // browser's own bars, a sixth of a 768px projector's height.
+        try {
+            if (on && qrStage.requestFullscreen && !document.fullscreenElement) {
+                await qrStage.requestFullscreen();
+            } else if (!on && document.fullscreenElement) {
+                await document.exitFullscreen();
+            }
+        } catch (_) { }
+    }
+
+    qrStage.addEventListener('click', () => showFullScreen(!qrStage.classList.contains('is-full')));
+    document.getElementById('qrFullscreenBtn').addEventListener('click', () => showFullScreen(true));
+    document.addEventListener('keydown', event => {
+        if (event.key === 'Escape') showFullScreen(false);
+    });
+    // Esc in real full screen is taken by the browser and never reaches the
+    // page; this is how the page finds out.
+    document.addEventListener('fullscreenchange', () => {
+        if (!document.fullscreenElement) qrStage.classList.remove('is-full');
+    });
 
 
     // --- 2. GPS LOCATION SETTER ---

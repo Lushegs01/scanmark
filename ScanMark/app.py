@@ -4955,7 +4955,13 @@ def get_qr_image(session_id):
 
     try:
         import qrcode
-        img = qrcode.make(qr_text)
+        from qrcode.constants import ERROR_CORRECT_M
+        # Drawn large enough that filling a projector is at most a modest
+        # scale-up of whole pixels rather than a 3x blur of a 370px image.
+        qr = qrcode.QRCode(error_correction=ERROR_CORRECT_M, box_size=20, border=4)
+        qr.add_data(qr_text)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color='black', back_color='white')
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         png_bytes = buf.getvalue()
