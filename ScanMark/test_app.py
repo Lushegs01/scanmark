@@ -1187,29 +1187,96 @@ class TestLiveAttendanceOnTheDashboard:
             self, appmod, seed, login):
         """Class running or not: it is what a lecturer checks before starting."""
         ada = login(seed['coordinator_email'])
-        enrolled_url = f"/api/course/{seed['course_id']}/enrolled"
         for running in (True, False):
             if not running:
                 ada.post(f"/session/{seed['session_id']}/end")
             body = ada.get('/lecturer_dashboard').get_data(as_text=True)
             assert 'data-enrolled="1"' in body
-            assert f'data-enrolled-url="{enrolled_url}"' in body
+            assert f'data-students-url="{self.students_url(seed)}"' in body
             assert 'data-live-joined' in body
+            assert 'data-live-roster' in body
 
-    def test_the_joined_count_follows_students_joining(self, appmod, seed, login):
-        ada = login(seed['coordinator_email'])
-        url = f"/api/course/{seed['course_id']}/enrolled"
-        assert ada.get(url).get_json() == {'status': 'success', 'enrolled': 1}
+    @staticmethod
+    def students_url(seed):
+        return f"/api/course/{seed['course_id']}/students"
 
-        tayo = login(seed['other_student_email'])
-        tayo.post('/register_course', data={'course_code': 'CSC201'})
-        response = ada.get(url)
-        assert response.get_json()['enrolled'] == 2
-        assert response.headers['Cache-Control'] == 'no-store'
-
-    def test_only_the_courses_teachers_can_read_the_joined_count(
+    def test_the_window_lists_each_student_with_their_details(
             self, appmod, seed, login):
-        url = f"/api/course/{seed['course_id']}/enrolled"
+        ada = login(seed['coordinator_email'])
+        response = ada.get(self.students_url(seed))
+        assert response.headers['Cache-Control'] == 'no-store'
+        payload = response.get_json()
+        assert payload['total'] == payload['enrolled'] == 1
+        assert payload['class_running'] is True
+        (kemi,) = payload['students']
+        assert kemi['name'] == 'Kemi Student'
+        assert kemi['matric_no'] == '20200001'
+        assert kemi['level'] == '300'
+        assert kemi['email'] == seed['student_email']
+        assert kemi['joined']                    # a date, e.g. "27 Oct 2026"
+        # On the roster for the one class held, not scanned in yet.
+        assert (kemi['attended'], kemi['expected'], kemi['pct']) == (0, 1, 0)
+        assert kemi['present'] is False
+
+    def test_the_list_marks_who_has_scanned_into_the_running_class(
+            self, appmod, seed, login):
+        login(seed['student_email']).post(
+            '/mark_attendance', json=scan_body(appmod, seed['session_id']))
+        ada = login(seed['coordinator_email'])
+        (kemi,) = ada.get(self.students_url(seed)).get_json()['students']
+        assert kemi['present'] is True
+        assert (kemi['attended'], kemi['expected'], kemi['pct']) == (1, 1, 100)
+
+        # No class running: nothing to be present at.
+        ada.post(f"/session/{seed['session_id']}/end")
+        payload = ada.get(self.students_url(seed)).get_json()
+        assert payload['class_running'] is False
+        assert payload['students'][0]['present'] is None
+        assert payload['students'][0]['attended'] == 1
+
+    def test_the_list_follows_students_joining(self, appmod, seed, login):
+        ada = login(seed['coordinator_email'])
+        login(seed['other_student_email']).post(
+            '/register_course', data={'course_code': 'CSC201'})
+        payload = ada.get(self.students_url(seed)).get_json()
+        assert payload['enrolled'] == 2
+        assert [s['name'] for s in payload['students']] == ['Kemi Student', 'Tayo Student']
+        # Joined after the class opened, so it was never expected of them.
+        tayo = payload['students'][1]
+        assert (tayo['attended'], tayo['expected'], tayo['pct']) == (0, 0, None)
+
+    def test_the_list_searches_by_name_matric_or_email(self, appmod, seed, login):
+        ada = login(seed['coordinator_email'])
+        login(seed['other_student_email']).post(
+            '/register_course', data={'course_code': 'CSC201'})
+        url = self.students_url(seed)
+
+        def names(query):
+            payload = ada.get(url, query_string={'q': query}).get_json()
+            return [s['name'] for s in payload['students']], payload
+
+        assert names('tayo')[0] == ['Tayo Student']
+        assert names('20200001')[0] == ['Kemi Student']
+        assert names('kemi@student')[0] == ['Kemi Student']
+        # LIKE wildcards are searched for literally, not as wildcards.
+        found, payload = names('%')
+        assert found == [] and payload['total'] == 0
+        assert payload['enrolled'] == 2          # the header count is unfiltered
+
+    def test_the_list_is_paged(self, appmod, seed, login, monkeypatch):
+        monkeypatch.setattr(appmod, 'COURSE_STUDENTS_PER_PAGE', 1)
+        ada = login(seed['coordinator_email'])
+        login(seed['other_student_email']).post(
+            '/register_course', data={'course_code': 'CSC201'})
+        url = self.students_url(seed)
+        second = ada.get(url, query_string={'page': 2}).get_json()
+        assert [s['name'] for s in second['students']] == ['Tayo Student']
+        assert (second['page'], second['pages'], second['total']) == (2, 2, 2)
+        # Past the end is the last page, not an empty one.
+        assert ada.get(url, query_string={'page': 99}).get_json()['page'] == 2
+
+    def test_only_the_courses_teachers_can_read_the_list(self, appmod, seed, login):
+        url = self.students_url(seed)
         assert login(seed['outsider_email']).get(url).status_code == 403
         assert login(seed['student_email']).get(url).status_code == 403
         assert appmod.app.test_client().get(url).status_code in (302, 401)

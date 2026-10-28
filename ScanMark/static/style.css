@@ -301,6 +301,22 @@ h1, h2, h3, h4, h5, h6 { font-weight: 700; }
   .live-feed .live-tally { flex-shrink: 0; }
 }
 
+/* Scans / Students switch and the student search, pinned while the rows
+   scroll under them, so they need the window's own solid background. */
+.live-feed .live-controls {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--surface-solid);
+  border-bottom: 1px solid var(--divider);
+}
+[data-theme="dark"] .live-feed .live-controls { background: #0e1a11; }
+.live-feed .live-controls .btn.active {
+  background: var(--green);
+  border-color: var(--green);
+  color: #fff;
+}
+
 @keyframes live-dot-pulse {
   0%   { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(40, 167, 69, 0.7); }
   70%  { transform: scale(1);    box-shadow: 0 0 0 8px rgba(40, 167, 69, 0); }

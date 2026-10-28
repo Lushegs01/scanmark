@@ -191,7 +191,7 @@
                             data-course-title="{{ course.title }}"
                             data-register-url="{{ url_for('view_attendance', course_id=course.id) }}"
                             data-enrolled="{{ enrolled_counts.get(course.id, 0) }}"
-                            data-enrolled-url="{{ url_for('get_course_enrolled', course_id=course.id) }}"
+                            data-students-url="{{ url_for('get_course_students', course_id=course.id) }}"
                             {% if live_session %}
                             data-feed-url="{{ url_for('get_session_attendees', session_id=live_session.id) }}"
                             data-qr-url="{{ url_for('session_qr', session_id=live_session.id) }}"
@@ -380,7 +380,35 @@
                 <button type="button" class="btn-close ms-0" data-bs-dismiss="modal" aria-label="Close"></button>
             </div>
             <div class="modal-body p-0">
+                {# Two views of the course: who has scanned into the class
+                   running now, newest first, and everyone who has joined it,
+                   with their details. With no class running there are no
+                   scans, so the students show on their own. #}
+                {# Pinned above the rows, so switching view or searching
+                   never means scrolling back up a 50-row page. Buttons, not
+                   .nav-link tabs: the navbar's white .nav-link style is
+                   global and would paint the labels white on white. #}
+                <div class="live-controls d-grid gap-2 px-3 py-2">
+                    <div class="btn-group btn-group-sm" role="group" aria-label="Show" data-live-tabs>
+                        <button type="button" class="btn btn-outline-success active" data-live-tab="scans"
+                            aria-pressed="true">Scans</button>
+                        <button type="button" class="btn btn-outline-success" data-live-tab="students"
+                            aria-pressed="false">Students</button>
+                    </div>
+                    <input type="search" class="form-control form-control-sm d-none" data-live-search
+                        placeholder="Search by name, matric number or email"
+                        aria-label="Search students">
+                </div>
                 <ul class="list-group list-group-flush" data-live-list></ul>
+                <div class="d-none" data-live-students>
+                    <ul class="list-group list-group-flush" data-live-roster></ul>
+                    <div class="d-flex justify-content-between align-items-center px-3 py-2 small"
+                        data-live-pager>
+                        <button type="button" class="btn btn-link btn-sm p-0" data-live-prev>← Previous</button>
+                        <span class="text-muted" data-live-range></span>
+                        <button type="button" class="btn btn-link btn-sm p-0" data-live-next>Next →</button>
+                    </div>
+                </div>
             </div>
             <div class="modal-footer small text-muted d-flex flex-wrap gap-2 justify-content-between">
                 <span data-live-note></span>
@@ -401,15 +429,22 @@
         // window is bounded, so browser cost is independent of class size.
         const RECENT_ROWS = {{ live_recent_rows }};
         const POLL_MS = 1000;
-        // With no class running only the joined count can change, and only
-        // as fast as students find the course: no need for the 1s cadence.
-        const JOINED_POLL_MS = 5000;
+        // The student list changes only as fast as students join and scan:
+        // no need for the scans' 1s cadence.
+        const STUDENTS_POLL_MS = 5000;
         const modal = document.getElementById('liveAttendanceModal');
         const part = name => modal.querySelector(`[data-live-${name}]`);
         const list = part('list');
+        const roster = part('roster');
+        const tabs = modal.querySelectorAll('[data-live-tab]');
         // Only the class whose window is open is polled, and only while it
-        // is open: a dashboard left on a desk costs the server nothing.
+        // is open: a dashboard left on a desk costs the server nothing. The
+        // student list is polled only while its tab is the one showing.
         let feed = null;
+        let students = null;
+        let currentTab = 'scans';
+        // The footer line for each tab, kept so switching back restores it.
+        const notes = { scans: '', students: '' };
 
         function waitingItem() {
             const li = document.createElement('li');
@@ -442,6 +477,63 @@
             return li;
         }
 
+        // One student who has joined the course, and what the lecturer needs
+        // about them. `present` is null when no class is running.
+        function studentItem(student) {
+            const li = document.createElement('li');
+            li.className = 'list-group-item';
+            li.dataset.studentId = String(student.id);
+
+            const row = document.createElement('div');
+            row.className = 'd-flex justify-content-between align-items-start gap-2';
+            const details = document.createElement('div');
+            details.style.minWidth = '0';
+            const name = document.createElement('div');
+            name.className = 'fw-bold';
+            name.textContent = student.name;
+            if (student.present !== null) {
+                const mark = document.createElement('span');
+                mark.className = `badge ms-2 ${student.present ? 'bg-success' : 'bg-secondary'}`;
+                mark.textContent = student.present ? 'Present' : 'Not yet';
+                name.append(mark);
+            }
+            const meta = document.createElement('small');
+            meta.className = 'text-muted d-block';
+            meta.textContent = `Matric: ${student.matric_no} | Level: ${student.level}`;
+            details.append(name, meta);
+
+            const stats = document.createElement('div');
+            stats.className = 'text-end small text-nowrap';
+            const rate = document.createElement('div');
+            rate.className = 'fw-semibold';
+            // Out of the classes they were on the roster for, as their own
+            // dashboard counts it: a student who joined in week 6 is not
+            // absent for weeks 1 to 5.
+            rate.textContent = student.expected
+                ? `${student.attended}/${student.expected} classes · ${student.pct}%`
+                : (student.attended ? `${student.attended} attended` : 'No classes yet');
+            stats.append(rate);
+            if (student.joined) {
+                const joined = document.createElement('div');
+                joined.className = 'text-muted';
+                joined.textContent = `Joined ${student.joined}`;
+                stats.append(joined);
+            }
+
+            row.append(details, stats);
+            li.append(row);
+            // Its own line, under both columns: squeezed beside the numbers
+            // on a phone, an address breaks mid-word.
+            if (student.email) {
+                const email = document.createElement('a');
+                email.className = 'small text-break';
+                email.href = `mailto:${student.email}`;
+                email.textContent = student.email;
+                li.append(email);
+            }
+            return li;
+        }
+
         function messageItem(text) {
             const li = document.createElement('li');
             li.className = 'list-group-item text-muted text-center py-4';
@@ -461,8 +553,32 @@
                 : `${n} students have joined`;
         }
 
+        function setNote(tab, text) {
+            notes[tab] = text;
+            if (tab === currentTab) part('note').textContent = text;
+        }
+
+        function selectTab(name) {
+            currentTab = name;
+            tabs.forEach(tab => {
+                const on = tab.dataset.liveTab === name;
+                tab.classList.toggle('active', on);
+                tab.setAttribute('aria-pressed', String(on));
+            });
+            show('list', name === 'scans');
+            show('students', name === 'students');
+            show('search', name === 'students');
+            part('note').textContent = notes[name];
+            if (students) {
+                if (name === 'students') students.start();
+                else students.pause();
+            }
+        }
+
+        tabs.forEach(tab => tab.addEventListener('click', () => selectTab(tab.dataset.liveTab)));
+
         // Fill the window for the course whose eye was pressed. With no class
-        // running there is nothing to poll; say so, and point at what to do.
+        // running there are no scans to show; the students show instead.
         function showClass(source) {
             const live = Boolean(source.feedUrl);
             part('code').textContent = source.courseCode;
@@ -481,18 +597,20 @@
             part('joined').className = live ? 'small text-muted mt-1' : 'fw-semibold';
             showJoined(source.enrolled);
             part('register').href = source.registerUrl;
+            part('search').value = '';
+            roster.replaceChildren(messageItem('Loading students…'));
+            show('pager', false);
             if (live) {
                 part('qr').href = source.qrUrl;
                 part('sheet').href = source.sheetUrl;
-                part('note').textContent = `Showing the ${RECENT_ROWS} most recent scans`;
                 list.replaceChildren(waitingItem());
             } else {
-                part('note').textContent = 'No class running';
-                list.replaceChildren(messageItem(
-                    `No class is running for ${source.courseCode} right now. ` +
-                    'Start attendance and students will appear here as they scan.'));
+                list.replaceChildren();
             }
-            ['session', 'dot', 'count', 'qr', 'sheet'].forEach(name => show(name, live));
+            notes.scans = live ? `Showing the ${RECENT_ROWS} most recent scans` : '';
+            notes.students = live ? 'Present marks are for the class running now'
+                                  : 'No class running';
+            ['session', 'dot', 'count', 'qr', 'sheet', 'tabs'].forEach(name => show(name, live));
             show('register', !live);
         }
 
@@ -516,7 +634,8 @@
                 dot.title = '';
                 dot.textContent = 'Ended';
                 part('qr').classList.add('d-none');
-                part('note').textContent = message;
+                setNote('scans', message);
+                setNote('students', 'This class has ended');
             }
 
             async function poll() {
@@ -581,64 +700,114 @@
             return { poll, stop };
         }
 
-        // No class running: keep the joined count current, so a lecturer
-        // telling the room to join the course can watch it climb.
-        function joinedFeed(url) {
+        // Everyone who has joined the course, a page at a time, refreshed
+        // while its tab is showing: a lecturer telling the room to join the
+        // course watches them arrive, and during a class sees who has not
+        // scanned yet. Also keeps the joined count in the header current.
+        function studentsFeed(url) {
+            let page = 1;
+            let query = '';
             let timer = null;
-            let busy = false;
-            let stopped = false;
+            let active = false;
+            // Each request takes a ticket; a reply that is not the latest
+            // ticket's is stale (an older search, the previous page) and is
+            // dropped rather than drawn over the newer one.
+            let ticket = 0;
 
-            function stop() {
-                stopped = true;
-                clearTimeout(timer);
+            function render(data) {
+                if (!data.students.length) {
+                    roster.replaceChildren(messageItem(query
+                        ? `No students match “${query}”.`
+                        : 'No students have joined this course yet.'));
+                } else {
+                    const fragment = document.createDocumentFragment();
+                    data.students.forEach(student => fragment.append(studentItem(student)));
+                    roster.replaceChildren(fragment);
+                }
+                const first = (data.page - 1) * data.per_page + 1;
+                part('range').textContent = data.total
+                    ? `${first}–${first + data.students.length - 1} of ${data.total}` : '';
+                part('prev').disabled = data.page <= 1;
+                part('next').disabled = data.page >= data.pages;
+                show('pager', data.pages > 1);
             }
 
-            async function poll() {
-                if (stopped || busy || document.hidden) return;
-                busy = true;
+            async function load() {
+                if (!active || document.hidden) return;
+                const mine = ++ticket;
+                clearTimeout(timer);
                 try {
-                    const response = await fetch(url, { cache: 'no-store' });
-                    if (stopped) return;
+                    const params = new URLSearchParams({ page: String(page) });
+                    if (query) params.set('q', query);
+                    const response = await fetch(`${url}?${params}`, { cache: 'no-store' });
+                    if (mine !== ticket) return;
                     if (response.status === 403 || response.status === 404) {
-                        stop();
+                        active = false;
+                        roster.replaceChildren(messageItem('This course is no longer available.'));
+                        show('pager', false);
                         return;
                     }
                     if (!response.ok) throw new Error(`HTTP ${response.status}`);
                     const data = await response.json();
-                    if (!stopped && data.status === 'success') showJoined(data.enrolled);
+                    if (mine !== ticket || data.status !== 'success') return;
+                    page = data.page;
+                    showJoined(data.enrolled);
+                    render(data);
                 } catch (error) {
-                    console.error('Error fetching the joined count:', error);
+                    console.error('Error fetching the students:', error);
                 } finally {
-                    busy = false;
-                    if (!stopped) {
+                    if (mine === ticket && active) {
                         clearTimeout(timer);
-                        timer = setTimeout(poll, JOINED_POLL_MS);
+                        timer = setTimeout(load, STUDENTS_POLL_MS);
                     }
                 }
             }
 
-            return { poll, stop };
+            return {
+                start() { active = true; load(); },
+                // Stops the timer and orphans any request in flight.
+                pause() { active = false; ticket++; clearTimeout(timer); },
+                poll: load,
+                search(text) { query = text; page = 1; load(); },
+                turn(step) { page = Math.max(1, page + step); load(); },
+            };
         }
+
+        let searchTimer = null;
+        part('search').addEventListener('input', () => {
+            clearTimeout(searchTimer);
+            searchTimer = setTimeout(() => {
+                if (students) students.search(part('search').value.trim());
+            }, 250);
+        });
+        part('prev').addEventListener('click', () => students && students.turn(-1));
+        part('next').addEventListener('click', () => students && students.turn(1));
 
         modal.addEventListener('show.bs.modal', event => {
             const source = event.relatedTarget && event.relatedTarget.dataset;
             if (!source || !source.courseCode) return;
             if (feed) feed.stop();
+            if (students) students.pause();
             feed = null;
             showClass(source);
+            students = source.studentsUrl ? studentsFeed(source.studentsUrl) : null;
             if (source.feedUrl) {
                 feed = liveFeed(source.feedUrl);
-            } else if (source.enrolledUrl) {
-                feed = joinedFeed(source.enrolledUrl);
+                feed.poll();
             }
-            if (feed) feed.poll();
+            selectTab(source.feedUrl ? 'scans' : 'students');
         });
         modal.addEventListener('hidden.bs.modal', () => {
             if (feed) feed.stop();
+            if (students) students.pause();
             feed = null;
+            students = null;
+            clearTimeout(searchTimer);
         });
         document.addEventListener('visibilitychange', () => {
-            if (!document.hidden && feed) feed.poll();
+            if (document.hidden) return;
+            if (feed) feed.poll();
+            if (students && currentTab === 'students') students.poll();
         });
     })();
 </script>
