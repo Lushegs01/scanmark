@@ -2422,6 +2422,30 @@ class TestScanResponseContract:
         assert second.status_code == 409
         assert second.get_json()['status'] == 'error'
 
+    def test_a_retried_scan_that_already_landed_reads_as_success(
+            self, appmod, seed, login):
+        """
+        On slow mobile data the first scan is saved but its answer never
+        reaches the phone, so the scanner retries and gets this 409. The
+        student IS marked; the scanner used to say so in a red error banner.
+        Only the 'duplicate' outcome is good news — a 409 for a queued scan
+        from another account is still an error.
+        """
+        kemi = login(seed['student_email'])
+        token = qr_token(appmod, seed['session_id'])
+        kemi.post('/mark_attendance', json=scan_body(appmod, token=token))
+        retry = kemi.post('/mark_attendance', json=scan_body(appmod, token=token))
+        assert retry.status_code == 409
+        assert retry.get_json()['outcome'] == 'duplicate'
+
+        scanner = open('static/scanner.js', encoding='utf-8').read()
+        duplicate = scanner.index("payload.outcome === 'duplicate'")
+        terminal = scanner.index('response.status === 403 || response.status === 404')
+        assert duplicate < terminal, 'the red terminal branch would catch it first'
+        branch = scanner[duplicate:terminal]
+        assert "result(message, 'success')" in branch
+        assert "'danger'" not in branch
+
     def test_an_unenrolled_student_is_a_403(self, appmod, seed, login):
         tayo = login(seed['other_student_email'])
         response = tayo.post('/mark_attendance',
