@@ -1024,9 +1024,21 @@
             retryAttempt = 0;
             const message = payload.message || 'Attendance could not be marked.';
 
+            // Already on the register: good news, not an error. Most often
+            // it is this phone's own retry — the first attempt was saved but
+            // its answer never came back (slow mobile data, a busy server),
+            // so the scanner asked again. It used to be shown in red, which
+            // told a student who WAS marked that scanning had failed.
+            if (response.status === 409 && payload.outcome === 'duplicate') {
+                rejectionStreak = 0;
+                result(message, 'success');
+                stopScanner();
+                return;
+            }
+
             // Terminal: nothing about pointing the camera again can change
-            // the answer. 403 not enrolled, 404 no such session, 409 already
-            // marked or a queued scan from another account.
+            // the answer. 403 not enrolled, 404 no such session, 409 a queued
+            // scan from another account.
             if (response.status === 403 || response.status === 404 || response.status === 409) {
                 rejectionStreak = 0;
                 result(message, 'danger');
