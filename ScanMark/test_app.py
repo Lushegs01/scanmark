@@ -1275,6 +1275,37 @@ class TestLiveAttendanceOnTheDashboard:
         # Past the end is the last page, not an empty one.
         assert ada.get(url, query_string={'page': 99}).get_json()['page'] == 2
 
+    def test_a_coordinator_added_to_a_colleagues_course_gets_its_card(
+            self, appmod, seed, login):
+        """
+        add_instructor accepts a Course Coordinator account, but their
+        dashboard listed only the courses they coordinate. The course they
+        were added to had no card, so its live window and student list were
+        out of reach, though the server would have let them use both.
+        """
+        course = seed['course_id']
+        ada = login(seed['coordinator_email'])
+        ada.post('/add_instructor', data={'course_id': course,
+                                          'lecturer_email': seed['outsider_email']})
+        eve = login(seed['outsider_email'])                 # a Course Coordinator
+        body = eve.get('/lecturer_dashboard').get_data(as_text=True)
+
+        assert 'CSC201' in body
+        assert f'data-students-url="{self.students_url(seed)}"' in body
+        assert f'data-feed-url="{self.feed_url(seed)}"' in body
+        assert '<span>Live attendance</span>' in body       # no Edit course beside it
+        # Ada's course: not Eve's to edit, archive, delete or invite to.
+        for owner_only in (f'/course/{course}/edit', f'/course/{course}/archive',
+                           f'/delete_course/{course}', 'action="/add_instructor"'):
+            assert owner_only not in body, owner_only
+        assert 'createClassModal' in body                   # still creates her own
+
+        # The owner keeps every control on her own course.
+        own = ada.get('/lecturer_dashboard').get_data(as_text=True)
+        for owner_only in (f'/course/{course}/edit', f'/course/{course}/archive',
+                           f'/delete_course/{course}', 'action="/add_instructor"'):
+            assert owner_only in own, owner_only
+
     def test_only_the_courses_teachers_can_read_the_list(self, appmod, seed, login):
         url = self.students_url(seed)
         assert login(seed['outsider_email']).get(url).status_code == 403
