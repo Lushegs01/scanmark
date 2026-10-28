@@ -23,7 +23,7 @@ from urllib.parse import urlparse
 from markupsafe import escape
 from flask_login import LoginManager, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
-from sqlalchemy import event, func, inspect, literal, select
+from sqlalchemy import event, func, inspect, literal, or_, select
 from sqlalchemy.exc import (
     IntegrityError, OperationalError, ProgrammingError,
     # NOT the builtin of the same name: SQLAlchemy raises its own class when a
@@ -4989,22 +4989,114 @@ def get_qr_image(session_id):
         return "QR code library not installed", 500
 
 
-@app.route('/api/course/<int:course_id>/enrolled')
+# One page of the live window's student list. A bounded window, like the
+# scans list beside it: a 2000-student course is paged, not drawn whole.
+COURSE_STUDENTS_PER_PAGE = 50
+
+
+def _like_pattern(text):
+    """A LIKE pattern matching ``text`` anywhere, with its wildcards escaped."""
+    escaped = (text.replace('\\', '\\\\').replace('%', '\\%')
+               .replace('_', '\\_'))
+    return f'%{escaped}%'
+
+
+@app.route('/api/course/<int:course_id>/students')
 @login_required
 @limiter.exempt
-def get_course_enrolled(course_id):
+def get_course_students(course_id):
     """
-    How many students have joined a course, for the live attendance window
-    while no class is running. It polls this every few seconds while open,
-    so a lecturer telling the room "join CSC201 now" watches it climb. One
-    indexed COUNT; exempt from the per-user limit like the attendees feed
-    that takes over once a class starts.
+    Who has joined a course, one page at a time, with what a lecturer needs
+    about each: matric number, level, email, when they joined, and how many
+    of the classes they were on the roster for they have attended — counted
+    the way their own dashboard counts it. While a class is running, each
+    is also marked present or not for it.
+
+    ``q`` filters by name, matric number or email. The live window polls the
+    page it shows every few seconds while that tab is open — so a lecturer
+    telling the room "join CSC201 now" watches them arrive — which is why
+    this stays a handful of indexed queries over at most one page of
+    students, and is exempt from the per-user limit like the attendees feed.
     """
     course = db.get_or_404(Course, course_id)
     if not _is_course_authorized(course):
         return jsonify({"error": "Unauthorised"}), 403
-    response = jsonify({"status": "success",
-                        "enrolled": _enrolled_count(course.id)})
+
+    search = _clean_text(request.args.get('q'), 60)
+    page = max(1, request.args.get('page', default=1, type=int) or 1)
+
+    roster = (db.session.query(User.id, User.full_name, User.matric_no,
+                               User.level, User.email, enrollments.c.enrolled_at)
+              .join(enrollments, enrollments.c.user_id == User.id)
+              .filter(enrollments.c.course_id == course.id))
+    if search:
+        pattern = _like_pattern(search)
+        roster = roster.filter(or_(User.full_name.ilike(pattern, escape='\\'),
+                                   User.matric_no.ilike(pattern, escape='\\'),
+                                   User.email.ilike(pattern, escape='\\')))
+    total = roster.order_by(None).count()
+    pages = max(1, -(-total // COURSE_STUDENTS_PER_PAGE))
+    page = min(page, pages)
+    rows = (roster.order_by(func.lower(User.full_name).asc(), User.id.asc())
+            .offset((page - 1) * COURSE_STUDENTS_PER_PAGE)
+            .limit(COURSE_STUDENTS_PER_PAGE)
+            .all())
+
+    student_ids = [row.id for row in rows]
+    attended = {}
+    if student_ids:
+        attended = dict(
+            db.session.query(Attendance.student_id, func.count(Attendance.id))
+            .filter(Attendance.course_id == course.id,
+                    Attendance.student_id.in_(student_ids))
+            .group_by(Attendance.student_id)
+            .all())
+    expected = _expected_sessions_for_students(course.id, student_ids)
+
+    # The class running now, if any: the same "open" the dashboard uses.
+    live_session = (ClassSession.query
+                    .filter(ClassSession.course_id == course.id,
+                            ClassSession.active.is_(True),
+                            ClassSession.ended_at.is_(None))
+                    .order_by(ClassSession.date_created.desc())
+                    .first())
+    present_now = set()
+    if live_session and student_ids:
+        present_now = {
+            student_id for (student_id,) in
+            db.session.query(Attendance.student_id)
+            .filter(Attendance.session_id == live_session.id,
+                    Attendance.student_id.in_(student_ids))
+        }
+
+    students = []
+    for row in rows:
+        count = attended.get(row.id, 0)
+        held = expected.get(row.id, 0)
+        students.append({
+            "id": row.id,
+            "name": row.full_name or "Unknown",
+            "matric_no": row.matric_no or "N/A",
+            "level": row.level or "N/A",
+            "email": row.email,
+            # Rows enrolled before the column existed cannot be dated.
+            "joined": local_date_only(row.enrolled_at) if row.enrolled_at else None,
+            "attended": count,
+            "expected": held,
+            "pct": _attendance_percentage(count, held),
+            "present": (row.id in present_now) if live_session else None,
+        })
+
+    response = jsonify({
+        "status": "success",
+        "students": students,
+        "total": total,
+        "enrolled": total if not search else _enrolled_count(course.id),
+        "page": page,
+        "pages": pages,
+        "per_page": COURSE_STUDENTS_PER_PAGE,
+        "class_running": live_session is not None,
+    })
     response.headers['Cache-Control'] = 'no-store'
     return response
 
