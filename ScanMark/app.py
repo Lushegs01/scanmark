@@ -3767,14 +3767,17 @@ def lecturer_dashboard():
 
     show_archived = request.args.get('archived', '').strip().lower() in ('1', 'true', 'yes')
 
-    if user_has_role(current_user, COORDINATOR_ROLE):
-        query = Course.query.filter_by(coordinator_id=current_user.id)
-        can_create = True
-    else:
-        query = Course.query.join(
-            course_instructors, course_instructors.c.course_id == Course.id
-        ).filter(course_instructors.c.user_id == current_user.id)
-        can_create = False
+    # Every course this person teaches: the ones they coordinate AND the ones
+    # a colleague added them to. A coordinator used to see only the first
+    # kind, so one added to a colleague's course — which add_instructor
+    # allows — had no card for it, and with it no live attendance, student
+    # list or start button, while the server would have let them use all of
+    # it. What each card offers is decided per course, by ownership.
+    taught = (db.session.query(course_instructors.c.course_id)
+              .filter(course_instructors.c.user_id == current_user.id))
+    query = Course.query.filter(or_(Course.coordinator_id == current_user.id,
+                                    Course.id.in_(taught)))
+    can_create = user_has_role(current_user, COORDINATOR_ROLE)
 
     if not show_archived:
         query = query.filter(Course.archived.is_(False))
@@ -3836,7 +3839,6 @@ def lecturer_dashboard():
                            enrolled_counts=enrolled_counts,
                            live_recent_rows=PROJECTOR_RECENT_ROWS,
                            show_archived=show_archived,
-                           is_coordinator=can_create,
                            classrooms=_my_classrooms(),
                            current_term=describe_term(*academic_term_of()))
 
