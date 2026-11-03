@@ -1,2 +1,3 @@
 -r requirements.txt
 locust>=2.24,<3
+gevent>=24.2,<27

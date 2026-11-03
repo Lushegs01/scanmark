@@ -1,0 +1,18 @@
+{
+  "mode": "staging",
+  "origin": "https://YOUR-ISOLATED-STAGING-HOST",
+  "database": {"host": "YOUR-STAGING-POSTGRES-HOST", "port": 5432, "database": "scanmark_staging"},
+  "deployed_commit": "",
+  "web_plan": "",
+  "region": "",
+  "postgres_version_plan": "",
+  "redis_version_plan": "",
+  "worker_settings": "",
+  "database_connection_limit": "",
+  "generator": "",
+  "isolated_services": false,
+  "synthetic_accounts": false,
+  "mail_sink": false,
+  "campos_disabled": false,
+  "security_controls_enabled": false
+}
