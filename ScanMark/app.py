@@ -3470,18 +3470,29 @@ def complete_profile():
         flash("Only student accounts have a matric number and level.", "warning")
         return redirect_by_role(current_user.role)
 
+    # The same page edits a finished profile: the dashboard links here so a
+    # student can correct a mistyped matric number themselves, which is what
+    # the "already registered" refusals tell them to do.
+    editing = bool(current_user.matric_no and current_user.level)
+    form = {'matric_no': current_user.matric_no or '',
+            'level': current_user.level or ''}
+
+    def render(status=200):
+        return render_template('complete_profile.html', levels=LEVEL_CHOICES,
+                               editing=editing, form=form), status
+
     if request.method == 'POST':
-        matric_no = normalize_matric(request.form.get('matric_no', ''))
-        level = request.form.get('level', '').strip()
+        form = {'matric_no': (request.form.get('matric_no') or '').strip()[:25],
+                'level': (request.form.get('level') or '').strip()}
+        matric_no = normalize_matric(form['matric_no'])
+        level = form['level']
 
         if not matric_no:
             flash("Enter a valid matric number (4-20 letters and digits).", "danger")
-            return render_template('complete_profile.html',
-                                   levels=LEVEL_CHOICES), 400
+            return render(400)
         if level not in LEVEL_CHOICES:
             flash("Choose your level from the list.", "danger")
-            return render_template('complete_profile.html',
-                                   levels=LEVEL_CHOICES), 400
+            return render(400)
 
         current_user.matric_no = matric_no
         current_user.level = level
@@ -3497,13 +3508,13 @@ def complete_profile():
             flash("That matric number is already registered at your "
                   "institution. Check it, or contact your department.",
                   "danger")
-            return render_template('complete_profile.html',
-                                   levels=LEVEL_CHOICES), 409
+            return render(409)
 
-        flash("Profile updated! Welcome to ScanMark.", "success")
+        flash("Profile updated." if editing
+              else "Profile updated! Welcome to ScanMark.", "success")
         return redirect_by_role(current_user.role)
 
-    return render_template('complete_profile.html', levels=LEVEL_CHOICES)
+    return render()
 
 @app.route('/login', methods=['GET', 'POST'])
 # Count only actual login ATTEMPTS (POSTs) — the old limit also counted GETs,
@@ -4635,8 +4646,10 @@ def register_course():
                     'Refused to bind user id=%s to %s: matric already held there',
                     current_user.id, course.institution)
                 flash("Your matric number is already registered at the "
-                      "institution that runs this course. Check it, or "
-                      "contact your department.", "danger")
+                      "institution that runs this course. If you typed it "
+                      "wrong, correct it with Edit profile at the top of "
+                      "this page; otherwise contact your department.",
+                      "danger")
                 return redirect(url_for('student_dashboard'))
 
         current_user.enrolled_courses.append(course)

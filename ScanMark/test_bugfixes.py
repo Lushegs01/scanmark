@@ -952,6 +952,48 @@ class TestCompleteProfile:
         assert response.status_code == 409
         assert b'already registered' in response.data
 
+    def test_the_dashboard_links_to_the_profile_form(self, appmod, seed, login):
+        """Once filled in, the form was reachable only by typing its URL, so
+        the refusals telling a student to check their number were a dead end."""
+        kemi = login(seed['student_email'])
+        page = kemi.get('/student_dashboard').get_data(as_text=True)
+        assert 'href="/complete_profile"' in page
+        assert 'Edit profile' in page
+        assert '20200001' in page
+
+    def test_a_finished_profile_opens_prefilled_for_editing(self, appmod, seed, login):
+        kemi = login(seed['student_email'])
+        page = kemi.get('/complete_profile').get_data(as_text=True)
+        assert 'Edit Profile' in page
+        assert 'value="20200001"' in page
+        assert '<option value="300" selected>' in page
+
+    def test_a_student_can_correct_their_matric_number(self, appmod, seed, login):
+        from models import db, User
+
+        kemi = login(seed['student_email'])
+        response = kemi.post('/complete_profile',
+                             data={'matric_no': '2020/0011', 'level': '400'},
+                             follow_redirects=True)
+        assert response.status_code == 200
+        assert 'Profile updated.' in response.get_data(as_text=True)
+        with appmod.app.app_context():
+            kemi_row = db.session.get(User, seed['student_id'])
+            assert kemi_row.matric_no == '20200011'
+            assert kemi_row.level == '400'
+
+    def test_a_refused_edit_keeps_what_was_typed(self, appmod, seed, login):
+        from models import db, User
+
+        kemi = login(seed['student_email'])
+        response = kemi.post('/complete_profile',
+                             data={'matric_no': '20200002',   # Tayo's
+                                   'level': '300'})
+        assert response.status_code == 409
+        assert 'value="20200002"' in response.get_data(as_text=True)
+        with appmod.app.app_context():
+            assert db.session.get(User, seed['student_id']).matric_no == '20200001'
+
     def test_staff_cannot_claim_a_matric_number(self, appmod, seed, login):
         from models import db, User
 
