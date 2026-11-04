@@ -9,6 +9,7 @@ instead, which is the one port a PaaS always leaves open.
 Nothing here knows about Flask: app.py adapts its Message objects at the one
 place that actually sends.
 """
+import re
 from email.utils import parseaddr
 
 import requests
@@ -21,6 +22,17 @@ DEFAULT_BREVO_ENDPOINT = 'https://api.brevo.com/v3/smtp/email'
 #: same 401 it gives a key that does not exist, so say which one is configured.
 V3_KEY_PREFIX = 'xkeysib-'
 SMTP_KEY_PREFIX = 'xsmtpsib-'
+
+#: Where Brevo lists the addresses an account will take API calls from.
+AUTHORISED_IPS_URL = 'https://app.brevo.com/security/authorised_ips'
+
+#: Brevo's 401 for a call from an address the account has not authorised:
+#: "We have detected you are using an unrecognised IP address 203.0.113.7. If
+#: you performed this action make sure to add the new IP address in this
+#: link: https://app.brevo.com/security/authorised_ips". The blocking is on by
+#: default for accounts opened since May 2024.
+_UNAUTHORISED_IP = re.compile(r'unrecogni[sz]ed ip|authori[sz]ed_?ips', re.I)
+_IP_IN_MESSAGE = re.compile(r'ip address\s+([0-9A-Fa-f:.]*[0-9A-Fa-f])', re.I)
 
 
 class MailSendError(Exception):
@@ -53,8 +65,19 @@ def _describe_http_failure(status, payload, sender_address, api_key=None):
 
     if status in (401, 403):
         # Brevo's own words separate "this key is not real" from "this account
-        # has not been activated yet", and only the first is worth re-copying
-        # a key over.
+        # has not been activated yet" and from "this key is fine but the call
+        # came from somewhere new", and only the first is worth re-copying a
+        # key over.
+        if _UNAUTHORISED_IP.search(message):
+            found = _IP_IN_MESSAGE.search(message)
+            address = found.group(1) if found else 'this server\'s address'
+            return (f'Brevo blocked the call because it came from an IP '
+                    f'address the account has not authorised ({address}) — '
+                    f'the API key itself is fine. Open {AUTHORISED_IPS_URL} '
+                    f'and add {address}, or deactivate IP blocking there: on '
+                    f'a PaaS such as Render the outbound address is shared '
+                    f'and can change, so one authorised address stops '
+                    f'working the next time it does ({status}: {message})')
         if 'activat' in message.lower():
             return (f'Brevo has not activated this account for sending '
                     f'({status}: {message}) — that is an account state, not a '
@@ -76,6 +99,14 @@ def _describe_http_failure(status, payload, sender_address, api_key=None):
     return f'Brevo returned {status}: {message or "no message"}'
 
 
+def _json_or_text(response):
+    """Brevo's error body, or the start of whatever came back instead."""
+    try:
+        return response.json()
+    except ValueError:
+        return {'message': response.text[:200]}
+
+
 def _senders_endpoint(settings):
     """The senders list lives beside the send endpoint on the same API."""
     endpoint = settings.brevo_endpoint or DEFAULT_BREVO_ENDPOINT
@@ -93,7 +124,9 @@ def check_sender_validated(settings):
 
     Returns (verdict, note) where verdict is True, False or None for
     "could not tell" — a check that cannot reach Brevo must not be reported as
-    a configuration problem.
+    a configuration problem. A 401/403 is not "could not tell": the send uses
+    the same key from the same address and will be refused the same way, so
+    it comes back False with Brevo's reason in the note.
     """
     _, address = split_sender(settings.sender)
     if not settings.brevo_api_key or not address:
@@ -109,6 +142,10 @@ def check_sender_validated(settings):
     except requests.RequestException as exc:
         return None, f'could not ask Brevo ({type(exc).__name__})'
 
+    if response.status_code in (401, 403):
+        return False, _describe_http_failure(
+            response.status_code, _json_or_text(response), address,
+            api_key=settings.brevo_api_key)
     if response.status_code >= 400:
         return None, f'Brevo returned {response.status_code} for the sender list'
 
@@ -127,9 +164,10 @@ def check_sender_validated(settings):
     listed = ', '.join(str(s.get('email')) for s in senders[:3]) or 'none'
     return False, (
         f'Brevo does not list {address} as a validated sender (it lists: '
-        f'{listed}). Messages will be accepted and then rejected. Add it '
-        f'under Senders, Domains & Dedicated IPs → Senders and open the '
-        f'confirmation mail Brevo sends to that address')
+        f'{listed}). Messages will be accepted and then rejected, which shows '
+        f'only in Brevo\'s Transactional → Logs. Add it under Senders, '
+        f'Domains & Dedicated IPs → Senders and open the confirmation mail '
+        f'Brevo sends to that address')
 
 
 def send_via_brevo(settings, *, subject, recipients, text, html=None,
@@ -173,12 +211,8 @@ def send_via_brevo(settings, *, subject, recipients, text, html=None,
             f'could not reach Brevo ({type(exc).__name__}: {exc})') from exc
 
     if response.status_code >= 400:
-        try:
-            body = response.json()
-        except ValueError:
-            body = {'message': response.text[:200]}
         raise MailSendError(_describe_http_failure(
-            response.status_code, body, sender_address,
+            response.status_code, _json_or_text(response), sender_address,
             api_key=settings.brevo_api_key))
 
     return response

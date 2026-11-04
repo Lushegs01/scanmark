@@ -1135,11 +1135,12 @@ def _warn_if_sender_is_not_validated():
     Say at boot what Brevo would otherwise only say hours later, in its own
     dashboard: the send endpoint answers 201 and rejects the message
     afterwards when the sender is not validated, so an unvalidated address
-    logs as a successful send and reaches nobody.
+    logs as a successful send and reaches nobody. The same call also meets a
+    refused key or an unauthorised server IP before the first signup does.
     """
     verdict, note = check_sender_validated(MAIL_SETTINGS)
     if verdict is False:
-        app.logger.warning('Brevo sender problem: %s', note)
+        app.logger.warning('Brevo will not send: %s', note)
     elif verdict is None:
         app.logger.info('Brevo sender not checked: %s', note)
     else:

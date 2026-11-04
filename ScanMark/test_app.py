@@ -465,6 +465,70 @@ class TestBrevoDelivery:
                                   recipients=['a@b.test'], text='body')
         assert 'not a configuration problem' in str(caught.value)
 
+    _IP_BLOCK = ('We have detected you are using an unrecognised IP address '
+                 '203.0.113.7. If you performed this action make sure to add '
+                 'the new IP address in this link: '
+                 'https://app.brevo.com/security/authorised_ips')
+
+    def test_an_unauthorised_ip_is_not_blamed_on_the_key(self, monkeypatch):
+        """
+        Brevo refuses calls from IPs the account has not authorised — on by
+        default since May 2024 — with a 401. Telling the operator to re-copy
+        a key that is fine sends them the wrong way; the server's IP is what
+        has to be allowed.
+        """
+        import mailer
+
+        monkeypatch.setattr(mailer.requests, 'post', lambda *a, **k: _FakeResponse(
+            401, {'code': 'unauthorized', 'message': self._IP_BLOCK}))
+        with pytest.raises(mailer.MailSendError) as caught:
+            mailer.send_via_brevo(self._settings(), subject='Hi',
+                                  recipients=['a@b.test'], text='body')
+        reason = str(caught.value)
+        assert '203.0.113.7' in reason
+        assert 'authorised_ips' in reason
+        assert 'key itself is fine' in reason
+        assert 'set it whole as BREVO_API_KEY' not in reason
+
+    def test_an_unauthorised_ipv6_address_is_named(self, monkeypatch):
+        import mailer
+
+        monkeypatch.setattr(mailer.requests, 'post', lambda *a, **k: _FakeResponse(
+            401, {'message': self._IP_BLOCK.replace('203.0.113.7',
+                                                    '2001:db8::7')}))
+        with pytest.raises(mailer.MailSendError) as caught:
+            mailer.send_via_brevo(self._settings(), subject='Hi',
+                                  recipients=['a@b.test'], text='body')
+        assert '(2001:db8::7)' in str(caught.value)
+
+    def test_the_boot_check_reports_an_unauthorised_ip(self, monkeypatch):
+        """It used to log this at INFO as 'not checked' and move on."""
+        mailer = self._sender_list(monkeypatch, status=401, payload={
+            'code': 'unauthorized', 'message': self._IP_BLOCK})
+        verdict, note = mailer.check_sender_validated(self._settings())
+        assert verdict is False
+        assert '203.0.113.7' in note
+
+    def test_the_boot_check_reports_a_rejected_key(self, monkeypatch):
+        mailer = self._sender_list(monkeypatch, status=401,
+                                   payload={'message': 'Key not found'})
+        verdict, note = mailer.check_sender_validated(
+            self._settings(BREVO_API_KEY='xsmtpsib-abc123'))
+        assert verdict is False
+        assert 'SMTP relay key' in note
+
+    def test_a_refused_boot_check_is_a_warning(self, appmod, monkeypatch,
+                                               caplog):
+        import logging
+
+        monkeypatch.setattr(appmod, 'check_sender_validated',
+                            lambda settings: (False, 'Brevo blocked the call'))
+        with caplog.at_level(logging.INFO):
+            appmod._warn_if_sender_is_not_validated()
+        assert any(record.levelno == logging.WARNING
+                   and 'Brevo blocked the call' in record.getMessage()
+                   for record in caplog.records)
+
     def test_a_v3_key_draws_no_complaint(self):
         import mailer
 

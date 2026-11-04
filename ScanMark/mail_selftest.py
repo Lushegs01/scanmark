@@ -57,12 +57,11 @@ def check_brevo(settings, recipient):
     # message afterwards, so an unvalidated sender otherwise looks like a
     # clean pass here and still reaches nobody.
     print("Checking the sender against Brevo's validated list...")
+    # A refused key or an unauthorised IP also stops here, with Brevo's
+    # reason in the note.
     verdict, note = check_sender_validated(settings)
     if verdict is False:
-        return fail(note,
-                    "Until that is done every message is accepted by the API "
-                    "and then dropped, which is visible only in Brevo's "
-                    "Transactional → Logs.")
+        return fail(note)
     print(f"   {note}.")
 
     if not recipient:
