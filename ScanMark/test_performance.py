@@ -97,7 +97,11 @@ def _point_north(latitude, longitude, metres):
 @pytest.mark.parametrize('distance_m,expected_status', [
     (78, 200),
     (99, 200),
-    (101, 422),
+    # The fence is GEOFENCE_RADIUS_M plus the fix's own reported error,
+    # capped (GEOFENCE_ACCURACY_ALLOWANCE_M). This fix reports ±5m, so it
+    # is forgiven exactly 5m and not one more.
+    (104, 200),
+    (106, 422),
 ])
 def test_authoritative_geofence_boundary(distance_m, expected_status):
     coordinator, student, course, sessions = _seed()

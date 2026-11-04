@@ -233,75 +233,102 @@
     // decides what the page bothers sending. A laptop reports thousands.
     const MAX_PIN_ACCURACY_M = {{ max_pin_accuracy_m }};
 
+    // The best reading so far, and the precision of the last one sent. A
+    // watch narrows over the first few seconds and then wanders indoors;
+    // only an IMPROVEMENT is worth sending, because the pin is the centre of
+    // every student's fence. (The server enforces the same rule.)
+    let bestPin = null;
+    let sentAccuracy = Infinity;
+    let sentAt = 0;
+    const RESEND_MS = 5 * 60 * 1000;
+
+    function showPinned(pin) {
+        const statusEl = document.getElementById('locationStatus');
+        const alertEl = document.getElementById('locationAlert');
+        statusEl.innerText = `Active ✅ (${pin.lat.toFixed(5)}, ${pin.lon.toFixed(5)}, ±${pin.accuracy}m)`;
+        alertEl.classList.remove('alert-warning', 'alert-danger');
+        alertEl.classList.add('alert-success');
+        const spinner = alertEl.querySelector('.spinner-grow');
+        if (spinner) spinner.classList.add('d-none'); // Hide spinner
+    }
+
+    function sendPin(pin) {
+        sentAccuracy = pin.accuracy;
+        sentAt = Date.now();
+        // Pinned against THIS meeting, not the course: the lecture,
+        // the tutorial and the makeup class are legitimately in
+        // different rooms.
+        fetch("{{ url_for('set_session_location', session_id=session.id) }}", {
+            method: "POST",
+            headers: {
+                'Content-Type': 'application/json',
+                'X-CSRFToken': CSRF_TOKEN
+            },
+            // Accuracy travels with the pin so the server can apply the
+            // same rule; a page that lied by omission used to be taken
+            // at its word.
+            body: JSON.stringify({ lat: pin.lat, lon: pin.lon, accuracy_m: pin.accuracy })
+        })
+            .then(res => res.json())
+            .then(data => {
+                if (data.status === 'error') {
+                    showLocationError(data.message);
+                    return;
+                }
+                console.log("✅ Location updated:", data);
+            })
+            .catch(err => {
+                sentAccuracy = Infinity;    // try again on the next reading
+                console.error("❌ Location send error:", err);
+            });
+    }
+
     function setClassLocation() {
         if (!navigator.geolocation) {
             showLocationError("Geolocation is not supported by this browser.");
             return;
         }
 
-        navigator.geolocation.getCurrentPosition(
+        navigator.geolocation.watchPosition(
             function (position) {
-                const lat = position.coords.latitude;
-                const lon = position.coords.longitude;
-                const accuracy = Math.round(position.coords.accuracy);
-
-                // Update UI to show active status
-                const statusEl = document.getElementById('locationStatus');
-                const alertEl = document.getElementById('locationAlert');
-
-                if (accuracy > MAX_PIN_ACCURACY_M) {
+                const pin = {
+                    lat: position.coords.latitude,
+                    lon: position.coords.longitude,
+                    accuracy: Math.round(position.coords.accuracy)
+                };
+                if (pin.accuracy > MAX_PIN_ACCURACY_M) {
                     // The 36km case, caught here instead of by every student
                     // in the room being told THEY are in the wrong place.
-                    showLocationError(
-                        `This machine only knows where it is to within ${accuracy}m, ` +
-                        `so it cannot mark the classroom. Pick a saved classroom below.`);
+                    if (!bestPin) {
+                        showLocationError(
+                            `This machine only knows where it is to within ${pin.accuracy}m, ` +
+                            `so it cannot mark the classroom. Pick a saved classroom below.`);
+                    }
                     return;
                 }
-
-                statusEl.innerText = `Active ✅ (${lat.toFixed(5)}, ${lon.toFixed(5)}, ±${accuracy}m)`;
-                alertEl.classList.remove('alert-warning', 'alert-danger');
-                alertEl.classList.add('alert-success');
-                const spinner = alertEl.querySelector('.spinner-grow');
-                if (spinner) spinner.classList.add('d-none'); // Hide spinner
-
-                // Pinned against THIS meeting, not the course: the lecture,
-                // the tutorial and the makeup class are legitimately in
-                // different rooms.
-                fetch("{{ url_for('set_session_location', session_id=session.id) }}", {
-                    method: "POST",
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'X-CSRFToken': CSRF_TOKEN
-                    },
-                    // Accuracy travels with the pin so the server can apply the
-                    // same rule; a page that lied by omission used to be taken
-                    // at its word.
-                    body: JSON.stringify({ lat: lat, lon: lon, accuracy_m: accuracy })
-                })
-                    .then(res => res.json())
-                    .then(data => {
-                        if (data.status === 'error') {
-                            showLocationError(data.message);
-                            return;
-                        }
-                        console.log("✅ Location updated:", data);
-                    })
-                    .catch(err => console.error("❌ Location send error:", err));
+                if (!bestPin || pin.accuracy < bestPin.accuracy) bestPin = pin;
+                showPinned(bestPin);
+                if (bestPin.accuracy < sentAccuracy - 2 || Date.now() - sentAt > RESEND_MS) {
+                    sendPin(bestPin);
+                }
             },
 
             function (error) {
+                // A watch keeps going after an error; only a denial is final,
+                // and once a pin is set a later hiccup changes nothing.
+                if (bestPin && error.code !== 1) return;
                 const messages = {
                     1: "GPS Permission Denied — please allow location access.",
                     2: "Position Unavailable — check your device GPS.",
-                    3: "GPS Timeout — retrying..."
+                    3: "GPS Timeout — still trying..."
                 };
                 showLocationError(messages[error.code] || "Unknown GPS error.");
             },
 
             {
                 enableHighAccuracy: true,
-                timeout: 10000,
-                maximumAge: 10000
+                timeout: 30000,
+                maximumAge: 0
             }
         );
     }
@@ -326,12 +353,11 @@
         if (spinner) spinner.classList.add('d-none');
     }
 
-    // Run immediately on page load, then every 30 seconds (FIX #6) — unless a
-    // saved room has already answered the question, in which case there is
-    // nothing to refresh and no permission prompt to inflict.
+    // Watch from page load, sending each improvement — unless a saved room
+    // has already answered the question, in which case there is nothing to
+    // refine and no permission prompt to inflict.
     if (!CLASSROOM_PINNED) {
         setClassLocation();
-        setInterval(setClassLocation, 30000);
     }
 </script>
 {% endblock %}

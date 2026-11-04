@@ -33,6 +33,7 @@
 
     const DEVICE_ID = deviceId();
     const analysisCanvas = document.getElementById('processing-canvas');
+    if (!analysisCanvas) return;          // a page without the scanner markup
     const context = analysisCanvas.getContext('2d', { willReadFrequently: true });
     const video = document.getElementById('camera-feed');
     const container = document.getElementById('scanner-container');
@@ -72,6 +73,10 @@
     const FAR = { fraction: 0.2, width: 720, upscale: 3 };
     const HUNT_REGIONS = [WIDE, MIDDLE, CENTRE, MIDDLE, FAR];
     const TARGET_INTERVAL_MS = 70;
+    // While a scan is already in hand and only waiting on the network, the
+    // camera is kept reading purely to pick up the NEXT code the projector
+    // shows. That needs a look every quarter second, not fourteen a second.
+    const REFRESH_INTERVAL_MS = 250;
     // Consecutive frames that find nothing before the scanner changes
     // something about how it is looking. Roughly a second of not finding it.
     const ESCALATE_AFTER_MISSES = 10;
@@ -86,6 +91,9 @@
     // Patches per side of the region judged. A distant code fills one of
     // them; averaged over the whole middle it would vanish into the wall.
     const PATTERN_TILES = 5;
+
+    // ---- Location ----------------------------------------------------------
+    //
     // How old a fix may be before we look for a better one. Deliberately
     // tighter than the server's limit, so there is room to get a fresh fix
     // and still post inside it.
@@ -94,17 +102,59 @@
     // GEOFENCE_MAX_LOCATION_AGE_MS's own default.
     const SERVER_MAX_AGE_MS = Number(config.maxLocationAgeMs) > 0
         ? Number(config.maxLocationAgeMs) : 30000;
-    const TRANSIENT_RETRY_LIMIT = 3;
+    // The worst accuracy the server accepts. Posting a fix it will refuse
+    // as imprecise is a wasted round trip and a red banner; waiting a few
+    // seconds for the watch to narrow is usually all it takes.
+    const MAX_ACCURACY_M = Number(config.maxLocationAccuracyM) > 0
+        ? Number(config.maxLocationAccuracyM) : 100;
+    // How long a scan waits for a usable fix before it goes with the best
+    // one it has (or explains why there is none).
+    const LOCATION_BUDGET_MS = 12000;
+    // A high-accuracy watch indoors can go quiet for a long time while it
+    // hunts for satellites. The network (Wi-Fi/cell) position answers in
+    // about a second and, inside a building with Wi-Fi, is often the more
+    // accurate of the two. Asked for after this long without any fix.
+    const NETWORK_FIX_AFTER_MS = 3000;
+    // Automatic goes at a fresh fix after the server said this one was too
+    // far, too vague or too old. Indoor fixes drift: the next reading is
+    // often 30-60m closer to the truth, and asking the student to tap again
+    // for it is the "you are too far" error a student sitting in the hall
+    // used to get.
+    const LOCATION_RETRY_LIMIT = 3;
+
+    // ---- Submission --------------------------------------------------------
+    //
     //: Marks that this page already reloaded itself once to recover a
     //  session/CSRF mismatch, so it cannot do it again in a loop.
     const RELOADED_FOR_SESSION_KEY = 'scanmark-reloaded-for-session';
-    // How many times we may re-read the same projected code and resubmit on
-    // our own after a rejection the student could plausibly fix (an expired
-    // code, a GPS fix that was too far out). Past this the camera stops and
-    // waits for a deliberate tap. Without the cap a rejected phone re-reads
-    // the screen every ~1.2s forever, which is the whole class's worth of
-    // wasted requests for the rest of the lecture.
+    // How many times we may re-read the projected code and resubmit on our
+    // own after the server refused the CODE (expired, not read just now).
+    // Past this the camera stops and waits for a deliberate tap. Without the
+    // cap a rejected phone re-reads the screen forever, which is the whole
+    // class's worth of wasted requests for the rest of the lecture.
     const AUTO_RESUBMIT_LIMIT = 3;
+    // One request's patience. A 2G POST on a cold connection is two round
+    // trips of set-up plus one for the request: a few seconds. Past this it
+    // is more likely stuck behind a dead radio than slow, and a fresh
+    // attempt (with the newest code) beats waiting on it.
+    const REQUEST_TIMEOUT_MS = 15000;
+    // How long a scan already read keeps trying to reach the server before
+    // the page gives up on it. Long, on purpose: as long as the camera can
+    // see the projector, every retry carries a code that is seconds old, so
+    // the server's replay window never runs out on a student whose network
+    // did.
+    const PENDING_GIVE_UP_MS = 300000;
+    // Keep a connection open while the scanner waits for the code to go up:
+    // the scan then rides it instead of paying TCP + TLS set-up — two round
+    // trips, which on 2G is the better part of two seconds. Below the
+    // ~60s idle reaping of most routers and carrier NATs.
+    const WARM_INTERVAL_MS = 45000;
+    // What a ScanMark code looks like. Anything else is somebody else's QR
+    // on the slide; posting it costs the student a request from their
+    // ten-a-minute allowance to be told so.
+    const TOKEN_PATTERN = /^S(\d+)\|(\d+)\|[0-9a-f]{16}$/;
+    const QR_WINDOW_SECONDS = Number(config.qrWindowSeconds) > 0
+        ? Number(config.qrWindowSeconds) : 45;
 
     let stream = null;
     let track = null;
@@ -117,22 +167,11 @@
     let analysisIntervalMs = TARGET_INTERVAL_MS;
     let animationFrameId = null;
     let focusIntervalId = null;
-    let resumeTimeoutId = null;
     let bannerTimeoutId = null;
-    let latestPosition = null;
-    let watchId = null;
+    let warmIntervalId = null;
     let cameraStartedAt = 0;
     let cameraReadyMs = 0;
-    let qrCapturedAt = 0;
-    // Wall-clock instant the camera actually decoded the code. Distinct from
-    // qrCapturedAt, which is a performance.now() reading used for local
-    // timing: the server needs a real timestamp to compare against the
-    // token's own, and it must be the moment of the READ — not the moment of
-    // the POST, which on a slow GPS fix can be seconds later.
-    let qrCapturedAtEpoch = 0;
     let lastDecodeMs = 0;
-    let retryAttempt = 0;
-    let rejectionStreak = 0;
     let torchEnabled = false;
     // The student tapped the flashlight themselves. The automatic hunt below
     // then leaves it alone — a control that fights the person holding it is
@@ -159,18 +198,129 @@
     let zoomPending = null;
     let zoomApplying = false;
 
+    // ---- The scan in hand --------------------------------------------------
+    //
+    // Once a code has been read, it is a PENDING scan until the server gives
+    // a definitive answer. Everything that can go wrong in between — no
+    // signal, a stalled request, a busy server, a GPS fix that drifted — is
+    // handled by trying again, automatically, with the newest code the camera
+    // has seen and the best fix the phone has. The student does not rescan.
+    let pending = null;
+    let inFlight = false;
+    let retryTimeoutId = null;
+    let transientAttempts = 0;
+    let codeRejections = 0;
+    let locationRetries = 0;
+    let csrfRefreshes = 0;
+    // The timestamp of a fix the server refused. The next attempt waits for
+    // a NEWER one; resubmitting the same reading gets the same answer.
+    let refusedFixAt = 0;
+    // Server clock minus ours, learned from a response's Date header. A
+    // phone whose clock is a minute out used to have every scan refused as
+    // "not read from the screen just now", because the capture time it
+    // reported was compared against the server's token time.
+    let serverOffsetMs = null;
+    let lastWarmAt = 0;
+
     function status(message, type) {
         statusBadge.textContent = message;
         statusBadge.className = `status-badge ${type}`;
     }
 
     function result(message, kind) {
+        if (!resultBanner) return;
         resultBanner.textContent = message;
         resultBanner.className = `alert mt-3 text-center fw-bold fs-5 alert-${kind}`;
         resultBanner.classList.remove('d-none');
         clearTimeout(bannerTimeoutId);
-        bannerTimeoutId = setTimeout(() => resultBanner.classList.add('d-none'), 7000);
+        bannerTimeoutId = setTimeout(() => resultBanner.classList.add('d-none'), 9000);
     }
+
+    // ---- Clock and connection ----------------------------------------------
+
+    function noteServerDate(response) {
+        const header = response && response.headers ? response.headers.get('Date') : null;
+        const parsed = header ? Date.parse(header) : NaN;
+        // The header is truncated to the second; the middle of that second
+        // is the best guess.
+        if (Number.isFinite(parsed)) serverOffsetMs = parsed + 500 - Date.now();
+        return response;
+    }
+
+    function serverNow() {
+        return Date.now() + (serverOffsetMs || 0);
+    }
+
+    /**
+     * Open (or keep open) the connection the scan will be posted on.
+     *
+     * Same credentials mode as the scan itself: browsers keep separate
+     * connection pools for credentialed and anonymous requests, and warming
+     * the wrong one would be a round trip spent on nothing.
+     */
+    function warmConnection() {
+        if (!config.warmUrl) return;
+        lastWarmAt = Date.now();
+        fetch(config.warmUrl, { method: 'HEAD', cache: 'no-store' })
+            .then(noteServerDate)
+            .catch(() => {});
+    }
+
+    // ---- Decoders ----------------------------------------------------------
+
+    let jsqrRequested = null;
+
+    /**
+     * Load the software decoder only when it is needed.
+     *
+     * Phones whose browser has BarcodeDetector (most Android Chrome) never
+     * use jsQR, and it is the heaviest file on the page. It used to be a
+     * parser-blocking script on the scan page; now it is fetched in the
+     * background, from the service worker's cache after the first visit.
+     */
+    function loadJsQR() {
+        if (typeof window.jsQR === 'function') return Promise.resolve();
+        if (!jsqrRequested && config.jsqrUrl) {
+            jsqrRequested = new Promise(resolve => {
+                const script = document.createElement('script');
+                script.src = config.jsqrUrl;
+                script.async = true;
+                script.onload = resolve;
+                script.onerror = () => { jsqrRequested = null; resolve(); };
+                document.head.appendChild(script);
+            });
+        }
+        return jsqrRequested || Promise.resolve();
+    }
+
+    async function configureDetector() {
+        detector = null;
+        if (!('BarcodeDetector' in window)) return;
+        try {
+            const formats = await window.BarcodeDetector.getSupportedFormats();
+            if (formats.includes('qr_code')) {
+                detector = new window.BarcodeDetector({ formats: ['qr_code'] });
+            }
+        } catch (_) {
+            detector = null;
+        }
+    }
+
+    // Asking the platform which formats it supports can take a few hundred
+    // milliseconds the first time (it loads the barcode model). That used to
+    // happen after the tap, in series with opening the camera; it now runs
+    // while the page is still being read.
+    const detectorReady = configureDetector().then(() => {
+        if (!detector) loadJsQR();
+    });
+
+    // ---- Location ----------------------------------------------------------
+
+    const fixes = [];
+    let fixWaiters = [];
+    let watchId = null;
+    let lastLocationError = null;
+    let networkFixTimer = null;
 
     /**
      * A problem with the fix itself, not with the network.
@@ -192,6 +342,84 @@
         return Math.max(0, Date.now() - position.timestamp);
     }
 
+    function describeLocationError(error) {
+        // Three different problems with three different fixes. All three
+        // used to read "Allow GPS access" — including a timeout indoors,
+        // where permission was granted and the student could do nothing
+        // about the message they were given.
+        if (error && error.code === 1) {
+            return 'Location permission is off for this site. Allow location ' +
+                '(precise) in your browser settings, then scan again.';
+        }
+        if (error && error.code === 2) {
+            return 'Your phone could not work out where it is. Turn on Location ' +
+                '(GPS) in your phone settings, then scan again.';
+        }
+        return 'Could not get a location fix in time. Step towards a window or ' +
+            'doorway for a moment, then scan again.';
+    }
+
+    function noteFix(position) {
+        lastLocationError = null;
+        fixes.push(position);
+        // Nothing older than the server will accept is worth keeping.
+        while (fixes.length && (fixes.length > 20 || positionAge(fixes[0]) > SERVER_MAX_AGE_MS)) {
+            fixes.shift();
+        }
+        const waiters = fixWaiters;
+        fixWaiters = [];
+        waiters.forEach(resolve => resolve());
+    }
+
+    function nextFix(timeoutMs) {
+        return new Promise(resolve => {
+            fixWaiters.push(resolve);
+            setTimeout(resolve, timeoutMs);
+        });
+    }
+
+    /**
+     * The most precise recent fix, not merely the latest.
+     *
+     * A watch reports a coarse network position first and narrows from
+     * there, and indoors it wanders: one reading ±15m, the next ±60m. Taking
+     * whichever arrived last meant a scan could carry the worst reading of
+     * the last ten seconds — and be told the student was too far away.
+     */
+    function bestFix(newerThan) {
+        let best = null;
+        for (const position of fixes) {
+            if (positionAge(position) > POSITION_MAX_AGE_MS) continue;
+            if (newerThan && position.timestamp <= newerThan) continue;
+            if (!best || position.coords.accuracy < best.coords.accuracy - 1
+                || (Math.abs(position.coords.accuracy - best.coords.accuracy) <= 1
+                    && position.timestamp > best.timestamp)) {
+                best = position;
+            }
+        }
+        return best;
+    }
+
+    function requestPosition(maximumAge, highAccuracy) {
+        return new Promise((resolve, reject) => {
+            if (!navigator.geolocation) {
+                reject(locationError('Geolocation is not supported by this browser.'));
+                return;
+            }
+            navigator.geolocation.getCurrentPosition(
+                position => {
+                    noteFix(position);
+                    resolve(position);
+                },
+                error => {
+                    lastLocationError = error;
+                    reject(locationError(describeLocationError(error)));
+                },
+                { enableHighAccuracy: highAccuracy !== false, timeout: 10000, maximumAge: maximumAge }
+            );
+        });
+    }
+
     /**
      * Keep a fix arriving while the camera is open.
      *
@@ -203,97 +431,88 @@
     function startWatchingLocation() {
         if (!navigator.geolocation || watchId !== null) return;
         watchId = navigator.geolocation.watchPosition(
-            position => { latestPosition = position; },
-            () => {},        // failures are reported at scan time, not here
+            noteFix,
+            // A watch reports errors as they happen and keeps going; only a
+            // denial is final. Waiters are woken so a denial is reported now
+            // rather than at the end of the budget.
+            error => {
+                lastLocationError = error;
+                if (error.code === 1) {
+                    const waiters = fixWaiters;
+                    fixWaiters = [];
+                    waiters.forEach(resolve => resolve());
+                }
+            },
             { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
         );
+        clearTimeout(networkFixTimer);
+        networkFixTimer = setTimeout(() => {
+            if (watchId !== null && !bestFix()) {
+                requestPosition(POSITION_MAX_AGE_MS, false).catch(() => {});
+            }
+        }, NETWORK_FIX_AFTER_MS);
     }
 
     function stopWatchingLocation() {
+        clearTimeout(networkFixTimer);
         if (watchId === null) return;
         navigator.geolocation.clearWatch(watchId);
         watchId = null;
     }
 
-    function recentPosition() {
-        if (!latestPosition) return null;
-        return positionAge(latestPosition) <= POSITION_MAX_AGE_MS
-            ? latestPosition : null;
-    }
-
-    function requestPosition(maximumAge) {
-        return new Promise((resolve, reject) => {
-            if (!navigator.geolocation) {
-                reject(locationError('Geolocation is not supported by this browser.'));
-                return;
-            }
-            navigator.geolocation.getCurrentPosition(
-                position => {
-                    latestPosition = position;
-                    resolve(position);
-                },
-                () => reject(locationError(
-                    'Location is required. Allow GPS access and scan again.')),
-                { enableHighAccuracy: true, timeout: 10000, maximumAge: maximumAge }
-            );
-        });
-    }
-
     /**
-     * A fix the server will accept, or an error saying why not.
+     * A fix the server will accept, or an error saying why there is none.
      *
      * maximumAge is a hint, not a promise: Android's fused provider hands
      * back a last-known location — minutes or hours old — whenever it cannot
      * get a fresh one, typically indoors, which is exactly where a lecture
-     * happens. Posting that earns "Location fix is stale" from the server
-     * after a pointless round trip, so ask again with maximumAge: 0 to force
-     * a real fix, and only give up when that is stale too.
+     * happens. Fixes older than the server allows are never chosen; when
+     * nothing usable has arrived halfway through the budget, one fresh
+     * reading is forced with maximumAge: 0.
      */
-    async function acquirePosition() {
-        const cached = recentPosition();
-        if (cached) return cached;
-
-        let position = await requestPosition(POSITION_MAX_AGE_MS);
-        if (positionAge(position) > SERVER_MAX_AGE_MS) {
-            status('Getting a fresh location...', 'scanning');
-            try {
-                position = await requestPosition(0);
-            } catch (_) {
-                // Keep the stale one's error below rather than the timeout's:
-                // "your phone gave us an old fix" is the useful sentence.
+    async function acquirePosition(newerThan) {
+        if (!navigator.geolocation) {
+            throw locationError('Geolocation is not supported by this browser.');
+        }
+        startWatchingLocation();
+        const started = performance.now();
+        let forced = false;
+        for (;;) {
+            const best = bestFix(newerThan);
+            if (best && best.coords.accuracy <= MAX_ACCURACY_M) return best;
+            if (lastLocationError && lastLocationError.code === 1) {
+                throw locationError(describeLocationError(lastLocationError));
             }
+            const waited = performance.now() - started;
+            if (waited >= LOCATION_BUDGET_MS) break;
+            status(best
+                ? `Sharpening your location (±${Math.round(best.coords.accuracy)}m)...`
+                : 'Finding your location...', 'scanning');
+            if (!forced && waited >= LOCATION_BUDGET_MS / 2) {
+                forced = true;
+                requestPosition(0).catch(() => {});
+            }
+            await nextFix(Math.min(1000, LOCATION_BUDGET_MS - waited));
         }
-        if (positionAge(position) > SERVER_MAX_AGE_MS) {
-            throw locationError(
-                'Your phone is reporting a location from ' +
-                `${Math.round(positionAge(position) / 1000)}s ago, which is too ` +
-                'old to prove you are in the classroom. Move near a window or ' +
-                'step outside for a moment, then scan again.');
-        }
-        return position;
+        // Out of time. The best reading there is still goes, and the server
+        // explains in its own words if it is not good enough.
+        const best = bestFix(newerThan);
+        if (best) return best;
+        throw locationError(describeLocationError(lastLocationError));
     }
 
-    async function configureDetector() {
-        detector = null;
-        if (!('BarcodeDetector' in window)) return;
-        try {
-            const formats = await window.BarcodeDetector.getSupportedFormats();
-            if (formats.includes('qr_code')) {
-                detector = new window.BarcodeDetector({ formats: ['qr_code'] });
-            }
-        } catch (_) {
-            detector = null;
-        }
-    }
-
-    async function applyCameraSettings() {
+    function applyCameraSettings() {
         capabilities = (track && track.getCapabilities && track.getCapabilities()) || {};
         zoomLevel = zoomDefault = capabilities.zoom
             ? clampZoom(trackSetting('zoom', capabilities.zoom.min || 1)) : null;
-        if (capabilities.focusMode && capabilities.focusMode.includes('continuous')) {
-            await applyAdvanced({ focusMode: 'continuous' });
-        }
         syncZoomSlider();
+        // Continuous focus was already asked for in getUserMedia. Repeating
+        // it explicitly helps some cameras, but nothing has to wait for it:
+        // it used to be awaited before the first frame was looked at, which
+        // put a constraint round trip into every camera start.
+        if (capabilities.focusMode && capabilities.focusMode.includes('continuous')) {
+            applyAdvanced({ focusMode: 'continuous' });
+        }
     }
 
     function clampZoom(level) {
@@ -351,14 +570,17 @@
         return new Promise(resolve => video.addEventListener('loadedmetadata', resolve, { once: true }));
     }
 
+    let cameraGeneration = 0;
+
     async function startScanner() {
-        stopScanner();
+        stopCamera();
+        const generation = cameraGeneration;
         // A deliberate tap is a fresh start: give the automatic-resubmit
         // budget back rather than inheriting the previous attempt's streak,
         // and begin the hunt from an un-adapted camera so a zoom left over
         // from the last room does not narrow this one's first look.
-        rejectionStreak = 0;
-        retryAttempt = 0;
+        codeRejections = 0;
+        locationRetries = 0;
         missStreak = 0;
         enhancing = false;
         resolutionRaised = false;
@@ -367,14 +589,21 @@
         zoomManual = false;
         zoomPending = null;
         cameraStartedAt = performance.now();
+        // Everything the scan will need is started now, side by side, rather
+        // than one after another once the code is in view: the GPS watch,
+        // the connection the result will be posted on, and the decoder.
         startWatchingLocation();
+        if (Date.now() - lastWarmAt > 5000) warmConnection();
+        warmIntervalId = setInterval(() => {
+            if (!inFlight) warmConnection();
+        }, WARM_INTERVAL_MS);
         container.style.display = 'block';
         document.body.style.overflow = 'hidden';
         loader.style.display = 'block';
-        status('Opening camera...', 'scanning');
+        status(pending ? 'Point at the code on screen to finish...' : 'Opening camera...',
+               'scanning');
         try {
-            await configureDetector();
-            stream = await navigator.mediaDevices.getUserMedia({
+            const opened = await navigator.mediaDevices.getUserMedia({
                 video: {
                     facingMode: { ideal: 'environment' },
                     // Start modest. Distance is a resolution problem before
@@ -388,38 +617,49 @@
                 },
                 audio: false
             });
+            if (generation !== cameraGeneration) {
+                // Closed while the camera was opening: do not leave it on
+                // behind a hidden overlay.
+                opened.getTracks().forEach(mediaTrack => mediaTrack.stop());
+                return;
+            }
+            stream = opened;
             video.srcObject = stream;
             await waitForVideo();
             await video.play();
+            if (generation !== cameraGeneration) return;
             track = stream.getVideoTracks()[0];
-            await applyCameraSettings();
+            applyCameraSettings();
             cameraReadyMs = performance.now() - cameraStartedAt;
             announce('');
             loader.style.display = 'none';
             active = true;
-            status(detector ? 'Scanning (native detector)...' : 'Scanning...', 'scanning');
-            focusIntervalId = setInterval(triggerFocus, 4000);
+            if (!pending) {
+                status(detector ? 'Scanning (native detector)...' : 'Scanning...', 'scanning');
+            }
+            focusIntervalId = setInterval(nudgeFocus, 4000);
             scheduleFrame();
+            // A detector can fail at runtime and fall back to software, so
+            // have jsQR on its way unless the platform one is in hand.
+            detectorReady.then(() => { if (!detector) loadJsQR(); });
         } catch (error) {
+            if (generation !== cameraGeneration) return;
             stopScanner();
             result(`Camera error: ${error.message || error}`, 'danger');
         }
     }
 
-    function stopScanner() {
+    function stopCamera() {
+        cameraGeneration += 1;
         active = false;
         decodePending = false;
-        // The watch exists to have a fix ready for a scan. With the camera
-        // closed there is nothing to scan, and a live GPS watch is one of the
-        // most expensive things a page can leave running on a phone.
-        stopWatchingLocation();
         clearInterval(focusIntervalId);
-        clearTimeout(resumeTimeoutId);
+        clearInterval(warmIntervalId);
         if (animationFrameId !== null) cancelAnimationFrame(animationFrameId);
         if (frameCallbackId !== null && video.cancelVideoFrameCallback) {
             video.cancelVideoFrameCallback(frameCallbackId);
         }
-        focusIntervalId = resumeTimeoutId = animationFrameId = frameCallbackId = null;
+        focusIntervalId = warmIntervalId = animationFrameId = frameCallbackId = null;
         if (stream) stream.getTracks().forEach(mediaTrack => mediaTrack.stop());
         stream = track = null;
         video.srcObject = null;
@@ -427,6 +667,29 @@
         loader.style.display = 'none';
         container.style.display = 'none';
         document.body.style.overflow = '';
+    }
+
+    function stopScanner() {
+        stopCamera();
+        // The watch exists to have a fix ready for a scan. With the camera
+        // closed and no scan still being sent there is nothing to fix, and a
+        // live GPS watch is one of the most expensive things a page can
+        // leave running on a phone.
+        if (!pending) stopWatchingLocation();
+    }
+
+    /** The close button: the camera goes, a scan already read does not. */
+    function closeScanner() {
+        stopScanner();
+        if (pending && pending.needsFreshCode) {
+            // The code in hand is spent and the camera that would have read
+            // the next one is gone: there is nothing left to send.
+            abandon('Scan not sent: that code had expired. Open the scanner and scan again.',
+                    'warning');
+        } else if (pending) {
+            result('Your scan is still being sent. Keep this page open until it is confirmed.',
+                   'warning');
+        }
     }
 
     /**
@@ -660,7 +923,10 @@
      * there is something patterned in the middle worth zooming into.
      */
     async function escalate(frame) {
-        if (adapting) return;
+        // Not while a scan is already in hand: the camera is only reading
+        // for a newer code by then, and a torch or zoom change on a phone
+        // that has been lowered helps nobody.
+        if (adapting || pending) return;
         adapting = true;
         try {
             if (!enhancing) {
@@ -826,6 +1092,7 @@
         return null;
     }
 
+
     async function detectWith(source) {
         try {
             const codes = await detector.detect(source);
@@ -851,7 +1118,9 @@
 
     async function analyseFrame(now) {
         if (!active) return;
-        if (decodePending || video.readyState < 2 || now - lastAnalysisAt < analysisIntervalMs) {
+        const interval = pending
+            ? Math.max(analysisIntervalMs, REFRESH_INTERVAL_MS) : analysisIntervalMs;
+        if (decodePending || video.readyState < 2 || now - lastAnalysisAt < interval) {
             scheduleFrame();
             return;
         }
@@ -864,35 +1133,202 @@
         } finally {
             decodePending = false;
         }
-        if (value && active) {
-            await qrDetected(value);
-            return;                 // found: qrDetected owns what happens next
-        }
+        if (value && active) qrDetected(value);
         scheduleFrame();
     }
 
-    async function qrDetected(qrData) {
-        active = false;
-        qrCapturedAt = performance.now();
-        qrCapturedAtEpoch = Date.now();
+    // ---- From a read code to a recorded one -------------------------------
+
+    // Refusals of the CODE, which a newer code can cure.
+    const CODE_REFUSALS = new Set(['invalid_qr', 'capture_out_of_window']);
+    // Refusals of the FIX, which a newer fix can cure.
+    const LOCATION_REFUSALS = new Set(['outside_geofence', 'imprecise_location',
+                                       'stale_location']);
+
+    function parseToken(text) {
+        const match = TOKEN_PATTERN.exec(String(text || ''));
+        return match ? { sessionId: match[1], issuedAt: Number(match[2]) } : null;
+    }
+
+    function pendingKey() {
+        return pending
+            ? `${config.userMarker || 'anonymous'}:${pending.token.sessionId}` : null;
+    }
+
+    /** ms until the server stops accepting this code, or null if unknown. */
+    function codeLifeLeftMs(token) {
+        if (serverOffsetMs === null) return null;
+        return (token.issuedAt + QR_WINDOW_SECONDS) * 1000 - serverNow();
+    }
+
+    let lastForeignCodeAt = 0;
+
+    function qrDetected(qrData) {
+        const token = parseToken(qrData);
+        if (!token) {
+            // Somebody else's QR on the slide. Say so and keep looking,
+            // rather than spending one of the student's requests on it.
+            if (Date.now() - lastForeignCodeAt > 3000) {
+                lastForeignCodeAt = Date.now();
+                status("That isn't a ScanMark code. Point at the attendance code.", 'error');
+            }
+            return;
+        }
+        if (pending) {
+            // The projector moved on to a newer code for the same class:
+            // that is now the one in hand, so whatever is sent next is as
+            // fresh as the screen. This is what lets a scan outlast a dead
+            // network without ever stretching the server's replay window.
+            if (token.sessionId === pending.token.sessionId
+                    && token.issuedAt > pending.token.issuedAt) {
+                pending.qrData = qrData;
+                pending.token = token;
+                pending.capturedAt = Date.now();
+                pending.capturedPerf = performance.now();
+                if (pending.needsFreshCode) {
+                    pending.needsFreshCode = false;
+                    attempt();
+                }
+            }
+            return;
+        }
+        pending = {
+            qrData, token,
+            // When the camera READ the code — not when the request goes, which
+            // on a slow GPS fix or a dead network can be much later.
+            capturedAt: Date.now(),
+            capturedPerf: performance.now(),
+            since: performance.now(),
+            needsFreshCode: false,
+        };
+        window.__scanmarkPendingKey = pendingKey();
+        transientAttempts = 0;
+        csrfRefreshes = 0;
+        refusedFixAt = 0;
         scanFrame.classList.add('success');
         status('QR code found', 'success');
         if (navigator.vibrate) navigator.vibrate(120);
-        await submitAttendance(qrData);
+        attempt();
     }
 
-    function resumeScanning(delayMs) {
-        clearTimeout(resumeTimeoutId);
-        resumeTimeoutId = setTimeout(() => {
-            if (!stream) return;
-            scanFrame.classList.remove('success');
-            status('Scanning...', 'scanning');
-            active = true;
-            // The code was found once, so whatever the camera had adapted to
-            // was working. Keep it rather than starting the hunt over.
-            missStreak = 0;
-            scheduleFrame();
-        }, delayMs);
+    function settle() {
+        clearTimeout(retryTimeoutId);
+        retryTimeoutId = null;
+        pending = null;
+        window.__scanmarkPendingKey = null;
+        transientAttempts = 0;
+        codeRejections = 0;
+        locationRetries = 0;
+        refusedFixAt = 0;
+        if (!stream) stopWatchingLocation();
+    }
+
+    function abandon(message, kind) {
+        settle();
+        result(message, kind);
+        stopScanner();
+    }
+
+    function succeed(payload) {
+        settle();
+        result(payload.message || 'Attendance marked successfully!', 'success');
+        bumpAttendance(payload.course_code);
+        stopScanner();
+    }
+
+    /** The code in hand is spent; the next one the projector shows is not. */
+    function awaitFreshCode(message) {
+        if (!stream) {
+            abandon(`${message} Open the scanner and point it at the code again.`, 'warning');
+            return;
+        }
+        pending.needsFreshCode = true;
+        scanFrame.classList.remove('success');
+        status(message, 'error');
+    }
+
+    async function attempt() {
+        if (!pending || inFlight) return;
+        clearTimeout(retryTimeoutId);
+        retryTimeoutId = null;
+        const left = codeLifeLeftMs(pending.token);
+        if (left !== null && left < 0) {
+            // Known dead on the server's own clock: posting it only buys a
+            // refusal. The camera is still reading; the next code will do.
+            awaitFreshCode('That code has expired. Hold the camera on the screen...');
+            return;
+        }
+        inFlight = true;
+        let position;
+        const gpsStarted = performance.now();
+        try {
+            status('Confirming location...', 'scanning');
+            position = await acquirePosition(refusedFixAt);
+        } catch (error) {
+            inFlight = false;
+            if (error && error.locationProblem && pending) {
+                abandon(`${error.message} Tap the scan button to try again.`,
+                        'danger');
+                return;
+            }
+            throw error;
+        }
+        const gpsWaitMs = performance.now() - gpsStarted;
+        if (!pending) {             // settled meanwhile (the service worker's copy landed)
+            inFlight = false;
+            return;
+        }
+        const scan = pending;
+        scan.attempts = (scan.attempts || 0) + 1;
+        status('Marking attendance...', 'scanning');
+        let response;
+        try {
+            response = await postScan(scan, position, gpsWaitMs);
+        } catch (_) {
+            inFlight = false;
+            transient(null, 'network');
+            return;
+        }
+        inFlight = false;
+        noteServerDate(response);
+        if (pending !== scan) return;
+        await handleResponse(response, position);
+    }
+
+    async function postScan(scan, position, gpsWaitMs) {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+        try {
+            return await fetch(config.endpoint || '/mark_attendance', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRFToken': config.csrfToken || ''
+                },
+                body: JSON.stringify({
+                    qr_data: scan.qrData,
+                    lat: position.coords.latitude,
+                    lon: position.coords.longitude,
+                    accuracy_m: position.coords.accuracy,
+                    location_age_ms: Math.max(0, Date.now() - position.timestamp),
+                    // On the SERVER's clock, which is what the token's own
+                    // timestamp is on. Corrected only when a response has
+                    // told us the offset; otherwise the phone's own clock.
+                    captured_at: new Date(scan.capturedAt + (serverOffsetMs || 0)).toISOString(),
+                    user_marker: config.userMarker,
+                    device_id: DEVICE_ID,
+                    client_metrics: {
+                        camera_ready_ms: cameraReadyMs,
+                        qr_decode_ms: lastDecodeMs,
+                        gps_wait_ms: gpsWaitMs,
+                        capture_to_request_ms: performance.now() - scan.capturedPerf
+                    }
+                }),
+                signal: controller.signal
+            });
+        } finally {
+            clearTimeout(timeout);
+        }
     }
 
     /**
@@ -925,163 +1361,210 @@
         return Math.max(250, Math.floor(clamped * (0.75 + Math.random() * 0.5)));
     }
 
+    /**
+     * Not an answer yet: no signal, a stalled request, or a busy server.
+     *
+     * Retried automatically with jittered, capped backoff — or at the pace
+     * the server asked for — for as long as it takes, up to a generous
+     * ceiling. Requests are idempotent on the server (one row per student per
+     * class, enforced by a unique index; a repeat is answered "already
+     * marked"), so a retry of a request that DID land is harmless.
+     */
+    function transient(delayHint, reason) {
+        if (!pending) return;
+        transientAttempts += 1;
+        if (performance.now() - pending.since > PENDING_GIVE_UP_MS) {
+            abandon('ScanMark could not be reached for several minutes, so this scan ' +
+                    'was not recorded. Check your connection, then scan the code again.',
+                    'danger');
+            return;
+        }
+        const delay = delayHint !== null && delayHint !== undefined
+            ? delayHint
+            : Math.floor(Math.min(8000, 1000 * (2 ** Math.min(transientAttempts - 1, 3)))
+                         * (0.75 + Math.random() * 0.5));
+        const seconds = Math.max(1, Math.ceil(delay / 1000));
+        const keepPointing = stream ? ' Keep the code in view.' : '';
+        status(reason === 'server'
+            ? `ScanMark is busy; retrying in ${seconds}s.${keepPointing}`
+            : `Waiting for signal; retrying in ${seconds}s.${keepPointing}`, 'error');
+        retryTimeoutId = setTimeout(attempt, delay);
+    }
 
-    async function submitAttendance(qrData) {
-        const gpsStarted = performance.now();
-        try {
-            status('Confirming location...', 'scanning');
-            const position = await acquirePosition();
-            const gpsWaitMs = performance.now() - gpsStarted;
-            const requestStarted = performance.now();
-            status('Marking attendance...', 'scanning');
-            const controller = new AbortController();
-            const timeout = setTimeout(() => controller.abort(), 20000);
-            let response;
-            try {
-                response = await fetch(config.endpoint || '/mark_attendance', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'X-CSRFToken': config.csrfToken || ''
-                    },
-                    body: JSON.stringify({
-                        qr_data: qrData,
-                        lat: position.coords.latitude,
-                        lon: position.coords.longitude,
-                        accuracy_m: position.coords.accuracy,
-                        location_age_ms: Math.max(0, Date.now() - position.timestamp),
-                        captured_at: new Date(qrCapturedAtEpoch || Date.now()).toISOString(),
-                        user_marker: config.userMarker,
-                        device_id: DEVICE_ID,
-                        client_metrics: {
-                            camera_ready_ms: cameraReadyMs,
-                            qr_decode_ms: lastDecodeMs,
-                            gps_wait_ms: gpsWaitMs,
-                            capture_to_request_ms: requestStarted - qrCapturedAt
-                        }
-                    }),
-                    signal: controller.signal
-                });
-            } finally {
-                clearTimeout(timeout);
-            }
+    function handleLocationRefusal(payload, message, position) {
+        const distance = Number(payload.distance_m);
+        const radius = Number(payload.radius_m);
+        // Kilometres off is not drift; it is somewhere else. Say so now
+        // rather than after three more round trips.
+        const elsewhere = payload.outcome === 'outside_geofence'
+            && Number.isFinite(distance) && Number.isFinite(radius)
+            && distance - radius > Math.max(150, 3 * (position.coords.accuracy || 0));
+        if (!LOCATION_REFUSALS.has(payload.outcome) || elsewhere
+                || locationRetries >= LOCATION_RETRY_LIMIT) {
+            abandon(`${message} Tap the scan button to try again.`, 'danger');
+            return;
+        }
+        // Indoor fixes wander. The next reading is often much closer to the
+        // truth, so wait for a NEWER one and go again on our own.
+        locationRetries += 1;
+        refusedFixAt = position.timestamp;
+        status('Your location reading was off; taking a fresh one...', 'scanning');
+        retryTimeoutId = setTimeout(attempt, 250);
+    }
 
-            const contentType = response.headers.get('content-type') || '';
-            if (!contentType.includes('application/json')) {
-                // A non-JSON body from a 4xx is almost always the CSRF guard
-                // rejecting a page whose token no longer matches the session:
-                // the page has been open longer than the token lives, or the
-                // session store failed over and the server is now issuing
-                // cookie sessions. Retrying cannot fix either; reloading can,
-                // because the reloaded page carries a token minted against
-                // whatever session the server is using NOW.
-                //
-                // So do it, rather than asking 2,000 students in a lecture
-                // theatre to each read an instruction and tap Reload. Once
-                // only: a sessionStorage marker means a fault that survives
-                // the reload shows the message instead of looping, and the
-                // marker is cleared as soon as a scan gets a real answer.
-                if (response.status < 500 && response.status !== 429) {
-                    retryAttempt = 0;
-                    rejectionStreak = 0;
-                    stopScanner();
-                    if (!sessionStorage.getItem(RELOADED_FOR_SESSION_KEY)) {
-                        sessionStorage.setItem(RELOADED_FOR_SESSION_KEY, '1');
-                        result('Reconnecting…', 'warning');
-                        setTimeout(() => location.reload(), 400);
-                        return;
-                    }
-                    result('Your session expired. Reload this page, then scan again.', 'danger');
+    function handleCodeRefusal(message) {
+        codeRejections += 1;
+        if (codeRejections >= AUTO_RESUBMIT_LIMIT) {
+            abandon(`${message} Tap the scan button to try again.`, 'danger');
+            return;
+        }
+        awaitFreshCode(`${message} Hold the camera on the screen...`);
+    }
+
+    async function handleResponse(response, position) {
+        const contentType = response.headers.get('content-type') || '';
+        if (!contentType.includes('application/json')) {
+            // A non-JSON body from a 4xx is the CSRF guard rejecting a page
+            // whose token no longer matches the session, from a server too
+            // old to say so in JSON (current ones send `csrf_expired` with a
+            // fresh token, handled below without a reload). Retrying cannot
+            // fix it; reloading can, because the reloaded page carries a
+            // token minted against whatever session the server is using NOW.
+            //
+            // Once only: a sessionStorage marker means a fault that survives
+            // the reload shows the message instead of looping, and the
+            // marker is cleared as soon as a scan gets a real answer.
+            if (response.status < 500 && response.status !== 429) {
+                settle();
+                stopScanner();
+                if (!sessionStorage.getItem(RELOADED_FOR_SESSION_KEY)) {
+                    sessionStorage.setItem(RELOADED_FOR_SESSION_KEY, '1');
+                    result('Reconnecting…', 'warning');
+                    setTimeout(() => location.reload(), 400);
                     return;
                 }
-                throw new Error(`HTTP ${response.status}`);
-            }
-            // A real answer means whatever the reload was for is resolved.
-            sessionStorage.removeItem(RELOADED_FOR_SESSION_KEY);
-
-            const payload = await response.json();
-
-            if (response.ok && payload.status === 'success') {
-                retryAttempt = 0;
-                rejectionStreak = 0;
-                result(payload.message, 'success');
-                stopScanner();
+                result('Your session expired. Reload this page, then scan again.', 'danger');
                 return;
             }
-            if (payload.status === 'queued') {
-                result(payload.message, 'warning');
-                stopScanner();
-                return;
-            }
-            // Server fault or deliberate shedding: back off and try the same
-            // code again, at the pace the server asked for where it gave one.
-            if (response.status === 429 || response.status >= 500) {
-                const error = new Error(payload.message || `HTTP ${response.status}`);
-                error.retryAfterMs = serverRetryDelay(response);
-                throw error;
-            }
-
-            retryAttempt = 0;
-            const message = payload.message || 'Attendance could not be marked.';
-
-            // Already on the register: good news, not an error. Most often
-            // it is this phone's own retry — the first attempt was saved but
-            // its answer never came back (slow mobile data, a busy server),
-            // so the scanner asked again. It used to be shown in red, which
-            // told a student who WAS marked that scanning had failed.
-            if (response.status === 409 && payload.outcome === 'duplicate') {
-                rejectionStreak = 0;
-                result(message, 'success');
-                stopScanner();
-                return;
-            }
-
-            // Terminal: nothing about pointing the camera again can change
-            // the answer. 403 not enrolled, 404 no such session, 409 a queued
-            // scan from another account.
-            if (response.status === 403 || response.status === 404 || response.status === 409) {
-                rejectionStreak = 0;
-                result(message, 'danger');
-                stopScanner();
-                return;
-            }
-
-            // Recoverable: an expired code (400) or a location problem (422).
-            // Give it a bounded number of automatic goes, then hand control
-            // back to the student instead of looping forever.
-            rejectionStreak += 1;
-            if (rejectionStreak >= AUTO_RESUBMIT_LIMIT) {
-                rejectionStreak = 0;
-                result(`${message} Tap "Start Advanced Scanner" to try again.`, 'danger');
-                stopScanner();
-                return;
-            }
-            result(message, 'danger');
-            resumeScanning(1200);
-        } catch (error) {
-            if (error && error.locationProblem) {
-                retryAttempt = 0;
-                rejectionStreak = 0;
-                result(`${error.message} Tap "Start Advanced Scanner" to try again.`,
-                       'danger');
-                stopScanner();
-                return;
-            }
-            if (retryAttempt < TRANSIENT_RETRY_LIMIT) {
-                retryAttempt += 1;
-                const delay = error && error.retryAfterMs !== null
-                    && error.retryAfterMs !== undefined
-                    ? error.retryAfterMs
-                    : Math.floor(Math.min(15000, 1500 * (2 ** (retryAttempt - 1)))
-                                 * (0.75 + Math.random() * 0.5));
-                status(`Network busy; retrying in ${Math.ceil(delay / 1000)}s`, 'error');
-                resumeTimeoutId = setTimeout(() => submitAttendance(qrData), delay);
-            } else {
-                retryAttempt = 0;
-                result('Could not reach the server. Check your connection and scan again.', 'danger');
-                resumeScanning(1200);
-            }
+            transient(serverRetryDelay(response), 'server');
+            return;
         }
+        let payload;
+        try {
+            payload = await response.json();
+        } catch (_) {
+            transient(null, 'network');
+            return;
+        }
+        // A real answer means whatever the reload was for is resolved.
+        try { sessionStorage.removeItem(RELOADED_FOR_SESSION_KEY); } catch (_) { /* private mode */ }
+
+        if (response.ok && payload.status === 'success') {
+            succeed(payload);
+            return;
+        }
+        if (payload.status === 'queued') {
+            // No signal at all. The service worker kept a copy that it will
+            // send on its own if this page goes away; meanwhile this page
+            // keeps trying, with whichever code is newest.
+            transient(null, 'offline');
+            return;
+        }
+        if (payload.outcome === 'csrf_expired' && payload.csrf_token && csrfRefreshes < 2) {
+            // The page outlived its form token. The server sent a new one;
+            // use it and go straight back, with no reload and nothing lost.
+            csrfRefreshes += 1;
+            config.csrfToken = payload.csrf_token;
+            attempt();
+            return;
+        }
+        // Server fault or deliberate shedding: back off and try again, at the
+        // pace the server asked for where it gave one.
+        if (response.status === 429 || response.status >= 500) {
+            transient(serverRetryDelay(response), 'server');
+            return;
+        }
+
+        transientAttempts = 0;
+        const message = payload.message || 'Attendance could not be marked.';
+
+        if (response.status === 422) {
+            handleLocationRefusal(payload, message, position);
+            return;
+        }
+        if (response.status === 400 && CODE_REFUSALS.has(payload.outcome)) {
+            handleCodeRefusal(message);
+            return;
+        }
+
+        // Already on the register: good news, not an error. Most often
+        // it is this phone's own retry — the first attempt was saved but
+        // its answer never came back (slow mobile data, a busy server),
+        // so the scanner asked again. It used to be shown in red, which
+        // told a student who WAS marked that scanning had failed.
+        if (response.status === 409 && payload.outcome === 'duplicate') {
+            if (pending.attempts > 1) {
+                // An earlier try of THIS scan landed and only its answer was
+                // lost: to the student that is simply "marked", and the
+                // count on the page has not been bumped for it yet.
+                const course = payload.course_code ? ` for ${payload.course_code}` : '';
+                succeed({ message: `Marked present${course}.`, course_code: payload.course_code });
+                return;
+            }
+            settle();
+            result(message, 'success');
+            stopScanner();
+            return;
+        }
+
+        // Terminal: nothing about pointing the camera again can change
+        // the answer. 403 not enrolled, 404 no such session, 409 the class
+        // has ended or a queued scan from another account.
+        if (response.status === 403 || response.status === 404 || response.status === 409) {
+            abandon(message, 'danger');
+            return;
+        }
+        abandon(`${message} Tap the scan button to try again.`, 'danger');
+    }
+
+    /**
+     * Show the new count straight away instead of reloading the page for it.
+     * Rows carry their numbers as data attributes; anything else is left as
+     * the server rendered it.
+     */
+    function bumpAttendance(courseCode) {
+        if (!courseCode) return;
+        document.querySelectorAll('[data-attended-for]').forEach(cell => {
+            if (cell.getAttribute('data-attended-for') !== courseCode) return;
+            const attended = Number(cell.getAttribute('data-attended')) + 1;
+            const total = Number(cell.getAttribute('data-total')) || 0;
+            cell.setAttribute('data-attended', String(attended));
+            cell.textContent = total ? `${attended} / ${total}` : String(attended);
+            const row = cell.closest('tr');
+            const badge = row && row.querySelector('[data-pct-badge]');
+            if (badge && total) {
+                const pct = Math.min(100, Math.round(attended / total * 100));
+                const onTrack = pct >= (Number(badge.getAttribute('data-threshold')) || 0);
+                badge.textContent = `${pct}% · ${onTrack ? 'On Track' : 'At Risk'}`;
+                const pill = badge.parentElement;
+                if (pill) {
+                    pill.classList.toggle('bg-danger', !onTrack);
+                    pill.style.background = onTrack ? 'rgba(0,90,43,0.12)' : '';
+                    pill.style.color = onTrack ? 'var(--green)' : '';
+                }
+            }
+        });
+        const totalAttended = document.querySelector('[data-total-attended]');
+        if (totalAttended) {
+            totalAttended.textContent = String(Number(totalAttended.textContent) + 1);
+        }
+    }
+
+    function nudgeFocus() {
+        // Only while the hunt is struggling. Re-applying continuous focus
+        // restarts the focus sweep on some cameras, so doing it every four
+        // seconds regardless blurred a code that was already sharp.
+        if (missStreak >= ESCALATE_AFTER_MISSES && !pending) triggerFocus();
     }
 
     async function triggerFocus() {
@@ -1115,6 +1598,36 @@
 
     focusButton.addEventListener('click', triggerFocus);
     window.addEventListener('pagehide', stopScanner);
+    // The radio came back: do not sit out the rest of a backoff.
+    window.addEventListener('online', () => {
+        if (pending && !inFlight) attempt();
+    });
+
+    if (navigator.serviceWorker) {
+        // The service worker sent its stored copy of this scan and got an
+        // answer first. Anything other than "recorded" is left to this page,
+        // whose own attempts carry a newer code than that copy did.
+        navigator.serviceWorker.addEventListener('message', event => {
+            const data = event.data || {};
+            if (data.type !== 'scan-sync' || !pending || data.key !== pendingKey()) return;
+            if (data.outcome === 'success' || data.outcome === 'duplicate') {
+                succeed({ message: data.message, course_code: data.course_code });
+            }
+        });
+    }
+
+    // Opening the scanner is a click handler, not a page load: the dashboard
+    // used to navigate to a separate scan page and make the student tap a
+    // second button there. A link keeps working if this script has not
+    // arrived yet.
+    document.querySelectorAll('[data-open-scanner]').forEach(trigger => {
+        trigger.addEventListener('click', event => {
+            event.preventDefault();
+            startScanner();
+        });
+    });
+
     window.startScanner = startScanner;
-    window.stopScanner = stopScanner;
+    window.stopScanner = closeScanner;
+    if (config.autoStart) startScanner();
 }());
