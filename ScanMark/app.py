@@ -2629,7 +2629,7 @@ def account_pending():
 # ============================================================
 
 def record_audit(action, target_type=None, target_id=None, target_label=None,
-                 course_id=None, **details):
+                 course_id=None, actor=None, **details):
     """
     Write one append-only line about a destructive or privileged action.
 
@@ -2638,14 +2638,18 @@ def record_audit(action, target_type=None, target_id=None, target_label=None,
     it, survives — the table carries no foreign keys precisely so that it
     outlives the rows it describes.
 
+    `actor` defaults to the signed-in user; pass it when the change happens
+    before anyone is signed in (the CampOS sign-in callback).
+
     Never raises: an audit write that fails must not take the operation with
     it, but it must be loud in the log.
     """
+    who = actor if actor is not None else current_user
     try:
         entry = AuditLog(
-            actor_id=getattr(current_user, 'id', None),
-            actor_email=getattr(current_user, 'email', None),
-            actor_role=getattr(current_user, 'role', None),
+            actor_id=getattr(who, 'id', None),
+            actor_email=getattr(who, 'email', None),
+            actor_role=getattr(who, 'role', None),
             action=action,
             target_type=target_type,
             target_id=target_id,
@@ -2673,6 +2677,35 @@ def record_audit(action, target_type=None, target_id=None, target_label=None,
     except Exception:
         app.logger.exception('Failed to write audit entry for %s', action)
         return None
+
+
+def record_matric_change(student, old, new, source, courses=None):
+    """
+    Audit a change to the matric number a student's register rows print.
+
+    Registers and CSVs read the number live from the user row, so a change
+    rewrites what every past register shows. One entry goes into the trail of
+    each course the student is enrolled in, because the per-course trail is
+    the only one lecturers can read; a student on no course still gets a
+    single course-less entry.
+
+    Skips a first-time number on a student nobody has on a register yet: that
+    is onboarding, and nobody has seen a number to have it changed under them.
+
+    Pass `courses` when the caller has already loaded them. Loading them here
+    autoflushes, which is the wrong moment to hit the matric unique constraint.
+    """
+    if old == new:
+        return
+    courses = list(student.enrolled_courses) if courses is None else courses
+    if not old and not courses:
+        return
+    for course in courses or [None]:
+        record_audit('student.matric_change', 'user', student.id,
+                     student.full_name,
+                     course_id=course.id if course else None,
+                     actor=student,
+                     old_matric=old, new_matric=new, source=source)
 
 
 # ============================================================
@@ -3403,6 +3436,9 @@ def campos_sso_callback():
                                              institution=institution_of(user)).first()
                         if matric_no else None)
         if matric_no and (not matric_owner or matric_owner.id == user.id) and user.matric_no != matric_no:
+            # Nobody is signed in yet, so the student is named as the actor
+            # and `source` says the number came from CampOS.
+            record_matric_change(user, user.matric_no, matric_no, 'campos_sso')
             user.matric_no = matric_no
             changed = True
         if level and user.level != level:
@@ -3470,22 +3506,43 @@ def complete_profile():
         flash("Only student accounts have a matric number and level.", "warning")
         return redirect_by_role(current_user.role)
 
+    # The same page edits a finished profile: the dashboard links here so a
+    # student can correct a mistyped matric number themselves, which is what
+    # the "already registered" refusals tell them to do.
+    editing = bool(current_user.matric_no and current_user.level)
+    form = {'matric_no': current_user.matric_no or '',
+            'level': current_user.level or ''}
+
+    def render(status=200):
+        return render_template('complete_profile.html', levels=LEVEL_CHOICES,
+                               editing=editing, form=form), status
+
     if request.method == 'POST':
-        matric_no = normalize_matric(request.form.get('matric_no', ''))
-        level = request.form.get('level', '').strip()
+        form = {'matric_no': (request.form.get('matric_no') or '').strip()[:25],
+                'level': (request.form.get('level') or '').strip()}
+        matric_no = normalize_matric(form['matric_no'])
+        level = form['level']
 
         if not matric_no:
             flash("Enter a valid matric number (4-20 letters and digits).", "danger")
-            return render_template('complete_profile.html',
-                                   levels=LEVEL_CHOICES), 400
+            return render(400)
         if level not in LEVEL_CHOICES:
             flash("Choose your level from the list.", "danger")
-            return render_template('complete_profile.html',
-                                   levels=LEVEL_CHOICES), 400
+            return render(400)
 
+        old_matric = current_user.matric_no
+        # Loaded before the assignment below, so the lazy load's autoflush
+        # cannot raise the unique-constraint error outside the handler.
+        courses = (list(current_user.enrolled_courses)
+                   if old_matric != matric_no else [])
         current_user.matric_no = matric_no
         current_user.level = level
         try:
+            # Flushed first so a taken number fails here, before any audit
+            # entry claims a change that is about to be rolled back.
+            db.session.flush()
+            record_matric_change(current_user, old_matric, matric_no,
+                                 'profile_form', courses=courses)
             db.session.commit()
         except IntegrityError:
             # matric_no is unique: another account already holds this one.
@@ -3497,13 +3554,13 @@ def complete_profile():
             flash("That matric number is already registered at your "
                   "institution. Check it, or contact your department.",
                   "danger")
-            return render_template('complete_profile.html',
-                                   levels=LEVEL_CHOICES), 409
+            return render(409)
 
-        flash("Profile updated! Welcome to ScanMark.", "success")
+        flash("Profile updated." if editing
+              else "Profile updated! Welcome to ScanMark.", "success")
         return redirect_by_role(current_user.role)
 
-    return render_template('complete_profile.html', levels=LEVEL_CHOICES)
+    return render()
 
 @app.route('/login', methods=['GET', 'POST'])
 # Count only actual login ATTEMPTS (POSTs) — the old limit also counted GETs,
@@ -4635,8 +4692,10 @@ def register_course():
                     'Refused to bind user id=%s to %s: matric already held there',
                     current_user.id, course.institution)
                 flash("Your matric number is already registered at the "
-                      "institution that runs this course. Check it, or "
-                      "contact your department.", "danger")
+                      "institution that runs this course. If you typed it "
+                      "wrong, correct it with Edit profile at the top of "
+                      "this page; otherwise contact your department.",
+                      "danger")
                 return redirect(url_for('student_dashboard'))
 
         current_user.enrolled_courses.append(course)

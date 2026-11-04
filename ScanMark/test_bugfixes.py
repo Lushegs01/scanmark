@@ -952,6 +952,58 @@ class TestCompleteProfile:
         assert response.status_code == 409
         assert b'already registered' in response.data
 
+    def test_the_dashboard_links_to_the_profile_form(self, appmod, seed, login):
+        """Once filled in, the form was reachable only by typing its URL, so
+        the refusals telling a student to check their number were a dead end."""
+        kemi = login(seed['student_email'])
+        page = kemi.get('/student_dashboard').get_data(as_text=True)
+        assert 'href="/complete_profile"' in page
+        assert 'Edit profile' in page
+        assert '20200001' in page
+
+    def test_a_finished_profile_opens_prefilled_for_editing(self, appmod, seed, login):
+        kemi = login(seed['student_email'])
+        page = kemi.get('/complete_profile').get_data(as_text=True)
+        assert 'Edit Profile' in page
+        assert 'value="20200001"' in page
+        assert '<option value="300" selected>' in page
+
+    def test_a_student_can_correct_their_matric_number(self, appmod, seed, login):
+        from models import db, User
+
+        kemi = login(seed['student_email'])
+        response = kemi.post('/complete_profile',
+                             data={'matric_no': '2020/0011', 'level': '400'},
+                             follow_redirects=True)
+        assert response.status_code == 200
+        assert 'Profile updated.' in response.get_data(as_text=True)
+        with appmod.app.app_context():
+            kemi_row = db.session.get(User, seed['student_id'])
+            assert kemi_row.matric_no == '20200011'
+            assert kemi_row.level == '400'
+
+    def test_a_refused_edit_keeps_what_was_typed(self, appmod, seed, login):
+        from models import db, User
+
+        kemi = login(seed['student_email'])
+        response = kemi.post('/complete_profile',
+                             data={'matric_no': '20200002',   # Tayo's
+                                   'level': '300'})
+        assert response.status_code == 409
+        assert 'value="20200002"' in response.get_data(as_text=True)
+        with appmod.app.app_context():
+            assert db.session.get(User, seed['student_id']).matric_no == '20200001'
+
+    def test_a_level_only_edit_writes_no_matric_audit(self, appmod, seed, login):
+        from models import AuditLog
+
+        kemi = login(seed['student_email'])
+        kemi.post('/complete_profile',
+                  data={'matric_no': '20200001', 'level': '400'})
+        with appmod.app.app_context():
+            assert AuditLog.query.filter_by(
+                action='student.matric_change').count() == 0
+
     def test_staff_cannot_claim_a_matric_number(self, appmod, seed, login):
         from models import db, User
 
@@ -961,6 +1013,127 @@ class TestCompleteProfile:
         assert response.status_code == 302
         with appmod.app.app_context():
             assert db.session.get(User, seed['lecturer_id']).matric_no is None
+
+
+class TestMatricChangesAreAudited:
+    """
+    Registers and CSVs print the number live from the user row, so changing it
+    rewrites every past register. Lecturers read only per-course trails, so
+    the change has to land in the trail of each course the student is on.
+    """
+
+    @staticmethod
+    def _entries(appmod):
+        import json
+        from models import AuditLog
+        with appmod.app.app_context():
+            return [(row.course_id, row.target_id, row.actor_email,
+                     json.loads(row.details))
+                    for row in AuditLog.query.filter_by(
+                        action='student.matric_change').order_by(AuditLog.id)]
+
+    def _second_course(self, appmod, seed):
+        from models import db, Course, User
+        with appmod.app.app_context():
+            course = Course(code='CSC305', title='Databases',
+                            coordinator_id=seed['coordinator_id'],
+                            department='Computer Science',
+                            faculty='Physical Sciences',
+                            institution='funaab.edu.ng')
+            db.session.add(course)
+            kemi = db.session.get(User, seed['student_id'])
+            kemi.enrolled_courses.append(course)
+            db.session.commit()
+            return course.id
+
+    def test_an_edit_is_logged_in_every_enrolled_course(self, appmod, seed, login):
+        second = self._second_course(appmod, seed)
+
+        kemi = login(seed['student_email'])
+        kemi.post('/complete_profile',
+                  data={'matric_no': '2020/0011', 'level': '300'})
+
+        entries = self._entries(appmod)
+        assert sorted(course for course, *_ in entries) == sorted(
+            [seed['course_id'], second])
+        for _, target, actor, details in entries:
+            assert target == seed['student_id']
+            assert actor == seed['student_email']
+            assert details == {'old_matric': '20200001',
+                               'new_matric': '20200011',
+                               'source': 'profile_form'}
+
+    def test_the_coordinator_sees_it_in_the_course_trail(self, appmod, seed, login):
+        kemi = login(seed['student_email'])
+        kemi.post('/complete_profile',
+                  data={'matric_no': '20200011', 'level': '300'})
+
+        ada = login(seed['coordinator_email'])
+        page = ada.get(f"/course/{seed['course_id']}/audit").get_data(as_text=True)
+        assert 'student.matric_change' in page
+        assert '20200001' in page and '20200011' in page
+
+    def test_a_refused_change_leaves_no_entry(self, appmod, seed, login):
+        kemi = login(seed['student_email'])
+        response = kemi.post('/complete_profile',
+                             data={'matric_no': '20200002',   # Tayo's
+                                   'level': '300'})
+        assert response.status_code == 409
+        assert self._entries(appmod) == []
+
+    def test_onboarding_is_not_a_change(self, appmod, seed, login):
+        """Tayo is on no course: nobody has seen a number to have it changed."""
+        from models import db, User
+        with appmod.app.app_context():
+            db.session.get(User, seed['other_student_id']).matric_no = None
+            db.session.commit()
+
+        tayo = login(seed['other_student_email'])
+        tayo.post('/complete_profile',
+                  data={'matric_no': '20200002', 'level': '300'})
+        assert self._entries(appmod) == []
+
+    def test_a_cleared_number_refilled_on_a_course_is_logged(
+            self, appmod, seed, login):
+        """The fix for a stolen number is clearing it; the refill shows."""
+        from models import db, User
+        with appmod.app.app_context():
+            db.session.get(User, seed['student_id']).matric_no = None
+            db.session.commit()
+
+        kemi = login(seed['student_email'])
+        kemi.post('/complete_profile',
+                  data={'matric_no': '20200001', 'level': '300'})
+        [(course, _, _, details)] = self._entries(appmod)
+        assert course == seed['course_id']
+        assert details['old_matric'] is None
+        assert details['new_matric'] == '20200001'
+
+    def test_a_campos_sign_in_that_changes_the_number_is_logged(
+            self, appmod, seed, monkeypatch):
+        from campos_integration import CamposLaunchIdentity
+        from models import db, User
+
+        claims = {'sub': 'campos-kemi', 'institutionId': 'funaab',
+                  'email': seed['student_email'], 'firstName': 'Kemi',
+                  'lastName': 'Student', 'matricNumber': '20200077',
+                  'level': '300'}
+        monkeypatch.setattr(appmod, 'CAMPOS_SSO_REQUIRE_STATE', False)
+        monkeypatch.setattr(appmod, 'exchange_campos_sso_code', lambda code: 'tok')
+        monkeypatch.setattr(appmod, 'verify_campos_sso_token', lambda token: claims)
+        monkeypatch.setattr(appmod, 'map_campos_launch_identity',
+                            lambda c: CamposLaunchIdentity('student', None, None, False))
+
+        response = appmod.app.test_client().get('/sso/callback?code=' + 'a' * 43)
+        assert response.status_code == 302
+
+        with appmod.app.app_context():
+            assert db.session.get(User, seed['student_id']).matric_no == '20200077'
+        [(course, target, actor, details)] = self._entries(appmod)
+        assert (course, target, actor) == (
+            seed['course_id'], seed['student_id'], seed['student_email'])
+        assert details == {'old_matric': '20200001', 'new_matric': '20200077',
+                           'source': 'campos_sso'}
 
 
 # ============================================================
