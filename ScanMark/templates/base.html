@@ -14,16 +14,21 @@
     <meta name="apple-mobile-web-app-title" content="ScanMark" />
 
     <link rel="icon" type="image/png" href="{{ static_url('logo-192.png') }}">
-    <!-- CSRF token for background fetches (offline scan sync) -->
+    <!-- CSRF token for background fetches -->
     <meta name="csrf-token" content="{{ csrf_token() }}">
     <meta name="current-user-id" content="{{ current_user.id if current_user.is_authenticated else '' }}">
 
-    <!-- Bootstrap 5 -->
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-    <!-- Google Fonts: Poppins -->
-    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
-    <!-- Font Awesome -->
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    {# Bootstrap 5.3.0, Poppins and Font Awesome 6.4.0, served from this
+       origin. They used to come from three CDNs (four origins, counting the
+       font files), and on a phone every new origin is a DNS lookup plus a
+       TCP and a TLS handshake before its first byte — on a 2G cell that is
+       seconds of render-blocking set-up per origin, before the page shows
+       anything. Same-origin they ride the connection the page already has,
+       get brotli and immutable caching from WhiteNoise, and the service
+       worker can keep them for an offline start. #}
+    <link href="{{ static_url('vendor/bootstrap/bootstrap.min.css') }}" rel="stylesheet">
+    <link href="{{ static_url('vendor/poppins/poppins.css') }}" rel="stylesheet">
+    <link href="{{ static_url('vendor/fontawesome/css/all.min.css') }}" rel="stylesheet">
     <!-- ScanMark Styles. ?v= is the static-file hash: without it a deploy
          leaves browsers and service workers on the previous stylesheet. -->
     <link rel="stylesheet" href="{{ static_url('style.css') }}">
@@ -139,8 +144,10 @@
 
     {% block content %}{% endblock %}
 
-    <!-- Bootstrap JS -->
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <!-- Bootstrap JS. Deferred: nothing reads `bootstrap` while the page is
+         parsing, and a parser-blocking script here held DOMContentLoaded —
+         and the offline-scan sync hung off it — behind an 80 KB download. -->
+    <script src="{{ static_url('vendor/bootstrap/bootstrap.bundle.min.js') }}" defer></script>
 
     <script>
         /* ===== DARK MODE LOGIC ===== */
@@ -178,119 +185,56 @@
             });
         }
 
-        /* ===== OFFLINE SYNC ===== */
-        async function syncOfflineScans() {
-            const csrfMeta = document.querySelector('meta[name="csrf-token"]');
-            const userMeta = document.querySelector('meta[name="current-user-id"]');
-            const csrfToken = csrfMeta ? csrfMeta.content : '';
-            const currentUserId = userMeta ? userMeta.content : '';
-            if (!currentUserId) return;
-
-            const database = await new Promise((resolve, reject) => {
-                const request = indexedDB.open('ScanMarkOfflineDB', 2);
-                request.onupgradeneeded = event => {
-                    const db = event.target.result;
-                    if (db.objectStoreNames.contains('scans')) db.deleteObjectStore('scans');
-                    db.createObjectStore('scans', { keyPath: 'dedupe_key' });
-                };
-                request.onsuccess = event => resolve(event.target.result);
-                request.onerror = () => reject(request.error);
-            }).catch(() => null);
-            if (!database || !database.objectStoreNames.contains('scans')) return;
-
-            const scans = await new Promise((resolve, reject) => {
-                const request = database.transaction('scans', 'readonly')
-                    .objectStore('scans').getAll();
-                request.onsuccess = () => resolve(request.result || []);
-                request.onerror = () => reject(request.error);
-            }).catch(() => []);
-
-            const drop = key => new Promise((resolve, reject) => {
-                const transaction = database.transaction('scans', 'readwrite');
-                transaction.objectStore('scans').delete(key);
-                transaction.oncomplete = resolve;
-                transaction.onerror = () => reject(transaction.error);
-            });
-
-            let marked = 0;
-            let lost = 0;
-            let lastFailureMessage = '';
-
-            for (const scanData of scans) {
-                // A queued scan is only redeemable until the server's QR
-                // window closes. Past that it is dead — say so rather than
-                // deleting it quietly and leaving the student thinking they
-                // were marked present.
-                const deadline = Number(scanData.expires_at);
-                if (Number.isFinite(deadline) && Date.now() > deadline) {
-                    await drop(scanData.dedupe_key);
-                    lost += 1;
-                    continue;
-                }
-                if (String(scanData.user_marker || '') !== currentUserId) continue;
-
-                try {
-                    const response = await fetch('/mark_attendance', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'X-CSRFToken': csrfToken
-                        },
-                        body: JSON.stringify(scanData)
-                    });
-                    const contentType = response.headers.get('content-type') || '';
-                    const definitive = contentType.includes('application/json') &&
-                        response.status !== 401 && response.status !== 429 &&
-                        response.status < 500;
-                    if (!definitive) continue;   // keep it queued, try again later
-
-                    const payload = await response.json().catch(() => ({}));
-                    await drop(scanData.dedupe_key);
-                    if (response.ok && payload.status === 'success') {
-                        marked += 1;
-                    } else if (payload.outcome === 'duplicate') {
-                        // Already on the register — the queued copy was a
-                        // duplicate, which is a success from where the
-                        // student stands.
-                        //
-                        // Matched on the outcome, not on the 409 status: that
-                        // status also covers "the class had ended before this
-                        // reached us" and "that queued scan belongs to another
-                        // account", and reporting either of those as recorded
-                        // tells a student they are present when they are not.
-                        marked += 1;
-                    } else {
-                        lost += 1;
-                        lastFailureMessage = payload.message || '';
-                    }
-                } catch (_) {
-                    break;   // still offline; leave the rest queued
-                }
+        /* ===== SCANS SENT WHILE OFFLINE ===== */
+        // The service worker keeps a copy of any scan that could not be sent
+        // and retries it itself. This page's part is to prompt it whenever
+        // the network may be back, and to say how a stored scan ended.
+        //
+        // It used to replay the queue only on DOMContentLoaded and the
+        // `online` event — and a phone on a dead-but-connected 2G cell never
+        // goes offline, so `online` never fired and a stored scan sat there
+        // until it expired.
+        function flushStoredScans() {
+            if (navigator.serviceWorker && navigator.serviceWorker.controller) {
+                navigator.serviceWorker.controller.postMessage({ type: 'flush' });
             }
-
-            reportOfflineSync(marked, lost, lastFailureMessage);
         }
 
-        function reportOfflineSync(marked, lost, failureMessage) {
+        function reportStoredScan(data) {
+            // The open scanner is already handling its own scan.
+            if (window.__scanmarkPendingKey && window.__scanmarkPendingKey === data.key) return;
             const banner = document.getElementById('offline-sync-banner');
-            if (!banner || (!marked && !lost)) return;
-
-            const parts = [];
-            if (marked) {
-                parts.push(`${marked} scan${marked === 1 ? '' : 's'} saved while you were offline ` +
-                           `${marked === 1 ? 'has' : 'have'} now been recorded.`);
-            }
-            if (lost) {
-                parts.push(`${lost} offline scan${lost === 1 ? '' : 's'} could not be recorded` +
-                           `${failureMessage ? ': ' + failureMessage : ' because the code expired.'} ` +
-                           `Please scan the code on screen again.`);
-            }
-            banner.textContent = parts.join(' ');
-            banner.className = `alert ${lost ? 'alert-warning' : 'alert-success'}`;
+            if (!banner) return;
+            const recorded = data.outcome === 'success' || data.outcome === 'duplicate';
+            banner.textContent = recorded
+                ? `Your scan saved while you were offline has been recorded${data.course_code ? ' for ' + data.course_code : ''}.`
+                : `A scan saved while you were offline could not be recorded` +
+                  `${data.message ? ': ' + data.message : ''}. Please scan the code on screen again.`;
+            banner.className = `alert ${recorded ? 'alert-success' : 'alert-warning'}`;
         }
 
-        window.addEventListener('online', syncOfflineScans);
-        document.addEventListener('DOMContentLoaded', syncOfflineScans);
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.addEventListener('message', function (event) {
+                if (event.data && event.data.type === 'scan-sync') reportStoredScan(event.data);
+            });
+            window.addEventListener('online', flushStoredScans);
+            document.addEventListener('visibilitychange', function () {
+                if (document.visibilityState === 'visible') flushStoredScans();
+            });
+            navigator.serviceWorker.ready.then(flushStoredScans).catch(function () {});
+        }
+
+        // The service worker answered with its saved copy of this page
+        // because the network did not. Say so, quietly: it still scans.
+        if (document.querySelector('meta[name="scanmark-saved-copy"]')) {
+            document.addEventListener('DOMContentLoaded', function () {
+                const banner = document.getElementById('offline-sync-banner');
+                if (!banner) return;
+                banner.textContent = 'Weak or no connection: showing your saved page. ' +
+                    'Scanning still works, and scans are sent as soon as the network answers.';
+                banner.className = 'alert alert-info';
+            });
+        }
     </script>
 </body>
 

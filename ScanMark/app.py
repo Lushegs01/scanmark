@@ -40,7 +40,7 @@ from itsdangerous import URLSafeTimedSerializer
 from flask_mail import Connection as FlaskMailConnection, Mail, Message
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
-from flask_wtf.csrf import CSRFError, CSRFProtect
+from flask_wtf.csrf import CSRFError, CSRFProtect, generate_csrf
 from flask_compress import Compress
 from werkzeug.middleware.proxy_fix import ProxyFix
 from whitenoise import WhiteNoise
@@ -376,15 +376,64 @@ def inject_static_url():
 # Generate .gz/.br siblings at boot so WhiteNoise can serve them (it only
 # serves compressed variants that already exist on disk). Best-effort: on a
 # read-only filesystem the originals are served instead.
-try:
+#
+# The WHOLE tree, not just the top level. This used to be os.listdir(), so
+# everything under static/vendor/ — jsQR, the one script every iPhone scan
+# depends on — went out uncompressed: 130 KB on the wire where brotli sends
+# ~35 KB, which on a 2G cell is three extra seconds before the camera can
+# read anything. Already-compressed formats (woff2, png) are skipped by
+# should_compress itself.
+def _precompress_static(root):
     from whitenoise.compress import Compressor
-    _compressor = Compressor(quiet=True)
-    for _fname in os.listdir(_static_root):
-        _fpath = os.path.join(_static_root, _fname)
-        if os.path.isfile(_fpath) and _compressor.should_compress(_fname):
-            _compressor.compress(_fpath)
+    compressor = Compressor(quiet=True)
+    for directory, _subdirs, filenames in os.walk(root):
+        for filename in filenames:
+            path = os.path.join(directory, filename)
+            if compressor.should_compress(filename):
+                compressor.compress(path)
+
+
+try:
+    _precompress_static(_static_root)
 except Exception as _e:
     print(f"⚠️ Static pre-compression skipped: {_e}")
+
+
+class VersionedStaticCache:
+    """
+    Mark ``/static/...?v=<current asset hash>`` immutable for a year.
+
+    Templates reference every asset through ``static_url()``, which appends
+    the hash of the whole static tree, so a URL carrying the CURRENT hash can
+    never change content without changing name. WhiteNoise cannot see the
+    query string, so it gave those URLs the same one-day lifetime as a bare
+    path — and every day after that, each page load on a phone paid one
+    conditional request per stylesheet and script to be told "304, nothing
+    changed". On a 2G cell that is a second or more of render-blocking round
+    trips per asset, spent learning nothing.
+
+    Only the current hash qualifies. A request for an older ``?v=`` during a
+    rolling deploy is answered with today's file, and must not be pinned in
+    a browser for a year under yesterday's name.
+    """
+
+    IMMUTABLE = 'public, max-age=31536000, immutable'
+
+    def __init__(self, wrapped, version):
+        self.wrapped = wrapped
+        self.marker = f'v={version}'
+
+    def __call__(self, environ, start_response):
+        if (environ.get('PATH_INFO', '').startswith('/static/')
+                and self.marker in environ.get('QUERY_STRING', '').split('&')):
+            def immutable_start_response(status, headers, exc_info=None):
+                if status.startswith(('200', '304')):
+                    headers = [(name, value) for name, value in headers
+                               if name.lower() != 'cache-control']
+                    headers.append(('Cache-Control', self.IMMUTABLE))
+                return start_response(status, headers, exc_info)
+            return self.wrapped(environ, immutable_start_response)
+        return self.wrapped(environ, start_response)
 
 class HealthcheckMiddleware:
     """Answer the process probe before Flask opens a session or extension."""
@@ -452,12 +501,12 @@ if TRUSTED_PROXY_COUNT:
 else:
     print("🔗 No reverse proxy trusted; the peer address is the client address")
 
-app.wsgi_app = HealthcheckMiddleware(WhiteNoise(
+app.wsgi_app = HealthcheckMiddleware(VersionedStaticCache(WhiteNoise(
     app.wsgi_app,
     root=_static_root,
     prefix='static/',
     max_age=int(os.environ.get('STATIC_MAX_AGE', 86400)),
-))
+), ASSET_VERSION))
 
 # Gzip/brotli-compress dynamic responses (HTML/JSON) — big win on campus
 # mobile connections; compressible responses shrink ~70-85%.
@@ -2007,8 +2056,21 @@ def _redis_timed(operation, function, *args, **kwargs):
 CLASS_LOCATION_TTL = int(os.environ.get('CLASS_LOCATION_TTL', 14400))   # 4 hours
 
 
-def set_class_location(session_id, lat, lon):
-    """Store the lecturer's pinned classroom for ONE class session."""
+def _pin_accuracy_key(session_id):
+    return f"class_location_accuracy:session:{session_id}"
+
+
+def set_class_location(session_id, lat, lon, accuracy_m=None):
+    """
+    Store the lecturer's pinned classroom for ONE class session.
+
+    `accuracy_m` is how precise the browser said the pin was, kept beside it
+    (in its own key, so a worker still running the previous release reads the
+    pin exactly as before) so that a later, vaguer reading cannot replace it —
+    see should_replace_pin. None means the pin is authoritative (a saved
+    room, typed off a map) and anything stored about a previous one is
+    dropped.
+    """
     if redis_client:
         try:
             _redis_timed(
@@ -2016,6 +2078,13 @@ def set_class_location(session_id, lat, lon):
                 f"class_location:session:{session_id}", CLASS_LOCATION_TTL,
                 f"{lat},{lon}"
             )
+            if accuracy_m is None:
+                _redis_timed('delete', redis_client.delete,
+                             _pin_accuracy_key(session_id))
+            else:
+                _redis_timed('setex', redis_client.setex,
+                             _pin_accuracy_key(session_id), CLASS_LOCATION_TTL,
+                             f"{float(accuracy_m):.1f}")
         except redis.RedisError as error:
             # The pin's durable home is class_session.classroom_id; this is a
             # cache write, and failing it must not fail the request that
@@ -2025,6 +2094,43 @@ def set_class_location(session_id, lat, lon):
     else:
         # Local-dev fallback: module-level dict (single process only)
         _local_locations[session_id] = {'lat': lat, 'lon': lon}
+        _local_pin_accuracy[session_id] = accuracy_m
+
+
+def _pin_accuracy(session_id):
+    """The stored precision of this meeting's browser pin, or None."""
+    if not redis_client:
+        return _local_pin_accuracy.get(session_id)
+    try:
+        raw = _redis_timed('get', redis_client.get, _pin_accuracy_key(session_id))
+        return float(raw) if raw else None
+    except (redis.RedisError, ValueError):
+        return None
+
+
+def should_replace_pin(session_id, lat, lon, accuracy_m):
+    """
+    Whether a browser pin should replace the one this meeting already has.
+
+    The projector page used to re-send whatever fix it got every 30 seconds,
+    and each one replaced the last. A phone or laptop indoors wanders by tens
+    of metres between readings, so the CENTRE OF THE FENCE wandered with it
+    through the lecture: a room pinned at ±12m was re-pinned at ±80m, the
+    centre moved 70m, and students on the far side of the hall were suddenly
+    "too far away". A reading now replaces the pin only if it is at least as
+    precise — or so far from it, beyond both readings' error and the fence
+    itself, that the class has evidently moved rooms.
+    """
+    if accuracy_m is None:
+        return True
+    current = get_class_location(session_id)
+    current_accuracy = _pin_accuracy(session_id)
+    if current is None or current_accuracy is None:
+        return True
+    if accuracy_m <= current_accuracy:
+        return True
+    moved_m = calculate_distance(current['lat'], current['lon'], lat, lon)
+    return moved_m > current_accuracy + accuracy_m + GEOFENCE_RADIUS_M
 
 
 def _parse_location(raw):
@@ -2088,6 +2194,7 @@ def get_class_location(session_id, course_id=None, saved_room=None):
 
 # Local-dev fallback only (never used when Redis is available)
 _local_locations = {}
+_local_pin_accuracy = {}
 
 
 def _enrolled_count(course_id):
@@ -2204,16 +2311,39 @@ GEOFENCE_REQUIRED = _env_flag('GEOFENCE_REQUIRED', True)
 
 # Reported GPS accuracy beyond which a reading proves nothing: a fix with a
 # 2km error radius "inside" a 100m geofence is not evidence of presence.
-#
-# Deliberately NOT used to widen the fence. Treating the near edge of the
-# error circle as the student's position would mean a phone reporting the
-# worst permitted accuracy is accepted a further GEOFENCE_MAX_ACCURACY_M out
-# — and accuracy is a self-reported number, so that is a free pass for the
-# asking. GEOFENCE_RADIUS_M is already sized for indoor GPS drift; an
-# imprecise fix is refused outright instead.
 GEOFENCE_MAX_ACCURACY_M = int(
     os.environ.get('GEOFENCE_MAX_ACCURACY_M') or GEOFENCE_RADIUS_M
 )
+
+# How much of a fix's own reported error is forgiven at the edge of the fence,
+# at most, in metres. 0 restores the strict rule (the raw point must be inside
+# the radius).
+#
+# Why forgive any. A phone's reported accuracy is a ~68% confidence radius:
+# about one honest reading in three lands FURTHER than that from where the
+# phone really is, and indoors — concrete, steel roofing, a crowd of bodies —
+# the error is worst exactly where a lecture happens. A student at the back of
+# a long hall pinned from the front, with a ±40m reading that drifted the
+# wrong way, was told "you are 130m away (max 100m)" while sitting in their
+# seat. The measured complaint this addresses is that one, not a theory.
+#
+# Why only a little, and capped. Accuracy is self-reported, so the allowance
+# is a gift to anyone who reports a vague fix. It is therefore never more than
+# this cap, never more than the fix's own stated error, and never more than
+# half the room's radius (a lecturer who drew a tight 30m fence meant it). A
+# student across campus — hundreds of metres out — gains nothing from it, and
+# a fix vaguer than GEOFENCE_MAX_ACCURACY_M is still refused outright. A phone
+# that lies about its accuracy can lie about its coordinates too; the fence
+# was never proof against that (see mark_attendance), and this does not
+# change it.
+GEOFENCE_ACCURACY_ALLOWANCE_M = max(0.0, float(
+    os.environ.get('GEOFENCE_ACCURACY_ALLOWANCE_M', 25)))
+
+
+def geofence_allowance_m(accuracy_m, radius_m):
+    """Metres of slack beyond `radius_m` for a fix reporting `accuracy_m`."""
+    return max(0.0, min(float(accuracy_m), GEOFENCE_ACCURACY_ALLOWANCE_M,
+                        float(radius_m) / 2))
 
 # Oldest position fix a scan may carry. A phone will happily hand back a
 # cached fix from hours ago and somewhere else entirely.
@@ -3812,7 +3942,8 @@ def student_dashboard():
     return render_template('student_dashboard.html',
                            attendance_data=attendance_data,
                            enrolled_courses=enrolled_courses,
-                           threshold=ATTENDANCE_TARGET_PERCENT)
+                           threshold=ATTENDANCE_TARGET_PERCENT,
+                           scanner_config=_scanner_context())
 
 
 @app.route('/lecturer_dashboard')
@@ -5258,17 +5389,35 @@ def scan_page():
     # the "you haven't marked attendance yet" empty state, however many
     # classes they had actually attended.
     _courses, attendance_data = _student_attendance_summary()
-    # The page enforces the same freshness rule the scan endpoint does, so a
-    # fix it already knows is too old is replaced before it is posted rather
-    # than after a round trip. Two separately maintained numbers would drift.
+    # Someone who opened the scan page came to scan: the camera opens on
+    # arrival instead of waiting for a second tap. (The dashboard opens the
+    # same scanner in place; this page is where its link lands if the tap
+    # beat the script on a slow connection.)
     return render_template('scan.html', attendance_data=attendance_data,
-                           max_location_age_ms=GEOFENCE_MAX_LOCATION_AGE_MS,
-                           max_location_accuracy_m=GEOFENCE_MAX_ACCURACY_M)
+                           scanner_config=_scanner_context(auto_start=True))
+
+
+def _scanner_context(auto_start=False):
+    """
+    What the camera overlay (templates/_scanner.html) needs from the server.
+
+    The page enforces the same rules the scan endpoint does — how old a fix
+    may be, how vague, how long a code lives — so a reading it already knows
+    will be refused is replaced before it is posted rather than after a round
+    trip. Two separately maintained numbers would drift.
+    """
+    return {
+        'max_location_age_ms': GEOFENCE_MAX_LOCATION_AGE_MS,
+        'max_location_accuracy_m': GEOFENCE_MAX_ACCURACY_M,
+        'qr_window_seconds': QR_CODE_WINDOW,
+        'auto_start': auto_start,
+    }
 
 
 def _read_pin(data):
     """
-    Validate a posted classroom pin, returning (lat, lon) or an error.
+    Validate a posted classroom pin, returning (lat, lon, accuracy_m or None)
+    or an error.
 
     A pin that is merely in range is not good enough. The device sending it
     also says how precise the fix is, and a laptop locating itself from Wi-Fi
@@ -5288,6 +5437,7 @@ def _read_pin(data):
         return None, "Latitude or longitude is out of range."
 
     reported = data.get('accuracy_m')
+    accuracy_m = None
     if reported is not None:
         try:
             accuracy_m = float(reported)
@@ -5304,7 +5454,7 @@ def _read_pin(data):
                 f"centre of a {GEOFENCE_RADIUS_M}m classroom — every student "
                 f"would be refused. Choose a saved classroom instead."
             )
-    return (latitude, longitude), None
+    return (latitude, longitude, accuracy_m), None
 
 
 @app.route('/session/<int:session_id>/set_location', methods=['POST'])
@@ -5336,6 +5486,9 @@ def set_session_location(session_id):
     if problem:
         return jsonify({"status": "error", "message": problem}), 400
 
+    if not should_replace_pin(session_id, *pin):
+        return jsonify({"status": "ok", "kept": True,
+                        "accuracy_m": _pin_accuracy(session_id)})
     set_class_location(session_id, *pin)
     app.logger.info('Classroom pinned for session %s (course %s)',
                     session_id, course.id)
@@ -5375,6 +5528,8 @@ def set_location(course_id):
     if problem:
         return jsonify({"status": "error", "message": problem}), 400
 
+    if not should_replace_pin(session_row.id, *pin):
+        return jsonify({"status": "ok", "kept": True})
     set_class_location(session_row.id, *pin)
     app.logger.info('Classroom pinned for session %s via the legacy '
                     'course-scoped endpoint', session_row.id)
@@ -6391,7 +6546,7 @@ def mark_attendance():
             runtime_metrics.increment(f'scan.budget_exceeded.{name}')
         stage_started = now
 
-    def respond(status, message, http_status, outcome, headers=None):
+    def respond(status, message, http_status, outcome, headers=None, extra=None):
         total_ms = (time.perf_counter() - request_started) * 1000
         runtime_metrics.observe_ms('scan.response', total_ms)
         runtime_metrics.increment(f'scan.outcome.{outcome}')
@@ -6407,8 +6562,10 @@ def mark_attendance():
         # 409 now covers "already marked" (a success from where the student
         # stands) as well as "the class had ended" and "that queued scan is
         # somebody else's", which are emphatically not.
-        response = jsonify({'status': status, 'message': message,
-                            'outcome': outcome})
+        body = {'status': status, 'message': message, 'outcome': outcome}
+        if extra:
+            body.update(extra)
+        response = jsonify(body)
         if stages:
             response.headers['Server-Timing'] = ', '.join(
                 f'{name};dur={value:.2f}' for name, value in stages.items()
@@ -6550,10 +6707,18 @@ def mark_attendance():
                                'Please scan the current code.',
                                400, 'capture_out_of_window')
 
-        saved_room = (None if target['room_lat'] is None
-                      else (target['room_lat'], target['room_lon']))
-        class_loc = get_class_location(target['session_id'], target['course_id'],
-                                       saved_room=saved_room)
+        if target['room_lat'] is not None:
+            # A meeting held in a saved room is pinned to exactly that room by
+            # every path that can set a pin — starting the class in it,
+            # moving the class into it, and the projector's periodic
+            # set_location, which defers to the room. So the row the join
+            # already returned IS the pin, and reading Redis for it was a
+            # round trip per scan to learn the same two numbers (or, on a
+            # cache miss, to write them back). The database is also the more
+            # current of the two if the room is ever corrected.
+            class_loc = {'lat': target['room_lat'], 'lon': target['room_lon']}
+        else:
+            class_loc = get_class_location(target['session_id'], target['course_id'])
         if class_loc:
             try:
                 student_lat = float(data['lat'])
@@ -6598,6 +6763,8 @@ def mark_attendance():
                     f'too imprecise to confirm you are in the classroom. Move '
                     f'towards a window and scan again.',
                     422, 'imprecise_location',
+                    extra={'accuracy_m': round(accuracy_m),
+                           'max_accuracy_m': GEOFENCE_MAX_ACCURACY_M},
                 )
 
             distance_m = calculate_distance(
@@ -6607,13 +6774,21 @@ def mark_attendance():
             # (an ad-hoc pin, or a room that never set one) uses the
             # server-wide default.
             geofence_radius_m = target['room_radius_m'] or GEOFENCE_RADIUS_M
-            if distance_m > geofence_radius_m:
+            if distance_m > geofence_radius_m + geofence_allowance_m(
+                    accuracy_m, geofence_radius_m):
                 return respond(
                     'error',
                     f'Too far from the classroom. You are {int(distance_m)}m away '
                     f'(max {int(geofence_radius_m)}m).',
                     422,
                     'outside_geofence',
+                    # What the scanner needs to tell drift (wait for a better
+                    # fix and go again on its own) from being somewhere else
+                    # (say so now). Nothing here the message does not already
+                    # say in words.
+                    extra={'distance_m': round(distance_m),
+                           'radius_m': round(geofence_radius_m),
+                           'accuracy_m': round(accuracy_m)},
                 )
         elif GEOFENCE_REQUIRED:
             # Opt-in strict mode: no pinned classroom means no proof of
@@ -6679,6 +6854,7 @@ def mark_attendance():
                 'You are already marked present for this class.',
                 409,
                 'duplicate',
+                extra={'course_code': target['course_code']},
             )
 
         # Deliberately NO cache invalidation here. The lecturer's headcount is
@@ -6716,7 +6892,14 @@ def mark_attendance():
         # record; students read it on their dashboard.
         checkpoint('enqueue')
 
-        return respond('success', 'Attendance marked successfully!', 200, 'success')
+        # Named, so the confirmation says WHICH class — and so the page can
+        # bump that course's count in place instead of reloading for it.
+        return respond('success',
+                       f"Marked present for {target['course_code']}.",
+                       200, 'success',
+                       extra={'course_code': target['course_code'],
+                              'course_title': target['course_title'],
+                              'session_title': target['session_title']})
 
     except PoolTimeoutError:
         # Saturation, not a fault. Told apart from a 500 so the scanner backs
@@ -7973,6 +8156,18 @@ def csrf_error_handler(error):
     """
     if request.endpoint in ('login', 'signup') and request.accept_mimetypes.best == 'application/json':
         return jsonify(outcome='csrf_expired', message='Please reload this page and try again.'), 400
+    if request.path == '/mark_attendance' and request.method == 'POST':
+        # A scan from a page that outlived its form token: a scanner left
+        # open through a long lecture, a dashboard the service worker served
+        # from its offline copy, a session store that failed over. The stock
+        # HTML 400 left the scanner one choice — reload the page, which on
+        # 2G is seconds and throws away the scan in hand. The fresh token
+        # comes back with the refusal instead, and the scanner resends at
+        # once. Safe to hand out: another origin cannot read this response,
+        # and the cookie it is bound to is the requester's own.
+        return jsonify(status='error', outcome='csrf_expired',
+                       message='Your page had been open a while; resending.',
+                       csrf_token=generate_csrf()), 400
     if request.path.startswith('/event/') and request.method == 'POST':
         event_row = _find_event((request.view_args or {}).get('token'))
         if event_row is not None:

@@ -1,4 +1,238 @@
-# ScanMark performance report — concurrency round
+# ScanMark performance report — the student journey on a bad network
+
+Date: 2026-11-04
+
+The previous round (appendix below) made the **server** fast: ~15 ms per scan
+at p50 under a 2,000-student burst. This round is about the **student**: the
+seconds between opening the app and seeing "Marked present" on a FUNAAB phone
+connection, and whether the scan survives that connection failing halfway.
+The server was not where those seconds were going.
+
+## How this was measured
+
+`loadtest/journey/` (new) drives a real Chromium against a real gunicorn +
+Redis server through a TCP relay that behaves like a mobile link: round-trip
+latency, one shared bandwidth-limited radio, TCP + TLS set-up on every new
+connection, and on demand a **stall** (everything held) or a **drop** (every
+connection reset). It applies to the page, the service worker and third-party
+CDNs alike — DevTools throttling models none of the last two, and no
+connection set-up at all, so it understates exactly the costs this round
+removes. The camera is a canvas showing the projector's live, rotating,
+server-signed code (blank for the first 1.5 s while the student aims); GPS
+is a fix a second, optionally wandering like an indoor reading.
+
+| Profile | RTT | Down / up |
+|---|---:|---:|
+| `3g` | 300 ms | 1.6 / 0.75 Mbit/s |
+| `2g` | 800 ms | 250 / 100 kbit/s |
+
+Same box, same scenarios, same seeded students, baseline (`a7bef10`) and this
+change run back to back; each journey row is the median of 3 runs.
+
+**What this cannot measure.** No Android hardware was available, so real
+camera start-up, BarcodeDetector initialisation and real GPS behaviour
+are not in these numbers; changes aimed at those are argued from the code
+and listed as such. The profiles are shapes, not FUNAAB carrier measurements.
+
+## Results
+
+### Tap "scan" → "Marked present" on screen
+
+Includes the harness's fixed 1.5 s of aiming, identical in both columns.
+
+| | Before | After | |
+|---|---:|---:|---|
+| 3G | 3,127 ms | **2,080 ms** | −33% (−64% excluding the 1.5 s aim) |
+| 2G | 5,511 ms | **4,269 ms** | −23% (−31% excluding the aim) |
+| Bytes on the radio during the scan | 11.3 KB | **3.4 KB** | −69% |
+
+### Opening the dashboard
+
+| | Before | After | |
+|---|---:|---:|---|
+| 3G first visit, load | 4,777 ms | **3,066 ms** | −36% |
+| 3G first visit, first paint | 2,716 ms | **2,088 ms** | −23% |
+| 2G first visit, load | 17,803 ms | **10,259 ms** | −42% |
+| 2G first visit, first paint | 8,668 ms | **6,152 ms** | −29% |
+| First-visit bytes | 351 KB | **171 KB** | −51% |
+| Third-party connections | 9 | **0** | |
+| Returning visit, 3G / 2G | 1,002 / 2,758 ms | 1,052 / 2,812 ms | unchanged (one HTML round trip; +1.4 KB for the scanner now on the page) |
+
+### Network failure in the middle of a scan
+
+The network goes away as the code is read, then comes back. Real QR window
+(45 s), real 12 s code rotation, checked against the database afterwards.
+
+| Outage | Before | After |
+|---|---|---|
+| Connection drop, 15 s | **Not recorded.** Told "saved, will be sent automatically"; nothing ever sent it | Recorded **1.6 s** after signal returned |
+| Connection drop, 60 s | **Not recorded** (same) | Recorded **4.7 s** after signal returned |
+| Stall, 15 s | Recorded 0.4 s after | Recorded 0.4 s after |
+| Stall, 60 s | "QR code has expired. Please scan again", then recorded on a re-read | Recorded 0.6 s after, no error ("Marked present for …") |
+
+### GPS drift inside the hall
+
+Student 25 m from the room; the phone's readings alternate between ±12 m
+(on target) and ±60 m drifted to 125 m — what a phone in a concrete hall does.
+
+| | Before | After |
+|---|---:|---:|
+| Scans recorded | **2 of 5** | **5 of 5** |
+| "Too far from the classroom" shown to a student in the room | 6 times | **0** |
+
+### Many students at once
+
+1,000 simultaneous, pre-authenticated scans (`loadtest/scan_burst.py`)
+against PostgreSQL 16 + Redis 7, gunicorn 8×2, everything on the one 4-CPU
+box with the load generator. Four alternating runs of each version, median
+(range):
+
+| | Before | After | |
+|---|---:|---:|---|
+| Recorded / duplicate / lost | 4,000 / 0 / 0 | **4,000 / 0 / 0** | every run passed acceptance |
+| Server time per scan, p50 | 12.9 ms (11.9–15.0) | **11.8 ms** (10.6–12.5) | −8% |
+| Server time per scan, p95 | 26.0 ms (25.5–27.6) | **23.5 ms** (20.0–24.8) | −9% |
+| Redis `GET`s per student (sign-in + scan) | 9 | **8** | the classroom-pin read, gone |
+| Throughput | 341 scans/s (323–368) | 322 scans/s (283–366) | overlapping: no change |
+| Client p95 | 2.15 s | 2.29 s | overlapping: queueing on a shared box |
+
+The honest reading: per-scan server cost went down a little and nothing
+regressed; capacity is unchanged, because this round did not need to change
+it. The previous round's analysis (appendix) of where the remaining client
+latency under a true burst comes from still stands — it is request slots and
+instance count, not code.
+
+## What was wrong, ranked
+
+### P0 — A dropped connection lost the scan while telling the student it was saved
+
+* **Where:** `static/service-worker.js`, `templates/base.html`.
+* **Evidence:** both connection-drop runs above; the students are absent from
+  the register.
+* **Why:** on a network error the worker stored the scan and answered "saved,
+  will be sent automatically", and the scanner stopped. The only replay was
+  in the page, on `DOMContentLoaded` or the `online` event — and a phone on a
+  dead-but-connected 2G cell never goes offline, so `online` never fires. The
+  stored code expired 45 s later, unsent. The worker also converted **every
+  5xx** into "saved offline", so a database busy for two seconds (503 +
+  `Retry-After`) stopped the scanner instead of pacing it.
+* **Change:** every HTTP answer now reaches the scanner untouched. A scan that
+  was read is held as *pending* until the server answers definitively:
+  retried with jittered backoff (or the server's `Retry-After`), and **each
+  retry carries the newest code the camera has seen** — the camera keeps
+  reading the projector at 4 Hz while a scan is pending — so an outage of any
+  length ends with a code seconds old, **without widening the server's
+  45 s replay window by a millisecond**. The worker keeps one copy per student
+  per class (newest code wins), retries it itself (Background Sync where the
+  browser has it, a bounded loop otherwise, 15 s per request), and tells open
+  pages how it ended. Pages prompt it on load, `online` and
+  `visibilitychange`.
+* **Integrity:** unchanged. The server still judges the token's age at
+  processing time; retries are idempotent through the unique
+  `(student, session)` index; a duplicate is reported as "already marked".
+
+### P0 — Students in the room told "you are too far from the classroom"
+
+Five separate causes, all on the evidence of the drift runs and the code:
+
+1. **The scanner sent the latest fix, not the best.** Indoors a watch
+   alternates good and drifted readings; whichever arrived last was posted.
+   *Now:* the most precise fix of the last 10 s.
+2. **A refusal was retried with the same fix.** The automatic resubmit
+   re-used the cached reading and got the same answer three times. *Now:*
+   a refused fix's timestamp is remembered and the retry waits for a newer
+   one; a refusal whose distance says "somewhere else entirely" (beyond
+   `max(150 m, 3 × accuracy)`) stops at once instead.
+3. **The fence had no tolerance for honest error.** A phone's accuracy is a
+   ~68% radius, so one honest reading in three lands further out than it says.
+   *Now:* `GEOFENCE_ACCURACY_ALLOWANCE_M` (default 25 m) forgives up to the
+   fix's own stated error — never more than the cap, never more than half
+   the room's radius, and a fix vaguer than `GEOFENCE_MAX_ACCURACY_M` is
+   still refused outright. A student hundreds of metres away gains nothing.
+   `0` restores the strict rule. This is the one change in the round that
+   moves the integrity line, so it is small, capped, configurable, and
+   documented in `DEPLOYMENT.md`.
+4. **The centre of the fence wandered.** The projector page re-pinned the
+   class every 30 s with whatever reading it got, each replacing the last; a
+   room pinned at ±12 m could be re-pinned at ±80 m mid-lecture. *Now:* the
+   page watches and sends only improvements, and the server keeps the most
+   precise pin per meeting (a reading far beyond both errors and the fence
+   is treated as the class having moved rooms).
+5. **Saved classrooms were stored at their first acceptable reading** — the
+   capture stopped at the first fix under 100 m, so rooms were saved at ±90 m.
+   *Now:* it holds out for ±20 m and falls back to the best acceptable
+   reading at the end of the window.
+
+Also: a GPS **timeout** indoors was reported as "Allow GPS access" — wrong
+advice for a student who had. Permission denied, position unavailable and
+timeout now each get their own message, and a network (Wi-Fi/cell) position is
+requested after 3 s without any fix, since indoors it often beats GPS.
+
+### P1 — Four third-party origins in front of every page
+
+* **Where:** `templates/base.html`, `complete_profile.html`.
+* **Evidence:** 9 third-party connections on a first visit; 351 KB.
+* **Why:** Bootstrap (jsDelivr), Font Awesome (cdnjs), Poppins (Google Fonts,
+  whose CSS then names a fourth origin for the font files). Each new origin
+  is DNS + TCP + TLS before its first byte, and the stylesheets were
+  render-blocking. Font Awesome's solid font alone was 150 KB for the ~50
+  icons ScanMark uses.
+* **Change:** all self-hosted under `static/vendor/` (same versions); the
+  icon font subset to the icons in use (150 KB → 4.7 KB) by
+  `tools/subset_icons.py`, with a test that fails if a template uses an icon
+  the subset lacks; Bootstrap's script deferred so it no longer holds
+  `DOMContentLoaded`.
+
+### P1 — Two page loads and two taps between the dashboard and the camera
+
+* **Where:** `student_dashboard.html` → `/scan_page` → "Start Advanced Scanner".
+* **Change:** the scanner overlay is a shared partial (`_scanner.html`) and
+  the dashboard opens the camera in place. The button is still a link to
+  `/scan_page`, which now starts the camera on arrival, so a tap before the
+  script has loaded still works.
+
+### P2 — Smaller things on the same path
+
+| Defect | Change |
+|---|---|
+| `jsQR.min.js` (131 KB) went out **uncompressed**: the boot-time compressor only walked the top level of `static/` | Walk the whole tree: 26 KB with brotli |
+| jsQR was a parser-blocking script on every scan page, though phones with BarcodeDetector never use it | Loaded on demand, only where there is no native detector |
+| Versioned assets (`?v=<hash>`) had a one-day `max-age`, so every day each page load revalidated every asset | `immutable`, one year, for the current hash only (`VersionedStaticCache`) |
+| The service worker refetched every cached asset in the background on every page view | Cache-first for versioned and vendored files; precache everything the scanner needs to start offline |
+| No page at all without signal | The worker keeps the last good student dashboard and scan page and serves it when the network fails or takes over 7 s; marked as a saved copy; dropped on logout or a redirect |
+| A page that outlived its CSRF token could only recover by reloading (seconds on 2G, scan lost) | The refusal for `/mark_attendance` is JSON carrying a fresh token; the scanner resends immediately |
+| A phone with a wrong clock had every scan refused "not read from the screen just now" | The scanner learns the server's clock from a response's `Date` and reports capture time on it |
+| A non-ScanMark QR on a slide was posted, costing a request and one of the student's 10/min | Recognised by shape on the phone and skipped |
+| Camera start was serial: detector initialisation, then `getUserMedia`, then an awaited focus constraint before the first frame | Detector initialised at page load; focus applied without waiting; *not measurable without hardware* |
+| Continuous focus re-applied every 4 s regardless, which restarts the focus sweep on some cameras | Only while the hunt is struggling |
+| The scan's connection was usually cold after the student waited for the code | A `HEAD /livez` opens it as the scanner opens (and every 45 s while waiting). Under HTTP/2 the scan rides it; over the harness's HTTP/1.1 at 2G the warm-up was still in flight, so the scan opened its own |
+| A success said "Attendance marked successfully!" and the counts were stale until reload | Names the course; the page's counts update in place |
+| A scan in a saved classroom read the pin from Redis — one round trip to learn what the join had just returned | The joined room is the pin (every path that pins such a meeting pins that room) |
+| `complete_profile.html` had no viewport tag, so phones rendered it at desktop width | Added |
+
+## Configuration added
+
+| Variable | Default | |
+|---|---|---|
+| `GEOFENCE_ACCURACY_ALLOWANCE_M` | 25 | See P0 above and `DEPLOYMENT.md`. `0` = previous strict rule. |
+
+## Remaining, honestly
+
+1. **Real-device numbers.** Camera start, native detector and GPS behaviour
+   need an Android rehearsal; `client_metrics` (camera-ready, decode, GPS
+   wait) are still collected per scan for exactly that.
+2. **A returning visit is one HTML round trip** (~1 s at 3G, ~2.8 s at 2G),
+   because the dashboard shows live counts. Showing the saved copy first and
+   refreshing it would hide that, at the price of briefly stale counts; not
+   done.
+3. **An outage longer than the replay window with the camera closed** still
+   cannot be recovered: there is no way to prove when an offline phone read
+   a code without trusting the phone. The scanner says so plainly; keeping
+   the camera on the projector is what makes long outages survivable.
+
+---
+
+# Appendix: the concurrency round (2026-08-31)
 
 Date: 2026-08-31
 

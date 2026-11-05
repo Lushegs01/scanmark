@@ -197,6 +197,15 @@
     // difference between this working and not.
     const CAPTURE_WINDOW_MS = 45000;
 
+    // What the search holds out for before stopping by itself. The server
+    // accepts anything up to MAX_PIN_ACCURACY_M, and this used to stop at
+    // the first reading under it — so rooms were saved at ±90m, the centre
+    // of every future fence up to 90m from the hall, and students on the
+    // far side were refused for the rest of the term. A phone near a window
+    // usually reaches ±20m within seconds; past the window the best
+    // acceptable reading is still used.
+    const GOOD_PIN_ACCURACY_M = Math.min(20, MAX_PIN_ACCURACY_M);
+
     const captureBtn = document.getElementById('captureBtn');
     const captureLabel = document.getElementById('captureLabel');
     const statusEl = document.getElementById('captureStatus');
@@ -237,6 +246,11 @@
     function giveUp() {
         stopWatching();
         const best = bestFix ? Math.round(bestFix.coords.accuracy) : null;
+        if (best !== null && best <= MAX_PIN_ACCURACY_M) {
+            // Never reached the target, but this is still a usable room.
+            useFix(bestFix);
+            return;
+        }
         if (best === null) {
             say('Could not get a location at all. Paste the coordinates from a map instead.',
                 'text-danger');
@@ -281,7 +295,7 @@
                 ? 'best so far ±' + Math.round(bestFix.coords.accuracy) + 'm'
                 : 'no fix yet';
             say('Narrowing it down — ' + sofar + ', ' + Math.max(0, left) + 's left. ' +
-                'It stops as soon as it is good enough.');
+                'It stops at ±' + GOOD_PIN_ACCURACY_M + 'm, or tap to take the best so far.');
         }, 1000);
 
         watchId = navigator.geolocation.watchPosition(
@@ -289,7 +303,7 @@
                 if (!bestFix || position.coords.accuracy < bestFix.coords.accuracy) {
                     bestFix = position;
                 }
-                if (position.coords.accuracy <= MAX_PIN_ACCURACY_M) {
+                if (position.coords.accuracy <= GOOD_PIN_ACCURACY_M) {
                     stopWatching();
                     useFix(position);
                     return;

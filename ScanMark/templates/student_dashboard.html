@@ -32,7 +32,7 @@
                 <div class="stat-icon" style="background: rgba(0,90,43,0.12);">✅</div>
                 {% set total = namespace(count=0) %}
                 {% for item in attendance_data %}{% set total.count = total.count + item.count %}{% endfor %}
-                <div class="stat-number">{{ total.count }}</div>
+                <div class="stat-number" data-total-attended>{{ total.count }}</div>
                 <div class="stat-label">Classes Attended</div>
             </div>
         </div>
@@ -53,25 +53,14 @@
                 </div>
             </div>
 
-            <button onclick="window.location.href='{{ url_for('scan_page') }}'" class="btn btn-scan" id="scanBtn">
+            {# Opens the camera right here (scanner.js), with no page load in
+               between. Still a real link, so a tap before the script has
+               arrived on a slow connection goes to the scan page instead of
+               doing nothing. #}
+            <a href="{{ url_for('scan_page') }}" class="btn btn-scan" id="scanBtn" data-open-scanner>
                 <i class="fas fa-camera"></i>
                 <span>Start Camera &amp; Scan</span>
-            </button>
-
-            <!-- QR Reader -->
-            <div id="reader" style="width: 100%; display:none; margin-top: 1rem;"></div>
-
-            <!-- Zoom Slider -->
-            <div id="zoom-container" style="display:none; margin-top: 0.8rem; text-align: center;">
-                <label for="zoom-slider"
-                    style="font-weight: 600; font-size: 0.8rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.7px;">
-                    <i class="fas fa-search me-1"></i> Zoom:
-                    <span id="zoom-value" style="color: var(--green); font-weight: 800;">1.0×</span>
-                </label>
-                <br>
-                <input type="range" id="zoom-slider" min="1" max="5" step="0.1" value="1"
-                    style="width: 85%; height: 6px; accent-color: var(--green); cursor: pointer; margin-top: 6px;">
-            </div>
+            </a>
 
             <!-- Result Banner -->
             <div id="result-banner" class="alert mt-3 text-center fw-bold d-none" role="alert"></div>
@@ -137,9 +126,9 @@
                                    WHILE THIS STUDENT WAS ENROLLED, so joining
                                    late does not start you at 0% of a term you
                                    were not there for. #}
-                                <span class="badge bg-primary" style="font-size: 0.85rem; min-width: 32px;">
-                                    {{ item.count }}{% if item.total_sessions %} / {{ item.total_sessions }}{% endif %}
-                                </span>
+                                <span class="badge bg-primary" style="font-size: 0.85rem; min-width: 32px;"
+                                      data-attended-for="{{ item.code }}" data-attended="{{ item.count }}"
+                                      data-total="{{ item.total_sessions }}">{{ item.count }}{% if item.total_sessions %} / {{ item.total_sessions }}{% endif %}</span>
                             </td>
                             <td class="text-center">
                                 {% if item.pct is none %}
@@ -147,11 +136,11 @@
                                 {% elif item.pct >= threshold %}
                                 <span class="badge"
                                     style="background: rgba(0,90,43,0.12); color: var(--green); font-size: 0.75rem;">
-                                    <i class="fas fa-circle fa-xs me-1" style="font-size: 0.5rem; vertical-align: middle;"></i>{{ item.pct }}% · On Track
+                                    <i class="fas fa-circle fa-xs me-1" style="font-size: 0.5rem; vertical-align: middle;"></i><span data-pct-badge data-threshold="{{ threshold }}">{{ item.pct }}% · On Track</span>
                                 </span>
                                 {% else %}
                                 <span class="badge bg-danger" style="font-size: 0.75rem;">
-                                    {{ item.pct }}% · At Risk
+                                    <span data-pct-badge data-threshold="{{ threshold }}">{{ item.pct }}% · At Risk</span>
                                 </span>
                                 {% endif %}
                             </td>
@@ -172,5 +161,5 @@
 
 </div>
 
-<!-- QR Scanner Script -->
+{% include '_scanner.html' %}
 {% endblock %}

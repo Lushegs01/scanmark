@@ -216,3 +216,6 @@ ScanMark/static/*.br
 ScanMark/gunicorn.ctl
 ScanMark/static/*.gz
 ScanMark/static/*.br
+# Boot-time compressed siblings anywhere under static/ (vendor/ included)
+ScanMark/static/**/*.gz
+ScanMark/static/**/*.br

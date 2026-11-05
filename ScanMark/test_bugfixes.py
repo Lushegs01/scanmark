@@ -1429,9 +1429,19 @@ class TestTheOfflineQueueTellsTheTruth:
         assert body['outcome'] == 'duplicate'
 
     def test_the_queue_matches_on_the_outcome_not_the_status(self, appmod):
+        """
+        The replay moved into the service worker (it now retries on its own,
+        page or no page), and the page only reports what it heard. Both
+        halves must still decide "recorded" from the outcome alone.
+        """
+        worker = open('static/service-worker.js', encoding='utf-8').read()
         page = open('templates/base.html', encoding='utf-8').read()
-        assert "payload.outcome === 'duplicate'" in page
-        assert 'response.status === 409' not in page
+        assert 'outcome: payload.outcome' in worker
+        assert "data.outcome === 'duplicate'" in page
+        assert "data.outcome === 'success'" in page
+        for source in (worker, page):
+            assert 'response.status === 409' not in source
+            assert 'status === 409' not in source
 
 
 class TestUpgradingAnExistingDatabase:
