@@ -91,6 +91,9 @@ def appmod(flask_app):
     else:
         flask_app.redis_client.flushdb()
         flask_app._admission_script = None
+    # The manual-code wrong-guess counters, for the no-Redis run. (With Redis
+    # they live in the database flushed above.)
+    flask_app._local_manual_guard.reset()
 
     yield flask_app
 

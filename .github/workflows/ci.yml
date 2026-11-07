@@ -42,20 +42,25 @@ jobs:
       - name: Static check for undefined names
         run: |
           python -m pyflakes app.py models.py campos_integration.py \
-                             localtime.py academic.py \
+                             localtime.py academic.py manual_code.py \
                              performance.py conftest.py \
                              test_app.py test_performance.py test_bugfixes.py test_auth.py \
                              test_scan_limits.py test_scan_validation.py \
-                             test_student_journey.py tools/*.py \
-                             benchmarks/*.py loadtest/*.py loadtest/journey/*.py
+                             test_student_journey.py test_manual_code.py tools/*.py \
+                             benchmarks/*.py loadtest/*.py loadtest/journey/*.py \
+                             e2e/*.py
 
       - name: Check the browser JavaScript parses
         run: |
           node --check static/scanner.js
           node --check static/service-worker.js
+          node --check static/attendance-common.js
+          node --check static/manual-code.js
           node --check loadtest/journey/journey.cjs
+          node --check e2e/manual_code.e2e.cjs
           node --check static/auth.js
           node --test test_auth_browser.cjs
+          node --test test_manual_code_browser.cjs
 
       - name: Check every Jinja template compiles
         env:

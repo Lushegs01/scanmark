@@ -26,6 +26,14 @@ stampede is its own capacity question and deserves its own answer.
 It also verifies the invariant that matters more than any latency figure:
 every admitted scan is in the database exactly once.
 
+``--mode manual`` sends the typed eight-digit attendance code instead of a QR
+token (POST /api/attendance/manual), and ``--mode mixed`` deals students
+between the two by ``--manual-ratio``, as a real hall does: most scan, the
+ones whose cameras cannot, type. Codes are derived with the server's own
+algorithm (manual_code.py) from the same secret, exactly as tokens are, and
+the burst waits for a window with at least 30 seconds left, so a rotation
+mid-burst is not mistaken for a capacity problem.
+
     python loadtest/scan_burst.py --host https://staging.example \\
         --students 2000 --session-id 1 --secret "$TARGET_SECRET_KEY" \\
         --database-url "$DATABASE_URL"
@@ -58,6 +66,11 @@ from sqlalchemy import create_engine  # noqa: E402
 from scan_validation import (  # noqa: E402
     acceptance_errors, attendance_counts, expected_attendance, verify_attendance,
 )
+
+# manual_code.py is framework-free on purpose, so the harness derives the
+# projector's code exactly as the server does, without importing the app.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import manual_code  # noqa: E402
 
 _METRES_PER_DEGREE_LAT = 111_194.9266
 
@@ -122,9 +135,10 @@ class Phone:
     """One student's browser: a cookie jar, a CSRF token, a seat."""
 
     __slots__ = ('number', 'session', 'csrf', 'marker', 'lat', 'lon',
-                 'device_id', 'session_id', 'login_ms')
+                 'device_id', 'session_id', 'login_ms', 'method')
 
-    def __init__(self, number, session_id, lat, lon):
+    def __init__(self, number, session_id, lat, lon, method='qr'):
+        self.method = method
         self.number = number
         self.session_id = session_id
         self.session = requests.Session()
@@ -200,6 +214,19 @@ class Phone:
             return 'https://' + host[len('http://'):]
         return host
 
+    def manual_body(self, code, accuracy_range, age_range):
+        """What the attendance-code form posts: no camera, no capture time."""
+        return {
+            'code': f'{code[:4]} {code[4:]}',
+            'session_id': self.session_id,
+            'lat': self.lat,
+            'lon': self.lon,
+            'accuracy_m': random.uniform(*accuracy_range),
+            'location_age_ms': random.uniform(*age_range),
+            'user_marker': self.marker,
+            'device_id': self.device_id,
+        }
+
     def scan_body(self, secret, accuracy_range, age_range, lag_range):
         lag_ms = random.uniform(*lag_range)
         return {
@@ -245,6 +272,11 @@ def main():
                              'here would just be the login stampede test.')
     parser.add_argument('--burst-concurrency', type=int, default=0,
                         help='0 = all at once, which is the point')
+    parser.add_argument('--arrival-seconds', type=float, default=0,
+                        help='spread the class evenly over this many seconds '
+                             'instead of releasing it in one instant: the '
+                             '"500 students mark attendance within 30-90 s" '
+                             'shape of a real lecture (0 = simultaneous)')
     parser.add_argument('--projector-watchers', type=int, default=0,
                         help='poll the lecturer attendee feed for the whole of '
                              'Phase 2, as the projected roll-call screen does. '
@@ -277,6 +309,22 @@ def main():
                              'costs a fresh handshake. Leaving this off '
                              'measures that case; turning it on measures the '
                              'best case.')
+    parser.add_argument('--mode', choices=('qr', 'manual', 'mixed'), default='qr',
+                        help='qr: every phone scans; manual: every phone types '
+                             'the attendance code; mixed: deal them by '
+                             '--manual-ratio')
+    parser.add_argument('--manual-ratio', type=float, default=0.5,
+                        help='mixed mode: fraction of phones typing the code')
+    parser.add_argument('--manual-secret', default=os.environ.get('MANUAL_CODE_SECRET', ''),
+                        help='the server\'s MANUAL_CODE_SECRET, if it sets one; '
+                             'otherwise the code key is derived from --secret')
+    parser.add_argument('--resource-out', default='',
+                        help='write server CPU/RSS, database connections and '
+                             'Redis command cost for the burst window here '
+                             '(runs loadtest/resource_sampler.py; the server '
+                             'must be on this host)')
+    parser.add_argument('--redis-url', default=os.environ.get('REDIS_URL', ''),
+                        help='for --resource-out: the Redis the server uses')
     parser.add_argument('--label', default='burst')
     parser.add_argument('--json-out', default='')
     parser.add_argument('--insecure', action='store_true',
@@ -336,11 +384,22 @@ def main():
           f'session(s) {session_ids}, host {host} ==')
 
     # ---------------- Phase 1: sign in (untimed, deliberately throttled) ----
+    def method_for(index):
+        if arguments.mode == 'mixed':
+            # Even spacing rather than random: the ratio is exact, and typed
+            # codes arrive interleaved with scans as they would in a hall.
+            return ('manual' if math.floor((index + 1) * arguments.manual_ratio)
+                    > math.floor(index * arguments.manual_ratio) else 'qr')
+        return arguments.mode
+
     phones = []
     for index, number in enumerate(numbers):
         latitude, longitude = seat(arguments.lat, arguments.lon, arguments.spread_m)
         phones.append(Phone(number, session_ids[index % len(session_ids)],
-                            latitude, longitude))
+                            latitude, longitude, method_for(index)))
+    code_generator = manual_code.ManualCodeGenerator(
+        manual_code.derive_key(arguments.manual_secret or arguments.secret))
+    print(f'  methods: {dict(Counter(phone.method for phone in phones))}')
 
     login_failures = Counter()
     started = time.perf_counter()
@@ -371,10 +430,15 @@ def main():
     statuses = Counter()
     server_ms = []
     retry_after = []
+    by_method = {method: {'client': [], 'server': [], 'outcomes': Counter()}
+                 for method in ('qr', 'manual')}
     gate = gevent.event.Event()
 
     def do_scan(phone):
         gate.wait()
+        if arguments.arrival_seconds > 0:
+            # Evenly spaced arrivals across the window, in roster order.
+            gevent.sleep(arrival_offsets[phone.number])
         # Concurrency, when capped, is capped AFTER the gate. Capping it by
         # sizing the spawn pool instead would block the main greenlet inside
         # the spawn loop and it would never reach gate.set().
@@ -387,27 +451,47 @@ def main():
                 throttle.release()
 
     def _run_scan(phone):
-        body = phone.scan_body(arguments.secret, (8, 35), (200, 8000), (150, 2500))
-        # All phones scan the same projected token, including phones delayed
-        # by a concurrency cap. Never mint a fresher QR to conceal queueing.
-        body['qr_data'] = burst_tokens[phone.session_id]
-        body['captured_at'] = burst_captured_at
+        if phone.method == 'manual':
+            # In a simultaneous burst every phone types the code projected at
+            # the gate, including phones delayed by a concurrency cap — never
+            # a fresher one. Spread over a lecture, a student types whatever
+            # the projector shows when they get to it.
+            code = (code_generator.window(phone.session_id, time.time()).code
+                    if arguments.arrival_seconds > 0 else burst_codes[phone.session_id])
+            body = phone.manual_body(code, (8, 35), (200, 8000))
+            path = '/api/attendance/manual'
+        else:
+            body = phone.scan_body(arguments.secret, (8, 35), (200, 8000), (150, 2500))
+            # In a simultaneous burst all phones scan the same projected
+            # token, including phones delayed by a concurrency cap: never
+            # mint a fresher QR to conceal queueing. Spread over a lecture,
+            # each phone reads whatever the projector shows when it arrives.
+            if arguments.arrival_seconds > 0:
+                body['qr_data'] = make_token(arguments.secret, phone.session_id)
+                body['captured_at'] = time.time() * 1000
+            else:
+                body['qr_data'] = burst_tokens[phone.session_id]
+                body['captured_at'] = burst_captured_at
+            path = '/mark_attendance'
+        stats = by_method[phone.method]
         request_started = time.perf_counter()
         try:
             # requests' timeout alone is a socket inactivity timeout, not
             # the browser's total AbortController deadline.
             with gevent.Timeout(20):
                 response = phone.session.post(
-                    f'{host}/mark_attendance', json=body,
+                    f'{host}{path}', json=body,
                     headers=proxy_headers | {
                         'X-CSRFToken': phone.csrf,
                         'Referer': f'{Phone.origin(host, proxy_headers)}/scan_page'},
                     timeout=20, verify=verify, allow_redirects=False)
         except (requests.RequestException, gevent.Timeout) as error:
             outcomes[f'transport:{type(error).__name__}'] += 1
+            stats['outcomes'][f'transport:{type(error).__name__}'] += 1
             statuses['transport_error'] += 1
             return
         latencies.append((time.perf_counter() - request_started) * 1000)
+        stats['client'].append(latencies[-1])
         statuses[response.status_code] += 1
         # Server-Timing carries the per-stage numbers the app measured for
         # THIS request, which is how client-observed queueing is told apart
@@ -417,12 +501,15 @@ def main():
                     re.findall(r';dur=([0-9.]+)', timing)) if timing else 0.0
         if total:
             server_ms.append(total)
+            stats['server'].append(total)
         if response.headers.get('Retry-After'):
             retry_after.append(response.headers['Retry-After'])
         try:
-            outcomes[response.json().get('outcome', 'no_outcome')] += 1
+            outcome = response.json().get('outcome', 'no_outcome')
         except ValueError:
-            outcomes[f'non_json_{response.status_code}'] += 1
+            outcome = f'non_json_{response.status_code}'
+        outcomes[outcome] += 1
+        stats['outcomes'][outcome] += 1
 
     # ---- optional: a login stampede running THROUGH the burst -------------
     noise_stop = gevent.event.Event()
@@ -494,14 +581,45 @@ def main():
 
     throttle = (gevent.lock.BoundedSemaphore(arguments.burst_concurrency)
                 if arguments.burst_concurrency else None)
+    arrival_offsets = {phone.number: index * arguments.arrival_seconds / max(1, len(ready))
+                       for index, phone in enumerate(ready)}
     greenlets = [gevent.spawn(do_scan, phone) for phone in ready]
     gevent.sleep(0.2)                     # let every greenlet reach the gate
+    if any(phone.method == 'manual' for phone in ready):
+        # Release the class on a fresh code, as a lecturer's projector would
+        # show it: a rotation mid-burst would turn a capacity run into a
+        # measurement of how many students typed during the grace period.
+        left = code_generator.window(session_ids[0], time.time()).expires_in(time.time())
+        if left < 30:
+            print(f'  waiting {left + 1:.0f}s for a fresh attendance code')
+            gevent.sleep(left + 1)
+    burst_codes = {sid: code_generator.window(sid, time.time()).code for sid in session_ids}
     burst_tokens = {sid: make_token(arguments.secret, sid) for sid in session_ids}
+    sampler = None
+    if arguments.resource_out:
+        import signal
+        import subprocess
+        sampler = subprocess.Popen([
+            sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                         'resource_sampler.py'),
+            '--out', arguments.resource_out,
+            '--database-url', arguments.database_url,
+            '--redis-url', arguments.redis_url])
+        gevent.sleep(0.5)                 # its baseline, before the gate opens
     burst_captured_at = time.time() * 1000
     burst_started = time.perf_counter()
     gate.set()                            # release the whole class at once
     gevent.joinall(greenlets, raise_error=True)
     burst_wall = time.perf_counter() - burst_started
+    resources = None
+    if sampler is not None:
+        sampler.send_signal(signal.SIGINT)
+        sampler.wait(timeout=30)
+        try:
+            with open(arguments.resource_out, encoding='utf-8') as handle:
+                resources = json.load(handle)
+        except (OSError, ValueError):
+            resources = None
     noise_stop.set()
     gevent.joinall(noise, timeout=30)
     gevent.joinall(watchers, timeout=30)
@@ -530,11 +648,23 @@ def main():
         summarise('  competing login', noise_logins)
         if noise_shed:
             print(f'  login outcomes while shedding: {dict(noise_shed)}')
+    for method, stats in by_method.items():
+        if stats['client']:
+            print(f'  -- {method} ({len(stats["client"])} requests)')
+            summarise(f'  {method} (client)', stats['client'])
+            summarise(f'  {method} (server stages)', stats['server'])
+            print(f'     outcomes {dict(stats["outcomes"].most_common())}')
     print(f'  statuses  {dict(sorted(statuses.items(), key=lambda kv: str(kv[0])))}')
     print(f'  outcomes  {dict(outcomes.most_common())}')
     if retry_after:
         print(f'  Retry-After seen on {len(retry_after)} responses '
               f'(values: {sorted(set(retry_after))})')
+    if resources:
+        print(f'  server resources over {resources["window_s"]}s: '
+              f'cpu_s={resources["cpu_seconds"]} peak_cores={resources["peak_cores_busy"]} '
+              f'peak_rss_mb={resources["peak_rss_mb"]} db={resources["db_connections"]}')
+        for command, cost in list(resources.get('redis_commands', {}).items())[:6]:
+            print(f'    redis {command:<10} calls={cost["calls"]:<6} usec/call={cost["usec_per_call"]}')
 
     # ---------------- Phase 3: what actually landed in the database --------
     verified = {}
@@ -554,6 +684,9 @@ def main():
         errors.append('projector_not_measured')
     if arguments.burst_concurrency and arguments.burst_concurrency < arguments.students:
         errors.append('not_a_simultaneous_full_cohort_burst')
+    if arguments.arrival_seconds > 0:
+        print(f'  (arrivals spread over {arguments.arrival_seconds:.0f}s: a realistic '
+              f'lecture, not the simultaneous-burst acceptance test)')
     print(f'\nAcceptance: {"FAIL: " + ", ".join(errors) if errors else "PASS"}')
 
     if arguments.json_out:
@@ -580,6 +713,17 @@ def main():
                 'passed': not errors,
                 'acceptance_errors': errors,
                 'projector_failures': dict(feed_failures),
+                'mode': arguments.mode,
+                'resources': resources,
+                'by_method': {
+                    method: {
+                        'requests': len(stats['client']),
+                        'client_ms': {stat: percentile(sorted(stats['client']), ratio)
+                                      for stat, ratio in (('p50', .50), ('p95', .95), ('p99', .99))},
+                        'server_stage_ms': {stat: percentile(sorted(stats['server']), ratio)
+                                            for stat, ratio in (('p50', .50), ('p95', .95), ('p99', .99))},
+                        'outcomes': dict(stats['outcomes']),
+                    } for method, stats in by_method.items() if stats['client']},
             }, handle, indent=2)
         print(f'\nwrote {arguments.json_out}')
 

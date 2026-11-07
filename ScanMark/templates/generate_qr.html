@@ -18,10 +18,31 @@
              from the back of a large hall the inline size is a few camera
              pixels per module, too few for any phone to decode. -->
         <div class="my-3">
-            <div id="qrStage" class="qr-stage" title="Show the code full screen">
+            <div id="qrStage" class="qr-stage{{ ' has-manual-code' if manual_code }}">
                 <img id="qrImage" class="qr-image" src="{{ url_for('get_qr_image', session_id=session.id) }}"
-                    alt="QR Code">
-                <p class="qr-stage-hint">Click or press Esc to return</p>
+                    alt="QR code for {{ course.code }} attendance" title="Show the codes full screen">
+                {# The fallback for students whose camera cannot read the QR.
+                   It sits INSIDE the stage on purpose: full screen enlarges
+                   the stage, so the code is projected with the QR instead of
+                   disappearing exactly when the room needs it most. #}
+                {% if manual_code %}
+                <section id="manualCode" class="manual-code" aria-labelledby="manualCodeHeading"
+                    data-url="{{ url_for('get_manual_code', session_id=session.id) }}"
+                    data-expires-in-ms="{{ manual_code.expires_in_ms }}"
+                    data-rotation-seconds="{{ manual_code.rotation_seconds }}">
+                    <h2 id="manualCodeHeading" class="visually-hidden">Attendance code</h2>
+                    <p class="manual-code-value" id="manualCodeValue" aria-live="polite" aria-atomic="true">
+                        <span class="visually-hidden" id="manualCodeSpoken">Attendance code {{ manual_code.code | join(' ') }}</span>
+                        <span class="manual-code-digits" id="manualCodeDigits" aria-hidden="true"><span>{{ manual_code.code[:4] }}</span><span>{{ manual_code.code[4:] }}</span></span>
+                    </p>
+                    <p class="manual-code-instruction">Can't scan the QR? Enter this code in ScanMark.</p>
+                    <div class="manual-code-meter" aria-hidden="true"><div id="manualCodeBar"></div></div>
+                    <p class="manual-code-status" id="manualCodeStatus" role="timer" aria-live="off">
+                        New code in <span id="manualCodeSeconds">{{ (manual_code.expires_in_ms / 1000) | round(0, 'ceil') | int }}</span>s
+                    </p>
+                </section>
+                {% endif %}
+                <p class="qr-stage-hint">Click the QR or press Esc to return</p>
             </div>
             <button type="button" id="qrFullscreenBtn" class="btn btn-outline-success btn-sm mt-2">
                 <i class="fas fa-expand"></i> Full screen for large rooms
@@ -30,7 +51,7 @@
 
         <!-- FIX #1: Removed stray </button> tag. Clean timer display -->
         <p class="text-muted mb-4">
-            Code refreshes in <span id="timer" class="fw-bold text-danger">{{ qr_token_ttl }}</span>s
+            QR code refreshes in <span id="timer" class="fw-bold text-danger">{{ qr_token_ttl }}</span>s
         </p>
 
         {# Where the geofence is centred. A saved room is the authoritative
@@ -94,7 +115,7 @@
              used to be a GET form pointing at the dashboard, so the class
              stayed open and its code stayed valid after the lecturer left. -->
         <form action="{{ url_for('end_session', session_id=session.id) }}" method="POST"
-            onsubmit="return confirm('End “{{ session.title }}”? Its QR code stops working immediately and no further student can scan in.')">
+            onsubmit="return confirm('End “{{ session.title }}”? Its QR code and attendance code stop working immediately and no further student can mark attendance.')">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <button type="submit" class="btn btn-danger btn-lg mt-3 w-100">
                 🛑 End Class &amp; Close Attendance
@@ -150,6 +171,156 @@
         margin: 0.5rem 0 0;
         color: #6c757d;
     }
+
+    /* ---- The manual attendance code --------------------------------
+       Black on white whatever the page theme: it is read off a projector
+       from the back of a hall, where contrast is everything. */
+    .manual-code {
+        margin: 1rem auto 0;
+        padding: 0.75rem 1rem 0.5rem;
+        background: #fff;
+        color: #000;
+        border: 3px solid #000;
+        border-radius: 12px;
+        max-width: 26rem;
+    }
+
+    .manual-code-value {
+        margin: 0;
+        line-height: 1.05;
+    }
+
+    .manual-code-digits {
+        display: inline-flex;
+        gap: 0.45em;
+        font-family: ui-monospace, "Cascadia Mono", Consolas, "DejaVu Sans Mono", "Liberation Mono", monospace;
+        font-weight: 800;
+        font-size: clamp(2.4rem, 11vw, 3.6rem);
+        letter-spacing: 0.06em;
+        font-variant-numeric: tabular-nums lining-nums;
+    }
+
+    .manual-code-instruction {
+        margin: 0.25rem 0 0.4rem;
+        font-weight: 600;
+        font-size: 1rem;
+    }
+
+    .manual-code-meter {
+        height: 6px;
+        background: #e9ecef;
+        border-radius: 3px;
+        overflow: hidden;
+    }
+
+    .manual-code-meter > div {
+        height: 100%;
+        width: 100%;
+        background: #198754;
+        transform-origin: left center;
+    }
+
+    .manual-code-status {
+        margin: 0.35rem 0 0;
+        font-size: 0.95rem;
+        color: #333;
+    }
+
+    /* Never show a code as valid once its time is up: grey it out until the
+       new one arrives, and blank it if the server cannot be reached. */
+    .manual-code.is-stale .manual-code-digits {
+        opacity: 0.2;
+    }
+
+    .manual-code.is-offline .manual-code-digits,
+    .manual-code.is-ended .manual-code-digits {
+        visibility: hidden;
+    }
+
+    .manual-code.is-offline,
+    .manual-code.is-ended {
+        border-color: #b02a37;
+    }
+
+    .manual-code.is-offline .manual-code-status,
+    .manual-code.is-ended .manual-code-status {
+        color: #b02a37;
+        font-weight: 700;
+    }
+
+    .manual-code.is-ended .manual-code-instruction,
+    .manual-code.is-ended .manual-code-meter {
+        display: none;
+    }
+
+    /* Full screen: QR and code side by side on a landscape projector,
+       stacked on a portrait screen, both as large as the space allows. */
+    .qr-stage.is-full.has-manual-code {
+        flex-direction: row;
+        gap: 3vw;
+        padding: 2vh 3vw;
+    }
+
+    .qr-stage.is-full.has-manual-code .qr-image {
+        width: min(56vw, 90vh);
+    }
+
+    .qr-stage.is-full .manual-code {
+        margin: 0;
+        max-width: none;
+        border-width: 0.5vh;
+        padding: 2vh 2vw 1.5vh;
+    }
+
+    /* Eight digits plus the gap are about 5.7em wide; this keeps them on
+       one line beside the QR from a 4:3 projector up to 16:9. */
+    .qr-stage.is-full .manual-code-digits {
+        font-size: min(5.8vw, 14vh);
+    }
+
+    .qr-stage.is-full .manual-code-instruction {
+        font-size: min(2.1vw, 4.2vh);
+    }
+
+    .qr-stage.is-full .manual-code-status {
+        font-size: min(1.8vw, 3.6vh);
+    }
+
+    .qr-stage.is-full .manual-code-meter {
+        height: 1vh;
+    }
+
+    .qr-stage.is-full.has-manual-code .qr-stage-hint {
+        position: absolute;
+        bottom: 1vh;
+        left: 0;
+        right: 0;
+    }
+
+    @media (orientation: portrait) {
+        .qr-stage.is-full.has-manual-code {
+            flex-direction: column;
+        }
+
+        .qr-stage.is-full.has-manual-code .qr-image {
+            width: min(90vw, 56vh);
+        }
+
+        .qr-stage.is-full .manual-code-digits {
+            font-size: min(13vw, 9vh);
+        }
+
+        .qr-stage.is-full .manual-code-instruction,
+        .qr-stage.is-full .manual-code-status {
+            font-size: min(4.5vw, 2.6vh);
+        }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+        .manual-code-meter > div {
+            transition: none !important;
+        }
+    }
 </style>
 <script>
     // --- 1. QR CODE AUTO-REFRESH ---
@@ -169,6 +340,10 @@
     qrImage.addEventListener('error', () => {
         showFullScreen(false);
         if (qrTimer) clearInterval(qrTimer);
+        // Do not assume: an image can fail for a network blip too. The code
+        // endpoint answers 409 only if the class really has ended, and the
+        // panel ends itself on that; otherwise the code keeps working.
+        if (window.scanmarkManualCode) window.scanmarkManualCode.refresh();
         timerEl.innerText = '—';
         qrImage.alt = 'This class has ended.';
         const alertEl = document.getElementById('locationAlert');
@@ -207,7 +382,14 @@
         } catch (_) { }
     }
 
-    qrStage.addEventListener('click', () => showFullScreen(!qrStage.classList.contains('is-full')));
+    // The QR image toggles full screen; so does a click anywhere once it is
+    // full. A click on the code panel in the normal layout does nothing, so
+    // a lecturer pointing at the code does not throw the page into full
+    // screen.
+    qrStage.addEventListener('click', event => {
+        const full = qrStage.classList.contains('is-full');
+        if (full || event.target === qrImage) showFullScreen(!full);
+    });
     document.getElementById('qrFullscreenBtn').addEventListener('click', () => showFullScreen(true));
     document.addEventListener('keydown', event => {
         if (event.key === 'Escape') showFullScreen(false);
@@ -217,6 +399,180 @@
     document.addEventListener('fullscreenchange', () => {
         if (!document.fullscreenElement) qrStage.classList.remove('is-full');
     });
+
+
+    // --- 1c. MANUAL ATTENDANCE CODE ---
+    // Rotates on the SERVER's clock. The page is told how many milliseconds
+    // the code on screen has left and counts that down on its own monotonic
+    // timer — never this machine's wall clock, which on a projector laptop
+    // can be minutes out. It asks for the next code just after the server
+    // rotates, re-syncs whenever the tab comes back from the background, and
+    // never shows a code as current once its time is up.
+    (function () {
+        const panel = document.getElementById('manualCode');
+        if (!panel) return;
+        const url = panel.dataset.url;
+        const digitsEl = document.getElementById('manualCodeDigits');
+        const spokenEl = document.getElementById('manualCodeSpoken');
+        const statusEl = document.getElementById('manualCodeStatus');
+        const barEl = document.getElementById('manualCodeBar');
+        // Ask a little after the rotation, so an instance whose clock is a
+        // touch behind still hands over the new code, not the old one again.
+        const FETCH_AFTER_ROTATION_MS = 400;
+        const REQUEST_TIMEOUT_MS = 8000;
+        // However the timers and responses line up — a throttled tab, a
+        // response slower than the code's remaining life — never more than
+        // one request a second. Normally it is one a minute.
+        const MIN_REFRESH_GAP_MS = 1000;
+        let lastRequestAt = -Infinity;
+
+        let rotationMs = Number(panel.dataset.rotationSeconds) * 1000 || 60000;
+        let expiresAt = 0;          // performance.now() time the shown code expires
+        let currentCode = null;
+        let fetchTimer = null;
+        let inFlight = false;
+        let failures = 0;
+        let stopped = false;
+
+        // The server rendered the first code into the page. Its countdown
+        // started when the response did, which is as close as the page can
+        // get to the server's own moment.
+        const navigation = (performance.getEntriesByType &&
+            performance.getEntriesByType('navigation')[0]) || null;
+        const renderedAt = navigation && navigation.responseStart > 0
+            ? navigation.responseStart : performance.now();
+        expiresAt = renderedAt + Number(panel.dataset.expiresInMs || 0);
+        currentCode = digitsEl.textContent.replace(/\D/g, '');
+
+        function setState(state, message) {
+            panel.classList.toggle('is-stale', state === 'stale');
+            panel.classList.toggle('is-offline', state === 'offline');
+            panel.classList.toggle('is-ended', state === 'ended');
+            if (message !== undefined) statusEl.textContent = message;
+        }
+
+        function showCode(code) {
+            if (code === currentCode) return;
+            currentCode = code;
+            const first = document.createElement('span');
+            first.textContent = code.slice(0, 4);
+            const second = document.createElement('span');
+            second.textContent = code.slice(4);
+            digitsEl.replaceChildren(first, second);
+            // Digit by digit, so a screen reader reads "4 8 2 6" rather than
+            // "four thousand eight hundred and twenty-six".
+            spokenEl.textContent = `Attendance code ${code.split('').join(' ')}`;
+        }
+
+        function schedule(delayMs) {
+            clearTimeout(fetchTimer);
+            if (stopped) return;
+            fetchTimer = setTimeout(refresh, Math.max(0, delayMs));
+        }
+
+        function tick() {
+            if (stopped) return;
+            const left = expiresAt - performance.now();
+            if (left > 0) {
+                if (!panel.classList.contains('is-offline')) {
+                    setState('live', `New code in ${Math.ceil(left / 1000)}s`);
+                }
+                barEl.style.transform = `scaleX(${Math.min(1, left / rotationMs)})`;
+                return;
+            }
+            barEl.style.transform = 'scaleX(0)';
+            if (!panel.classList.contains('is-offline')) {
+                setState('stale', 'Getting the new code…');
+            }
+            // A timer a background tab throttled, or a refresh that never
+            // came back: do not wait for it.
+            if (!inFlight && left < -FETCH_AFTER_ROTATION_MS - 1500) refresh();
+        }
+
+        async function refresh() {
+            if (stopped || inFlight) return;
+            clearTimeout(fetchTimer);
+            const gap = performance.now() - lastRequestAt;
+            if (gap < MIN_REFRESH_GAP_MS) {
+                schedule(MIN_REFRESH_GAP_MS - gap);
+                return;
+            }
+            lastRequestAt = performance.now();
+            inFlight = true;
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+            const sentAt = performance.now();
+            try {
+                const response = await fetch(url, {
+                    headers: { Accept: 'application/json' },
+                    cache: 'no-store',
+                    credentials: 'same-origin',
+                    signal: controller.signal,
+                });
+                const receivedAt = performance.now();
+                if (response.status === 409) { end(); return; }
+                if (response.status === 403 || response.status === 404) {
+                    // Signed out, no longer authorised, or codes switched
+                    // off: stop showing a code that may not be valid.
+                    stop('Attendance codes are not available on this screen. Reload the page.');
+                    return;
+                }
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const data = await response.json();
+                if (!/^\d{8}$/.test(String(data.code || ''))) throw new Error('bad payload');
+                failures = 0;
+                rotationMs = (Number(data.rotation_seconds) || rotationMs / 1000) * 1000;
+                // The server's moment is somewhere inside the round trip; the
+                // middle is the best estimate.
+                expiresAt = (sentAt + receivedAt) / 2 + Number(data.expires_in_ms);
+                showCode(String(data.code));
+                setState('live');
+                tick();
+                schedule(expiresAt - performance.now() + FETCH_AFTER_ROTATION_MS);
+            } catch (_) {
+                failures += 1;
+                // Keep a still-valid code on screen through a blip; once its
+                // time is up, a code that cannot be confirmed is not shown.
+                if (performance.now() >= expiresAt) {
+                    setState('offline', 'Cannot reach ScanMark. Reconnecting… (students can still scan the QR once it reloads)');
+                }
+                schedule(Math.min(15000, 1000 * 2 ** Math.min(failures, 4)));
+            } finally {
+                clearTimeout(timeout);
+                inFlight = false;
+            }
+        }
+
+        function stop(message) {
+            stopped = true;
+            clearTimeout(fetchTimer);
+            clearInterval(tickTimer);
+            setState('offline', message);
+        }
+
+        function end() {
+            stopped = true;
+            clearTimeout(fetchTimer);
+            clearInterval(tickTimer);
+            setState('ended', 'This class has ended. The code no longer works.');
+        }
+
+        // One interval for the life of the page, one pending fetch at a
+        // time: nothing here accumulates however long the lecture runs.
+        const tickTimer = setInterval(tick, 250);
+        tick();
+        schedule(expiresAt - performance.now() + FETCH_AFTER_ROTATION_MS);
+
+        // A suspended or backgrounded tab misses its timers. Coming back is
+        // the moment to re-sync, not to keep showing whatever was last drawn.
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible') refresh();
+        });
+        window.addEventListener('pageshow', event => { if (event.persisted) refresh(); });
+        window.addEventListener('online', () => refresh());
+
+        window.scanmarkManualCode = { end, refresh };
+    })();
 
 
     // --- 2. GPS LOCATION SETTER ---

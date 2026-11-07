@@ -81,7 +81,8 @@
                                 <th>Full Name</th>
                                 <th>Matric No</th>
                                 <th>Level</th>
-                                <th>Time Scanned</th>
+                                <th>Time Marked</th>
+                                <th>Method</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -96,11 +97,12 @@
                                 <td>{{ record.matric_no or 'N/A' }}</td>
                                 <td>{{ record.level ~ 'L' if record.level else 'N/A' }}</td>
                                 <td>{{ record.timestamp | local_time }}</td>
+                                <td>{% if record.submission_method == 'manual_code' %}<span class="badge bg-warning text-dark" title="Typed the attendance code instead of scanning"><i class="fas fa-keyboard me-1" aria-hidden="true"></i>{{ record.submission_method | attendance_method }}</span>{% else %}<span class="badge bg-light text-dark border"><i class="fas fa-qrcode me-1" aria-hidden="true"></i>{{ record.submission_method | attendance_method }}</span>{% endif %}</td>
                             </tr>
                             {% else %}
                             <tr>
-                                <td colspan="5" class="text-center py-4">
-                                    <span class="text-muted">Nobody scanned for this class.</span>
+                                <td colspan="6" class="text-center py-4">
+                                    <span class="text-muted">Nobody marked attendance for this class.</span>
                                 </td>
                             </tr>
                             {% endfor %}

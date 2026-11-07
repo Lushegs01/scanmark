@@ -3174,13 +3174,21 @@ class TestScanPageLocationRules:
         and the server refuses it as stale.
         """
         scanner = open('static/scanner.js', encoding='utf-8').read()
+        # The fix logic is shared with the manual attendance code, in
+        # attendance-common.js; the scanner must actually use it, with the
+        # server's limits, and stop it when the camera goes.
+        location = open('static/attendance-common.js', encoding='utf-8').read()
+        assert 'shared.createLocator(' in scanner
+        assert 'maxLocationAgeMs: config.maxLocationAgeMs' in scanner
+        assert 'locator.stopWatching()' in scanner, \
+            'a live GPS watch must not outlive the camera'
 
-        assert 'requestPosition(0)' in scanner, \
+        assert 'requestPosition(0)' in location, \
             'nothing forces a fresh fix when the OS hands back an old one'
-        assert 'SERVER_MAX_AGE_MS' in scanner
+        assert 'SERVER_MAX_AGE_MS' in location
         # The watch is what keeps a recent fix in hand before the code is read.
-        assert 'watchPosition' in scanner
-        assert 'clearWatch' in scanner, 'a live GPS watch must not outlive the camera'
+        assert 'watchPosition' in location
+        assert 'clearWatch' in location, 'a live GPS watch must not outlive the camera'
 
     def test_a_location_problem_is_not_reported_as_a_network_problem(self):
         """It used to fall into the transient-retry path: "Network busy"."""

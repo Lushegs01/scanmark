@@ -321,6 +321,18 @@ class Attendance(db.Model):
                                 server_default='0')
     campos_next_attempt_at = db.Column(db.DateTime, nullable=True)
 
+    # How the student proved they were reading the projector: 'qr' (scanned
+    # the QR code) or 'manual_code' (typed the rotating eight-digit code
+    # because their camera could not read it). 'staff_verified' is reserved
+    # for a future lecturer-confirmed path and is never written today.
+    #
+    # Both methods produce the SAME official record under the SAME unique
+    # (student_id, session_id) rule below — this column says how, not
+    # whether. The code itself is never stored. Rows that predate the column
+    # were all QR scans, which is what the migration's DEFAULT gives them.
+    submission_method = db.Column(db.String(20), nullable=False, default='qr',
+                                  server_default='qr')
+
     __table_args__ = (
         # One scan per student per class session, enforced by the database so
         # concurrent duplicate requests can't both slip past the app-level

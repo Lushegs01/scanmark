@@ -93,6 +93,22 @@ Useful flags:
 | `--proxied-https` | the target is plain HTTP standing in for a deployment that terminates TLS at a load balancer. Keeps TLS CPU out of a measurement of the app without relaxing anything on the server. |
 | `--burst-concurrency 1` | the uncontended serial cost of one scan — the baseline every other number should be read against. |
 
+| `--mode manual` | every phone types the eight-digit attendance code (`POST /api/attendance/manual`) instead of scanning. Codes are derived with the server's own algorithm (`manual_code.py`) from `--secret` (or `--manual-secret` when the server sets `MANUAL_CODE_SECRET`). |
+| `--mode mixed --manual-ratio 0.1` | a real hall: most phones scan, the ones whose cameras cannot type the code. Results are reported per method as well as in total. |
+| `--resource-out res.json --redis-url …` | server-side cost of the burst window only: CPU seconds and peak cores per process group (gunicorn, postgres, redis-server), peak RSS, peak total/active Postgres connections from `pg_stat_activity`, and Redis per-command cost from `INFO commandstats`. Runs `resource_sampler.py` as a separate process; the server must be on the same host. |
+
+A manual or mixed burst waits for a code window with at least 30 seconds
+left before releasing the class, so a rotation mid-burst is not mistaken for a
+capacity problem (a real student who misses the grace period is told to type
+the new code).
+
+To seed a disposable staging database for these runs:
+
+```bash
+python loadtest/seed_burst.py students --count 2000   # once; cheap test-only password hashes
+python loadtest/seed_burst.py session                  # before every run: a fresh session id
+```
+
 Use the Locust scenarios for sustained arrival-rate shapes, the login
 stampede on its own, and the duplicate race.
 

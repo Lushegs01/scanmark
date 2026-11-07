@@ -465,6 +465,14 @@
             const name = document.createElement('div');
             name.className = 'fw-bold';
             name.textContent = student.name;
+            if (student.method === 'manual_code') {
+                // Typed the projector's attendance code instead of scanning.
+                const how = document.createElement('span');
+                how.className = 'badge bg-warning text-dark ms-2';
+                how.title = 'Marked with the attendance code instead of the QR';
+                how.textContent = 'Code';
+                name.append(how);
+            }
             const meta = document.createElement('small');
             meta.className = 'text-muted';
             meta.textContent = `Matric: ${student.matric_no} | Level: ${student.level}`;

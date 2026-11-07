@@ -299,11 +299,15 @@ class TestScannerContract:
     """What the scanner promises about the network and the GPS."""
 
     scanner = staticmethod(lambda: _read('static/scanner.js'))
+    # Fix selection and GPS error wording are shared with the manual
+    # attendance code; the scanner delegates to this module.
+    location = staticmethod(lambda: _read('static/attendance-common.js'))
 
     def test_it_sends_the_most_precise_recent_fix_not_the_latest(self):
-        source = self.scanner()
+        source = self.location()
         assert 'function bestFix(' in source
         assert 'bestFix(newerThan)' in source
+        assert 'locator.acquire(newerThan' in self.scanner()
 
     def test_a_refused_fix_is_retried_with_a_newer_one(self):
         source = self.scanner()
@@ -311,9 +315,11 @@ class TestScannerContract:
         assert 'acquirePosition(refusedFixAt)' in source
 
     def test_a_timeout_is_not_reported_as_a_permission_problem(self):
-        source = self.scanner()
-        assert 'Allow GPS access and scan again' not in source
+        source = self.location()
+        assert 'Allow GPS access and scan again' not in source + self.scanner()
         assert 'error.code === 1' in source and 'error.code === 2' in source
+        # The scanner's messages still end "…then scan again".
+        assert "retryHint: 'scan again'" in self.scanner()
 
     def test_a_retry_carries_the_newest_code_the_camera_has_read(self):
         source = self.scanner()

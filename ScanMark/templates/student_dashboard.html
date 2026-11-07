@@ -39,15 +39,24 @@
     </div>
     {% endif %}
 
-    <!-- ===== QR SCAN CARD ===== -->
-    <div class="card mb-3">
+    <!-- ===== MARK ATTENDANCE: two ways in ===== -->
+    {# Two equal ways to mark attendance. The code needs no camera at all: it
+       is for a phone whose camera is broken, blocked, will not focus, or is
+       simply too far from the screen to read the QR. #}
+    <div class="section-label" id="mark-attendance-label">
+        <i class="fas fa-calendar-check me-1"></i> Mark Attendance
+    </div>
+    <div class="row g-3 mb-4" role="group" aria-labelledby="mark-attendance-label">
+    <div class="col-12 col-lg-6">
+    <div class="card h-100 attendance-method">
         <div class="card-body">
             <div class="d-flex align-items-start gap-3 mb-3">
                 <div class="stat-icon flex-shrink-0 m-0"
                     style="background: linear-gradient(135deg, var(--green), var(--green-mid)); color: white; font-size: 1.2rem;">
-                    <i class="fas fa-qrcode"></i>
+                    <i class="fas fa-qrcode" aria-hidden="true"></i>
                 </div>
                 <div>
+                    <span class="method-tag">Method 1</span>
                     <h5 class="mb-0 fw-bold" style="color: var(--text);">Scan QR Code</h5>
                     <p class="small mb-0" style="color: var(--text-muted);">Point your camera at the lecturer's QR code</p>
                 </div>
@@ -65,6 +74,55 @@
             <!-- Result Banner -->
             <div id="result-banner" class="alert mt-3 text-center fw-bold d-none" role="alert"></div>
         </div>
+    </div>
+    </div>
+
+    {% if manual_code_enabled %}
+    <div class="col-12 col-lg-6">
+    <div class="card h-100 attendance-method" id="attendance-code">
+        <div class="card-body">
+            <div class="d-flex align-items-start gap-3 mb-3">
+                <div class="stat-icon flex-shrink-0 m-0 manual-icon" aria-hidden="true">
+                    <i class="fas fa-keyboard"></i>
+                </div>
+                <div>
+                    <span class="method-tag">Method 2</span>
+                    <h5 class="mb-0 fw-bold" style="color: var(--text);" id="manualCodeTitle">Enter Attendance Code</h5>
+                    <p class="small mb-0" style="color: var(--text-muted);" id="manualCodeIntro">
+                        Can't scan? Type the 8-digit code shown under the QR on the screen.
+                        No camera needed.
+                    </p>
+                </div>
+            </div>
+
+            <form id="manualCodeForm" class="manual-form" novalidate aria-labelledby="manualCodeTitle">
+                {# Which class the code is for. Filled in when the student
+                   starts typing: nothing to choose when exactly one of their
+                   classes is open, a choice when several are. #}
+                <div id="manualSession" class="manual-session" aria-live="polite"></div>
+
+                <label for="manualCodeInput" class="form-label fw-semibold mb-1">Attendance code</label>
+                <input id="manualCodeInput" name="code" type="text" class="form-control manual-code-input"
+                    inputmode="numeric" autocomplete="one-time-code" enterkeyhint="go"
+                    autocapitalize="off" autocorrect="off" spellcheck="false"
+                    placeholder="0000 0000" aria-describedby="manualCodeHelp manualCodeFeedback"
+                    data-lpignore="true">
+                <div id="manualCodeHelp" class="form-text">
+                    8 digits. The code changes every minute. Your location is checked, just like when scanning.
+                </div>
+
+                <button type="submit" class="btn btn-scan mt-3" id="manualCodeSubmit">
+                    <span class="spinner-border spinner-border-sm d-none" aria-hidden="true" data-spinner></span>
+                    <span data-label>Submit Code</span>
+                </button>
+
+                <div id="manualCodeFeedback" class="manual-feedback d-none" role="status" aria-live="polite" aria-atomic="true"></div>
+                <noscript><p class="small text-danger mt-2">Turn on JavaScript to mark attendance with a code.</p></noscript>
+            </form>
+        </div>
+    </div>
+    </div>
+    {% endif %}
     </div>
 
     <!-- ===== REGISTER FOR COURSE ===== -->
@@ -162,4 +220,18 @@
 </div>
 
 {% include '_scanner.html' %}
+{% if manual_code_enabled %}
+<script>
+    window.SCANMARK_MANUAL_CONFIG = {
+        endpoint: "{{ url_for('submit_manual_attendance') }}",
+        sessionsUrl: "{{ url_for('manual_attendance_sessions') }}",
+        csrfToken: "{{ csrf_token() }}",
+        userMarker: "{{ current_user.id }}",
+        // The server's own limits, as for the scanner.
+        maxLocationAgeMs: {{ scanner_config.max_location_age_ms }},
+        maxLocationAccuracyM: {{ scanner_config.max_location_accuracy_m }}
+    };
+</script>
+<script src="{{ static_url('manual-code.js') }}" defer></script>
+{% endif %}
 {% endblock %}

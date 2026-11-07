@@ -14,7 +14,9 @@ const PAGE_CACHE = 'scanmark-pages-v1';
 // background after the first visit. Pages ask for these with ?v=<hash>.
 const PRECACHE_VERSIONED = [
     '/static/style.css',
+    '/static/attendance-common.js',
     '/static/scanner.js',
+    '/static/manual-code.js',
     '/static/vendor/jsQR.min.js',
     '/static/vendor/bootstrap/bootstrap.min.css',
     '/static/vendor/bootstrap/bootstrap.bundle.min.js',
@@ -72,6 +74,11 @@ self.addEventListener('fetch', event => {
         event.respondWith(handleAttendanceRequest(event));
         return;
     }
+    // POST /api/attendance/manual is deliberately NOT queued here. A typed
+    // code lives about a minute, so an offline replay could only be refused
+    // later — after the page had implied it might still count. It goes
+    // straight to the network (below: non-GETs pass through), and the page
+    // says plainly that nothing was recorded if it cannot get there.
     if (url.pathname === '/logout' && request.method === 'POST') {
         // Never show the next person on this phone the last one's page.
         event.waitUntil(caches.delete(PAGE_CACHE));

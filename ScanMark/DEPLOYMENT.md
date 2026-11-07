@@ -348,7 +348,144 @@ quietly at every phone.
 | `CAMPOS_WORKERS` / `CAMPOS_QUEUE_SIZE` | 4 / 2000 | Separate bounded CampOS delivery path. |
 | `SCAN_LOG_SAMPLE_RATE` | 0.02 | Fraction of *successful* scans that get a timing line. Every non-success outcome is always logged. Keeps a 2,000-scan class to ~40 lines rather than 2,000. |
 | `QR_TOKEN_TTL` | 12 | Seconds a token is cached and displayed before the projector rotates to a new one. The countdown on the QR screen reads this value. |
+| `MANUAL_CODE_ENABLED` | true | The eight-digit attendance code beside the QR, for students whose camera cannot read it. `false` hides it on the projector, removes the student's "Enter Attendance Code" card and refuses `POST /api/attendance/manual`; QR scanning is unaffected either way. See "Manual attendance codes" below. |
+| `MANUAL_CODE_SECRET` | — (derived from `SECRET_KEY`) | Optional dedicated secret for the codes. Unset, the code key is HMAC-derived from `SECRET_KEY` under its own label, so it is never the key QR tokens are signed with. Set it (≥32 chars in production) to rotate codes independently of sessions. Changing either secret changes every live code at once — projectors pick the new one up within a minute. |
+| `MANUAL_CODE_ROTATION_SECONDS` | 60 | Life of one code (30–600). Every class rotates on the same server-clock boundaries. |
+| `MANUAL_CODE_GRACE_SECONDS` | 5 | The first seconds after a rotation during which the code that was just on screen is still accepted (0–15). Never the whole previous window. |
+| `MANUAL_CODE_CLOCK_SKEW_SECONDS` | 2 | How early the NEXT code is accepted, for an instance whose clock runs slightly ahead of the one that served the projector (0–5). Keep your instances NTP-synchronised; this is not a substitute. |
+| `MANUAL_CODE_MAX_FAILURES_PER_SESSION` / `MANUAL_CODE_SESSION_LOCKOUT_SECONDS` / `MANUAL_CODE_SESSION_WINDOW_SECONDS` | 5 / 120 / 600 | Wrong codes one student may type for one class (within the window) before code entry for that class is locked for the lockout. Counted per **account**, never per IP. Correct-but-refused codes (outside the geofence, class ended, busy) do not count; neither do expired or malformed ones. |
+| `MANUAL_CODE_MAX_FAILURES_PER_ACCOUNT` / `MANUAL_CODE_ACCOUNT_WINDOW_SECONDS` | 20 / 3600 | Wrong codes one account may type across ALL classes per window; reaching it locks code entry until the window ends. This is what stops guessing by switching classes. |
+| `MANUAL_CODE_REQUEST_RATE_LIMIT` | `20 per minute` | Per-student request ceiling on the code endpoint (Flask-Limiter; fails open like every route limit). Wrong-code limits above are separate and fail **closed**. |
+| `SESSION_CLOSE_LOCK_TIMEOUT_MS` | 10000 | Longest End Class waits for attendance inserts already in flight (100–60000). Past it the lecturer is asked to press End Class again; nothing is closed or lost. |
 | `QR_CODE_WINDOW` | 45 | How stale a scanned token may be when the request is **processed**, not when it was scanned. It must stay comfortably above your p99 scan latency or legitimate queued scans bounce as "expired" and their phones retry, amplifying the burst. It is also the outer bound on the replay window for a photographed code, narrowed in practice by three other checks: the session must still be open (ending a class kills every token for it at once), the client's reported capture time must fall within `QR_CAPTURE_WINDOW` of the token, and the geofence must be satisfied. The service worker reads this value from the server so the offline queue can never promise to redeem a token the server will refuse. |
+
+## Manual attendance codes (the can't-scan fallback)
+
+Some students cannot read the projected QR: a cracked or unfocusable camera,
+no usable decoder, a seat too far from the screen, a browser that refuses the
+camera. The projector therefore shows an eight-digit code beside the QR
+(`4826 9137`, "Can't scan the QR? Enter this code in ScanMark."), rotating
+every minute, and the student dashboard offers **Method 2: Enter Attendance
+Code** next to **Method 1: Scan QR Code**. The code path never touches the
+camera.
+
+### It is the same attendance, not a second system
+
+`POST /api/attendance/manual` and `/mark_attendance` differ only in how the
+student proves they can read the projector right now. Everything after that is
+one shared pipeline in `app.py` (`_attendance_target`, `_refuse_unless_open`,
+`_refuse_unless_enrolled`, `_admit_or_refuse`, `_enforce_classroom_geofence`,
+`_record_attendance` → `_insert_attendance_once`): the same enrolment rule
+(which is also the institution boundary), the same session/archive rules, the
+same geofence and accuracy/freshness limits, the same admission control, the
+same atomic insert under the same `(student_id, session_id)` unique index, and
+the same CampOS outbox row and payload. A student marked by QR cannot be
+marked again by code, or vice versa — the database refuses the second row
+whichever arrives first, and the student is told "already marked present"
+with the method and time of the first. `attendance.submission_method`
+(`qr` / `manual_code`; `staff_verified` reserved) records how; lecturers see
+it on the session sheet, the course page, the live window and the per-session
+CSV (a new last column, "Method"). The semester register is unchanged.
+
+### How codes are made and checked
+
+`manual_code.py` documents it in full. In short: `code = HMAC-SHA256(key,
+session id ‖ 60-second step)` truncated to 8 digits, where `key` is derived
+from `SECRET_KEY` (or `MANUAL_CODE_SECRET`) under its own label. Nothing is
+stored — every worker on every instance computes the same code, so there is no
+per-class Redis key, no database write per rotation and no state to drift.
+Adjacent windows are guaranteed different by construction. The server accepts
+the current code; the previous one only during the first
+`MANUAL_CODE_GRACE_SECONDS` after a rotation; the next one only within
+`MANUAL_CODE_CLOCK_SKEW_SECONDS` of it. Server time is the only clock: the
+projector counts down the server's own `expires_in_ms` on a monotonic timer,
+re-syncs when its tab returns from the background, and blanks a code it can
+no longer confirm rather than showing it as current.
+
+Only the course's own teachers can read a code
+(`GET /api/session/<id>/manual_code`, same authorisation as `/api/qr_data`),
+and never once the class has ended.
+
+### Guessing
+
+10^8 codes is ample **online**, with the limits in the table above. Each
+submission atomically reserves an attempt in Redis (one Lua script) *before*
+its code is compared, and gives it back unless the code was wrong, so a script
+firing guesses in parallel gets exactly the per-class allowance and no more.
+Limits are per account, never per IP — a hall shares a few NAT addresses — so
+one student's typos never block another. At the defaults an account's chance of
+hitting a live code is about 4×10⁻⁷ per hour, and a hit still has to be
+enrolled and inside the geofence. Malformed input, an expired code, "already
+marked" and correct-but-refused submissions cost no attempt.
+
+**If Redis is unreachable, code entry fails closed** (`503
+verification_unavailable`, `Retry-After`): with no shared counter there would
+be no limit on guesses. QR scanning does not use this guard and keeps working,
+and the page tells the student to scan instead. Alert on
+`scanmark_manual_guard_unavailable_total`.
+
+### End Class versus a submission in flight
+
+The rule, for both methods: **an attendance is accepted if and only if its
+transaction commits before the End Class transaction does.** The insert checks
+"session open" inside the INSERT itself under a `FOR KEY SHARE` row lock; End
+Class takes `FOR UPDATE` on the same row, so it waits (milliseconds) for
+inserts already holding it, and any insert arriving after it re-evaluates
+against the closed row and writes nothing (`409 session_ended`). The previous
+plain `UPDATE` did not conflict with the insert's lock, so a scan could commit
+after the class had ended; that race is closed for QR too. `KEY SHARE` is
+the lock the attendance→class_session foreign key already took on every
+insert, so this adds no new contention between students.
+
+### What this does not prove
+
+A code can be read aloud, photographed or forwarded. Rotation bounds how long
+a forwarded code is useful (at most a minute plus the grace) and the
+classroom geofence — identical to the QR path, and required by default — is
+the presence check. Browser geolocation is self-reported: a determined
+student can fake coordinates for a code exactly as they can for a scan. The
+register is evidence that someone with this student's session read the
+projector and reported a location inside the room, not proof of a body in a
+seat. The "Method" column exists so a lecturer can see when code entries are
+unusually common.
+
+### Failure behaviour, by scenario
+
+| Scenario | Behaviour |
+|---|---|
+| Code typed one second before it changes | Accepted: the previous code is valid for the first 5 s of the next window. |
+| Submitted just after rotation with the new code | Accepted as current. A code older than the grace returns `code_expired` ("enter the new code"), which does not count as a guess. |
+| Lecturer ends the class while a student submits | The rule above: committed before End Class → recorded; otherwise `409 session_ended`, nothing written. |
+| QR and code submitted at the same moment | One row (unique index). The other gets `409 duplicate` with the first one's method and time. |
+| Redis down | Codes refused with `503 verification_unavailable`; QR continues (sessions fall back to signed cookies as before). |
+| Postgres saturated | `503 database_saturated` + `Retry-After`; the page retries a bounded number of times, then says "not recorded yet". Nothing is queued for later. |
+| Connection drops mid-submission | One quiet retry; the server is idempotent, so a request that did land comes back "already marked" and is shown as success. Otherwise "your attendance was NOT recorded". Codes are never queued offline (the service worker passes them straight through). |
+| Student reloads after success | The class list says "already marked"; a resubmission is answered `duplicate` before any guess is counted. |
+| Two universities at once | Codes are bound to session ids and enrolment is institution-scoped; neither can mark the other's class, and a foreign or non-existent session id gets the same generic `403`. |
+| Several classes in one university | Independent codes per session. A student with more than one open class must choose (`400 session_required`); the server never guesses. |
+| Hundreds of students on one NAT address | All limits are per account; no IP-based limit on this path. |
+| Scripted guessing | Per-class and per-account limits, enforced atomically before comparison; see "Guessing". |
+| Projector tab suspended for minutes | On return it re-syncs immediately; a code past its life is greyed (refreshing) or blanked (server unreachable), never shown as current. |
+| No camera permission / no QR decoder | The dashboard card needs neither. The scanner's camera error points to it, and its overlay has a "🔢" button that switches to it. |
+
+### Rolling it out
+
+1. Deploy. The boot migration adds `attendance.submission_method VARCHAR(20)
+   NOT NULL DEFAULT 'qr'` — a catalogue-only change on PostgreSQL 11+ (no
+   rewrite, no long lock). Every existing row reads `qr`, which is what they
+   were. Workers still on the previous release keep inserting; the default
+   fills the column. Verified by upgrading a database created by the previous
+   release in place (`test_manual_code.py::TestSubmissionMethodMigration`
+   covers the SQLite path in CI).
+2. Check: `/healthz` 204; a lecturer's QR page shows the code and its
+   countdown; `GET /api/session/<id>/manual_code` returns 403 for a student;
+   one test student marks attendance by code and the session sheet shows
+   "Manual code".
+3. Watch `scanmark_manual_outcome_*`, `scanmark_manual_guard_unavailable_total`,
+   `scanmark_manual_guard_refused_total`, `scanmark_manual_invalid_code_total`
+   and `scanmark_attendance_closed_during_submission_total`.
+4. Roll back the feature without a deploy: `MANUAL_CODE_ENABLED=false`. The
+   column can stay; the previous release ignores it.
 
 ## Health checks
 

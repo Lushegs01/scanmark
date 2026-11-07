@@ -14,6 +14,13 @@
         </div>
     </div>
 
+    {% if manual_code_enabled %}
+    <p class="mb-0">
+        <a href="{{ url_for('student_dashboard') }}#attendance-code" class="fw-semibold">
+            <i class="fas fa-keyboard me-1" aria-hidden="true"></i>Can't scan? Enter the attendance code instead</a>
+    </p>
+    {% endif %}
+
     <!-- Result Banner -->
     <div id="result-banner" class="alert mt-3 text-center fw-bold fs-5 d-none" role="alert"></div>
 

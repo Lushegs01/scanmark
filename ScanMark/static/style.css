@@ -932,3 +932,118 @@ h1, h2, h3, h4, h5, h6 { font-weight: 700; }
 .form-text { color: var(--text-secondary); }
 .border-bottom { border-color: var(--divider) !important; }
 hr { border-color: var(--divider); opacity: 1; margin: 1rem 0; }
+
+/* --- MARK ATTENDANCE: the two methods ----------------------------------
+   Scanning and the typed attendance code sit side by side as equals. The
+   code is the way in for a phone whose camera cannot read the projector. */
+.method-tag {
+  display: inline-block;
+  font-size: 0.66rem;
+  font-weight: 700;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 0.1rem;
+}
+
+.manual-icon {
+  background: linear-gradient(135deg, var(--gold), #e0a800);
+  color: #1a1a1a;
+  font-size: 1.2rem;
+}
+
+.attendance-method.is-suggested {
+  box-shadow: 0 0 0 3px var(--gold-glow), var(--shadow);
+}
+
+/* Large, spaced, monospaced digits: easy to check against the screen, and
+   a big target on a small phone. */
+.manual-code-input {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, "DejaVu Sans Mono", "Liberation Mono", monospace;
+  font-size: 1.6rem;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  text-align: center;
+  min-height: 3.4rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.manual-code-input::placeholder {
+  color: var(--text-muted);
+  opacity: 0.45;
+}
+
+.manual-code-input[aria-invalid="true"] {
+  border-color: #dc3545;
+  box-shadow: 0 0 0 3px rgba(220, 53, 69, 0.2);
+}
+
+.manual-code-input[readonly] {
+  opacity: 0.75;
+}
+
+/* Keyboard users must always see where they are. */
+.manual-form .form-control:focus-visible,
+.manual-form .form-select:focus-visible,
+.manual-form .btn:focus-visible,
+.manual-feedback:focus-visible,
+#manual-code-btn:focus-visible {
+  outline: 3px solid var(--gold);
+  outline-offset: 2px;
+}
+
+.manual-form .btn-scan {
+  min-height: 3.1rem;
+}
+
+.btn-scan:disabled,
+.btn-scan[aria-busy="true"] {
+  opacity: 0.75;
+  transform: none;
+  cursor: not-allowed;
+  box-shadow: none;
+}
+
+.manual-session-line {
+  color: var(--text-secondary);
+}
+
+.manual-session-line.is-done {
+  color: var(--green);
+  font-weight: 600;
+}
+
+[data-theme="dark"] .manual-session-line.is-done {
+  color: #38c57a;
+}
+
+.manual-feedback {
+  margin-top: 0.9rem;
+  padding: 0.75rem 0.9rem;
+  border-radius: 12px;
+  border: 1px solid var(--border-subtle);
+  font-size: 0.92rem;
+}
+
+.manual-feedback p {
+  margin: 0;
+}
+
+.manual-feedback .manual-feedback-message {
+  font-weight: 700;
+}
+
+.manual-feedback .manual-feedback-detail {
+  margin-top: 0.2rem;
+  font-size: 0.85rem;
+}
+
+.manual-feedback.is-progress { background: var(--surface); color: var(--text-secondary); }
+.manual-feedback.is-info     { background: rgba(13, 110, 253, 0.08); color: var(--text); }
+.manual-feedback.is-success  { background: rgba(25, 135, 84, 0.12); border-color: rgba(25, 135, 84, 0.35); color: var(--text); }
+.manual-feedback.is-warning  { background: rgba(255, 193, 7, 0.16); border-color: rgba(255, 193, 7, 0.5); color: var(--text); }
+.manual-feedback.is-danger   { background: rgba(220, 53, 69, 0.1); border-color: rgba(220, 53, 69, 0.4); color: var(--text); }
+.manual-feedback.is-success .manual-feedback-message { color: var(--green); }
+[data-theme="dark"] .manual-feedback.is-success .manual-feedback-message { color: #38c57a; }
+.manual-feedback.is-danger .manual-feedback-message { color: #c0392b; }
+[data-theme="dark"] .manual-feedback.is-danger .manual-feedback-message { color: #ff7b72; }
