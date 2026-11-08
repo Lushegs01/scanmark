@@ -59,9 +59,11 @@ jobs:
           node --check loadtest/journey/journey.cjs
           node --check e2e/manual_code.e2e.cjs
           node --check e2e/qr_refresh.e2e.cjs
+          node --check e2e/location.e2e.cjs
           node --check static/auth.js
           node --test test_auth_browser.cjs
           node --test test_manual_code_browser.cjs
+          node --test test_location_browser.cjs
 
       - name: Check every Jinja template compiles
         env:

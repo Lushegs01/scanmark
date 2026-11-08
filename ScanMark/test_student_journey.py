@@ -97,6 +97,110 @@ class TestGeofenceAllowance:
         assert body['max_accuracy_m'] == appmod.GEOFENCE_MAX_ACCURACY_M
 
 
+class TestThePinsOwnErrorCounts:
+    """
+    Distance is measured between two uncertain points. The fence used to
+    forgive only the student's error, so a sharp ±5m phone in a room pinned
+    at ±60m was refused for the pin's drift, not its own.
+    """
+
+    def _room(self, appmod, seed, accuracy_m):
+        from models import ClassSession, Classroom, db
+        with appmod.app.app_context():
+            room = Classroom(name='LT2', latitude=7.22, longitude=3.44,
+                             accuracy_m=accuracy_m, institution='funaab.edu.ng')
+            db.session.add(room)
+            db.session.commit()
+            appmod.pin_session_to_classroom(
+                db.session.get(ClassSession, seed['session_id']), room)
+
+    @pytest.mark.parametrize('pin,expected', [
+        (None, 5), (0, 5), (12, 13), (60, 25), (float('nan'), 5),
+    ])
+    def test_the_combined_error_is_still_bounded_by_the_same_caps(
+            self, appmod, pin, expected):
+        assert appmod.geofence_allowance_m(5, 100, pin) == pytest.approx(expected)
+
+    def test_a_precise_student_is_not_refused_for_a_vague_room_pin(
+            self, appmod, seed, login):
+        self._room(appmod, seed, accuracy_m=60)
+        kemi = login(seed['student_email'])
+        assert _scan_at(appmod, seed, kemi, 112, 5).status_code == 200
+
+    def test_a_vague_pin_still_buys_no_more_than_the_cap(self, appmod, seed, login):
+        self._room(appmod, seed, accuracy_m=90)
+        kemi = login(seed['student_email'])
+        response = _scan_at(appmod, seed, kemi, 127, 5)
+        assert response.status_code == 422
+        assert response.get_json()['outcome'] == 'outside_geofence'
+
+    def test_a_room_typed_off_a_map_is_exact(self, appmod, seed, login):
+        self._room(appmod, seed, accuracy_m=None)
+        kemi = login(seed['student_email'])
+        assert _scan_at(appmod, seed, kemi, 112, 5).status_code == 422
+
+    def test_an_ad_hoc_browser_pin_counts_its_error_too(self, appmod, seed, login):
+        with appmod.app.app_context():
+            appmod.set_class_location(seed['session_id'], 7.22, 3.44, accuracy_m=40)
+        kemi = login(seed['student_email'])
+        assert _scan_at(appmod, seed, kemi, 112, 5).status_code == 200
+
+    def test_a_scan_that_passes_does_not_look_the_pin_error_up(
+            self, appmod, seed, login, monkeypatch):
+        """Nearly every scan passes; they should not pay for the rare refusal."""
+        _pin(appmod, seed)
+
+        def not_on_the_hot_path(*_args, **_kwargs):
+            raise AssertionError('a passing scan read the pin accuracy')
+
+        monkeypatch.setattr(appmod, '_pin_accuracy', not_on_the_hot_path)
+        kemi = login(seed['student_email'])
+        assert _scan_at(appmod, seed, kemi, 40, 10).status_code == 200
+
+
+class TestRefusalsSayWhatIsTrue:
+
+    def test_a_distance_just_past_the_fence_is_not_reported_as_on_it(
+            self, appmod, seed, login):
+        """It truncated: 100.6m refused as "100m away (max 100m)"."""
+        _pin(appmod, seed)
+        kemi = login(seed['student_email'])
+        body = _scan_at(appmod, seed, kemi, 100.3, 0).get_json()
+        assert body['outcome'] == 'outside_geofence'
+        assert 'You are 101m away (max 100m)' in body['message']
+
+    def test_a_far_distance_is_reported_as_measured(self, appmod, seed, login):
+        _pin(appmod, seed)
+        kemi = login(seed['student_email'])
+        body = _scan_at(appmod, seed, kemi, 600, 10).get_json()
+        assert 'You are 600m away (max 100m)' in body['message']
+
+    def test_an_approximate_location_is_told_to_turn_on_precise_location(
+            self, appmod, seed, login):
+        _pin(appmod, seed)
+        kemi = login(seed['student_email'])
+        body = _scan_at(appmod, seed, kemi, 5, 2400).get_json()
+        assert body['outcome'] == 'imprecise_location'
+        assert 'approximate location (±2.4km)' in body['message']
+        assert 'Precise Location' in body['message']
+        assert 'window' not in body['message']
+
+    def test_a_merely_weak_fix_is_told_how_to_improve_it(self, appmod, seed, login):
+        _pin(appmod, seed)
+        kemi = login(seed['student_email'])
+        body = _scan_at(appmod, seed, kemi, 5, 140).get_json()
+        assert 'accurate to 140m' in body['message']
+        assert 'Wi-Fi' in body['message']
+
+    @pytest.mark.parametrize('lat,lon', [(True, 3.44), (7.22, False)])
+    def test_a_boolean_is_not_a_coordinate(self, appmod, seed, login, lat, lon):
+        _pin(appmod, seed, lat=1.0, lon=3.44)
+        kemi = login(seed['student_email'])
+        response = _scan_at(appmod, seed, kemi, 0, 5, lat=lat, lon=lon)
+        assert response.status_code == 422
+        assert response.get_json()['outcome'] == 'missing_location'
+
+
 class TestTheSavedRoomIsThePin:
 
     def _room(self, appmod, seed, lat=7.22, lon=3.44):
@@ -311,13 +415,16 @@ class TestScannerContract:
 
     def test_a_refused_fix_is_retried_with_a_newer_one(self):
         source = self.scanner()
-        assert 'refusedFixAt = position.timestamp' in source
+        # By the locator's own id for the reading, not its timestamp: a
+        # phone with a broken stamp (or a cached repeat of the same reading)
+        # would otherwise hand the refused fix straight back as "newer".
+        assert 'refusedFixAt = locator.fixId(position)' in source
         assert 'acquirePosition(refusedFixAt)' in source
 
     def test_a_timeout_is_not_reported_as_a_permission_problem(self):
         source = self.location()
         assert 'Allow GPS access and scan again' not in source + self.scanner()
-        assert 'error.code === 1' in source and 'error.code === 2' in source
+        assert 'code === 1' in source and 'code === 2' in source
         # The scanner's messages still end "…then scan again".
         assert "retryHint: 'scan again'" in self.scanner()
 

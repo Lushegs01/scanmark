@@ -174,6 +174,11 @@ if (typeof document !== 'undefined') (function () {
         maxLocationAgeMs: config.maxLocationAgeMs,
         maxLocationAccuracyM: config.maxLocationAccuracyM,
         retryHint: 'try again',
+        // Refused as soon as the student focused the box: tell them before
+        // they type eight digits that cannot be submitted.
+        onDenied: () => {
+            if (!inFlight) show(locator.describeError({ code: 1 }), 'danger');
+        },
     });
 
     let sessions = null;          // the student's open classes, once loaded
@@ -619,7 +624,7 @@ if (typeof document !== 'undefined') (function () {
             if (LOCATION_REFUSALS.has(verdict.outcome) && !elsewhere
                     && submission.locationRetries < LOCATION_RETRY_LIMIT) {
                 submission.locationRetries += 1;
-                submission.refusedFixAt = position.timestamp;
+                submission.refusedFixAt = locator.fixId(position);
                 setBusy(true, 'Your location reading was off; taking a fresh one…');
                 setTimeout(() => run(submission), 250);
                 return;

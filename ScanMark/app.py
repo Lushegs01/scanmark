@@ -2351,10 +2351,31 @@ GEOFENCE_ACCURACY_ALLOWANCE_M = max(0.0, float(
     os.environ.get('GEOFENCE_ACCURACY_ALLOWANCE_M', 25)))
 
 
-def geofence_allowance_m(accuracy_m, radius_m):
-    """Metres of slack beyond `radius_m` for a fix reporting `accuracy_m`."""
-    return max(0.0, min(float(accuracy_m), GEOFENCE_ACCURACY_ALLOWANCE_M,
+def geofence_allowance_m(accuracy_m, radius_m, pin_accuracy_m=None):
+    """
+    Metres of slack beyond `radius_m` for a fix reporting `accuracy_m`.
+
+    `pin_accuracy_m` is the error of the CENTRE of the fence, when it was
+    measured rather than typed off a map. Distance is measured between two
+    uncertain points, so the error that matters is both together — the root
+    of the sum of their squares — not the student's alone: a student with a
+    sharp ±5m fix in a room pinned at ±60m was forgiven 5m of the 60m by which
+    the pin itself may have been off. The same three caps bound the result,
+    so this can never give more slack than a vague student fix already could.
+    """
+    error_m = float(accuracy_m)
+    if pin_accuracy_m is not None and math.isfinite(float(pin_accuracy_m)) \
+            and float(pin_accuracy_m) > 0:
+        error_m = math.hypot(error_m, float(pin_accuracy_m))
+    return max(0.0, min(error_m, GEOFENCE_ACCURACY_ALLOWANCE_M,
                         float(radius_m) / 2))
+
+
+# A fix this vague is not a GPS that needs a moment: it is a phone sharing only
+# an approximate location (iOS with Precise Location off, Android's
+# "approximate" permission — one to several kilometres), or a laptop placing
+# itself by IP. Waiting does not help, so the refusal names the switch.
+GEOFENCE_APPROXIMATE_M = 1000
 
 # Oldest position fix a scan may carry. A phone will happily hand back a
 # cached fix from hours ago and somewhere else entirely.
@@ -6990,6 +7011,9 @@ def _attendance_target(session_id, student_id, include_existing=False):
             # is already happening for room_lat/room_lon, so reading it costs
             # nothing extra here.
             Classroom.radius_m.label('room_radius_m'),
+            # How precisely the room was pinned (NULL when typed off a map,
+            # which is exact). Only read when a scan is about to be refused.
+            Classroom.accuracy_m.label('room_accuracy_m'),
             # NULL unless this student is enrolled on this course.
             enrollments.c.user_id.label('enrolled'),
         )
@@ -7112,6 +7136,8 @@ def _enforce_classroom_geofence(target, data, again='scan again'):
         return
 
     try:
+        if isinstance(data['lat'], bool) or isinstance(data['lon'], bool):
+            raise TypeError('a boolean is not a coordinate')
         student_lat = float(data['lat'])
         student_lon = float(data['lon'])
     except (KeyError, TypeError, ValueError):
@@ -7150,10 +7176,20 @@ def _enforce_classroom_geofence(target, data, again='scan again'):
             f'Please allow precise GPS access and {again}.',
             422, 'missing_location_accuracy')
     if accuracy_m < 0 or accuracy_m > GEOFENCE_MAX_ACCURACY_M:
+        if accuracy_m > GEOFENCE_APPROXIMATE_M:
+            # "Move towards a window" does nothing for a phone that is only
+            # allowed to share where it roughly is.
+            message = (
+                f'Your phone is only sharing an approximate location '
+                f'(±{accuracy_m / 1000:.1f}km). Turn on Precise Location for '
+                f'your browser in your phone\'s location settings, then {again}.')
+        else:
+            message = (
+                f'Your location is only accurate to {math.ceil(accuracy_m)}m, '
+                f'which is too imprecise to confirm you are in the classroom. '
+                f'Turn on Wi-Fi, move towards a window and {again}.')
         raise AttendanceRefusal(
-            f'Your location is only accurate to {int(accuracy_m)}m, which is '
-            f'too imprecise to confirm you are in the classroom. Move '
-            f'towards a window and {again}.',
+            message,
             422, 'imprecise_location',
             extra={'accuracy_m': round(accuracy_m),
                    'max_accuracy_m': GEOFENCE_MAX_ACCURACY_M},
@@ -7165,18 +7201,33 @@ def _enforce_classroom_geofence(target, data, again='scan again'):
     # A saved classroom may have its own threshold; anything else (an ad-hoc
     # pin, or a room that never set one) uses the server-wide default.
     geofence_radius_m = target['room_radius_m'] or GEOFENCE_RADIUS_M
-    if distance_m > geofence_radius_m + geofence_allowance_m(accuracy_m, geofence_radius_m):
-        raise AttendanceRefusal(
-            f'Too far from the classroom. You are {int(distance_m)}m away '
-            f'(max {int(geofence_radius_m)}m).',
-            422, 'outside_geofence',
-            # What the client needs to tell drift (wait for a better fix and
-            # go again on its own) from being somewhere else (say so now).
-            # Nothing here the message does not already say in words.
-            extra={'distance_m': round(distance_m),
-                   'radius_m': round(geofence_radius_m),
-                   'accuracy_m': round(accuracy_m)},
-        )
+    if distance_m <= geofence_radius_m + geofence_allowance_m(accuracy_m, geofence_radius_m):
+        return
+    # Past the fence on the student's error alone. Before refusing, count the
+    # pin's own error too (see geofence_allowance_m). Looked up only here, so
+    # the scans that pass — nearly all of them — pay nothing for it.
+    if target['room_lat'] is not None:
+        pin_accuracy_m = target.get('room_accuracy_m')
+    else:
+        pin_accuracy_m = _pin_accuracy(target['session_id'])
+    if pin_accuracy_m and distance_m <= geofence_radius_m + geofence_allowance_m(
+            accuracy_m, geofence_radius_m, pin_accuracy_m):
+        return
+    # Never shown as at or under the limit: truncating used to refuse a
+    # student at 100.6m as "100m away (max 100m)", which reads as a bug. (Not
+    # a plain ceil either: float noise would turn 600m into "601m".)
+    shown_m = max(round(distance_m), math.floor(geofence_radius_m) + 1)
+    raise AttendanceRefusal(
+        f'Too far from the classroom. You are {shown_m}m away '
+        f'(max {geofence_radius_m:g}m).',
+        422, 'outside_geofence',
+        # What the client needs to tell drift (wait for a better fix and
+        # go again on its own) from being somewhere else (say so now).
+        # Nothing here the message does not already say in words.
+        extra={'distance_m': round(distance_m),
+               'radius_m': round(geofence_radius_m),
+               'accuracy_m': round(accuracy_m)},
+    )
 
 
 def _marked_details(submission_method, timestamp):
