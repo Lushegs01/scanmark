@@ -8,12 +8,10 @@
         <div class="accent-line"></div>
         <h1 class="page-title">My Portal</h1>
         <p class="page-subtitle mb-0">Welcome back, <strong>{{ current_user.full_name }}</strong></p>
-        {# The only way back to the profile form once it is filled in, so a
-           student refused for a mistyped matric number can correct it. #}
+        {# Edit profile, the way back to this form once it is filled in, is
+           in the navbar menu beside Logout. #}
         <p class="small mb-0 mt-1" style="color: var(--text-muted);">
-            Matric {{ current_user.matric_no }} · {{ current_user.level }} Level ·
-            <a href="{{ url_for('complete_profile') }}" class="fw-semibold" style="color: var(--green);">
-                <i class="fas fa-pen fa-xs me-1"></i>Edit profile</a>
+            Matric {{ current_user.matric_no }} · {{ current_user.level }} Level
         </p>
     </div>
 

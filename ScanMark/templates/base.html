@@ -89,6 +89,17 @@
                             <i class="fas fa-moon" id="darkToggleIconDesktop"></i>
                         </button>
                     </li>
+                    {% if is_student() %}
+                    {# Lives in the menu beside Logout so it is one tap away on
+                       every page. Icon only on desktop; the label shows in
+                       the opened hamburger on a phone. #}
+                    <li class="nav-item">
+                        <a class="nav-link" href="{{ url_for('complete_profile') }}"
+                           title="Edit profile" aria-label="Edit profile">
+                            <i class="fas fa-user-pen me-1 me-lg-0"></i><span class="d-lg-none">Edit profile</span>
+                        </a>
+                    </li>
+                    {% endif %}
                     <li class="nav-item">
                         {# A POST, so it carries a CSRF token. As a GET, any
                            page on the internet could sign a student out
