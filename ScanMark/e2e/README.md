@@ -22,7 +22,14 @@
   by jsQR) after the scanner's location code moved into
   `static/attendance-common.js`.
 
-It creates attendance, so use a disposable database.
+`qr_refresh.e2e.cjs` drives the projector's QR refresh: a dropped connection
+or a proxy's 502 shows "Reconnecting…" in the QR's place (still in full
+screen), retries with a growing backoff and brings the QR back by itself,
+while a class really ended from another device still ends the projector and
+stops it asking. It ends the seed's `ending_session_id` class, never the one
+`manual_code.e2e.cjs` uses.
+
+They create attendance and end a class, so use a disposable database.
 
 ```bash
 # Server: the real Procfile command, on Postgres + Redis
@@ -34,7 +41,7 @@ gunicorn --config gunicorn.conf.py app:app &
 # Seed (same environment), then run
 python e2e/seed_e2e.py > /tmp/e2e-seed.json
 E2E_BASE=http://127.0.0.1:8100 E2E_SEED=/tmp/e2e-seed.json \
-    node --test --test-concurrency=1 e2e/manual_code.e2e.cjs
+    node --test --test-concurrency=1 e2e/manual_code.e2e.cjs e2e/qr_refresh.e2e.cjs
 ```
 
 `SCANMARK_ENV=ci` is only so the session cookie is sent over plain
