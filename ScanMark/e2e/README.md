@@ -29,6 +29,17 @@ while a class really ended from another device still ends the projector and
 stops it asking. It ends the seed's `ending_session_id` class, never the one
 `manual_code.e2e.cjs` uses.
 
+`location.e2e.cjs` drives location verification through the browser's own
+Geolocation API (Playwright's geolocation emulation and permission grants, no
+JavaScript fake) on Android and iPhone device profiles: inside the room and
+near the fence edge marks attendance; 600m away is refused by the server; an
+approximate-only (±2.4km) location is explained within seconds without
+posting; a blocked site is reported on focus (and, on the scanner, while
+aiming) with the switch for that phone; allowing location afterwards works
+without a reload; and the dashboard's scanner and code box share one GPS
+watch. The "iPhone" is Chromium with an iPhone's user agent — real WebKit
+geolocation needs a real device.
+
 They create attendance and end a class, so use a disposable database.
 
 ```bash
@@ -41,7 +52,7 @@ gunicorn --config gunicorn.conf.py app:app &
 # Seed (same environment), then run
 python e2e/seed_e2e.py > /tmp/e2e-seed.json
 E2E_BASE=http://127.0.0.1:8100 E2E_SEED=/tmp/e2e-seed.json \
-    node --test --test-concurrency=1 e2e/manual_code.e2e.cjs e2e/qr_refresh.e2e.cjs
+    node --test --test-concurrency=1 e2e/manual_code.e2e.cjs e2e/qr_refresh.e2e.cjs e2e/location.e2e.cjs
 ```
 
 `SCANMARK_ENV=ci` is only so the session cookie is sent over plain

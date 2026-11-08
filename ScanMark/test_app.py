@@ -3183,7 +3183,7 @@ class TestScanPageLocationRules:
         assert 'locator.stopWatching()' in scanner, \
             'a live GPS watch must not outlive the camera'
 
-        assert 'requestPosition(0)' in location, \
+        assert 'source.request(true, 0)' in location, \
             'nothing forces a fresh fix when the OS hands back an old one'
         assert 'SERVER_MAX_AGE_MS' in location
         # The watch is what keeps a recent fix in hand before the code is read.

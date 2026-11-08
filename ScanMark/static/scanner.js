@@ -281,7 +281,16 @@
     const locator = shared.createLocator({
         maxLocationAgeMs: config.maxLocationAgeMs,
         maxLocationAccuracyM: config.maxLocationAccuracyM,
-        retryHint: 'scan again'
+        retryHint: 'scan again',
+        // Location refused while the student is still aiming: say so now.
+        // A scan cannot be recorded without it, and finding out only after
+        // the code has been read is a wasted minute of holding the phone up.
+        // (With a scan already read, attempt() reports it in its own words.)
+        onDenied: () => {
+            if (pending) return;
+            stopScanner();
+            result(locator.describeError({ code: 1 }), 'danger');
+        }
     });
 
     /**
@@ -1128,10 +1137,11 @@
                 },
                 body: JSON.stringify({
                     qr_data: scan.qrData,
-                    lat: position.coords.latitude,
-                    lon: position.coords.longitude,
-                    accuracy_m: position.coords.accuracy,
-                    location_age_ms: Math.max(0, Date.now() - position.timestamp),
+                    // lat, lon, accuracy_m, location_age_ms — measured the
+                    // same way as the code box does, by the shared locator
+                    // (which survives a wrong phone clock; the raw
+                    // `Date.now() - timestamp` this used to send did not).
+                    ...locator.payload(position),
                     // On the SERVER's clock, which is what the token's own
                     // timestamp is on. Corrected only when a response has
                     // told us the offset; otherwise the phone's own clock.
@@ -1219,7 +1229,7 @@
         // Indoor fixes wander. The next reading is often much closer to the
         // truth, so wait for a NEWER one and go again on our own.
         locationRetries += 1;
-        refusedFixAt = position.timestamp;
+        refusedFixAt = locator.fixId(position);
         status('Your location reading was off; taking a fresh one...', 'scanning');
         retryTimeoutId = setTimeout(attempt, 250);
     }
