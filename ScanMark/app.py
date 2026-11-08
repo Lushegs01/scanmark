@@ -2845,6 +2845,16 @@ def user_has_role(user, *roles):
     return normalize_role(getattr(user, 'role', None)) in roles
 
 
+@app.context_processor
+def inject_role_helpers():
+    """The navbar shows Edit profile to students only: /complete_profile
+    turns every other role away, so the link would be a dead end for them."""
+    def is_student():
+        return (current_user.is_authenticated
+                and user_has_role(current_user, STUDENT_ROLE))
+    return {'is_student': is_student}
+
+
 def role_matches(column):
     """
     A SQL predicate matching a role however it happens to be capitalised.
@@ -4979,8 +4989,8 @@ def register_course():
                     current_user.id, course.institution)
                 flash("Your matric number is already registered at the "
                       "institution that runs this course. If you typed it "
-                      "wrong, correct it with Edit profile at the top of "
-                      "this page; otherwise contact your department.",
+                      "wrong, correct it with Edit profile in the menu at the "
+                      "top of this page; otherwise contact your department.",
                       "danger")
                 return redirect(url_for('student_dashboard'))
 

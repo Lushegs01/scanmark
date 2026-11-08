@@ -961,6 +961,21 @@ class TestCompleteProfile:
         assert 'Edit profile' in page
         assert '20200001' in page
 
+    def test_edit_profile_sits_in_the_navbar_beside_logout(self, appmod, seed, login):
+        """In the hamburger menu, so it is reachable from every page."""
+        kemi = login(seed['student_email'])
+        page = kemi.get('/student_dashboard').get_data(as_text=True)
+        nav = page[page.index('id="navbarNav"'):page.index('</nav>')]
+        assert 'href="/complete_profile"' in nav
+        assert 'fa-user-pen' in nav
+        assert nav.index('/complete_profile') < nav.index('/logout')
+
+    def test_staff_do_not_get_an_edit_profile_link(self, appmod, seed, login):
+        """/complete_profile refuses every role but student."""
+        lecturer = login(seed['lecturer_email'])
+        page = lecturer.get('/lecturer_dashboard').get_data(as_text=True)
+        assert '/complete_profile' not in page
+
     def test_a_finished_profile_opens_prefilled_for_editing(self, appmod, seed, login):
         kemi = login(seed['student_email'])
         page = kemi.get('/complete_profile').get_data(as_text=True)
