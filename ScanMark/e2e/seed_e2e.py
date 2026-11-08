@@ -72,6 +72,8 @@ def main():
                     for n in range(8)]
         main_course = _course('CSC301', 'Operating Systems', lecturer)
         other_course = _course('MTH201', 'Linear Algebra', lecturer)
+        # A class the QR test really ends, so it never ends the one above.
+        ending_course = _course('CSC399', 'End Class Check', lecturer)
         for student in students:
             _enrol(student, main_course)
         # One student has two classes running at once: the "choose your class" case.
@@ -84,7 +86,7 @@ def main():
         db.session.commit()
 
         sessions = {}
-        for course in (main_course, other_course):
+        for course in (main_course, other_course, ending_course):
             session_row = scanmark.resume_or_start_session(course, force_new=True)
             scanmark.pin_session_to_classroom(session_row, room)
             sessions[course.code] = session_row.id
@@ -94,6 +96,7 @@ def main():
             'students': [student.email for student in students],
             'session_id': sessions['CSC301'],
             'other_session_id': sessions['MTH201'],
+            'ending_session_id': sessions['CSC399'],
             'course_code': 'CSC301',
             'room': ROOM,
         }))

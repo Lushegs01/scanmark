@@ -21,6 +21,11 @@
             <div id="qrStage" class="qr-stage{{ ' has-manual-code' if manual_code }}">
                 <img id="qrImage" class="qr-image" src="{{ url_for('get_qr_image', session_id=session.id) }}"
                     alt="QR code for {{ course.code }} attendance" title="Show the codes full screen">
+                {# Takes the QR's place, at the QR's size, whenever the image
+                   cannot be shown: the projector must never put up a broken
+                   image for the room to aim at, and the lecturer needs to
+                   know whether to wait or to act. #}
+                <p id="qrStatus" class="qr-status" role="status"></p>
                 {# The fallback for students whose camera cannot read the QR.
                    It sits INSIDE the stage on purpose: full screen enlarges
                    the stage, so the code is projected with the QR instead of
@@ -50,7 +55,7 @@
         </div>
 
         <!-- FIX #1: Removed stray </button> tag. Clean timer display -->
-        <p class="text-muted mb-4">
+        <p class="text-muted mb-4" id="qrCountdown">
             QR code refreshes in <span id="timer" class="fw-bold text-danger">{{ qr_token_ttl }}</span>s
         </p>
 
@@ -172,6 +177,38 @@
         color: #6c757d;
     }
 
+    /* No QR to show — reconnecting, or the class has ended: a message in
+       its place, the same size, so nothing else on the projector moves. */
+    .qr-status {
+        display: none;
+    }
+
+    .qr-stage.is-qr-down .qr-image {
+        display: none;
+    }
+
+    .qr-stage.is-qr-down .qr-status {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: min(100%, 60vh);
+        aspect-ratio: 1;
+        margin: 0 auto;
+        padding: 1.5rem;
+        background: #fff;
+        color: #b02a37;
+        border: 5px solid #b02a37;
+        border-radius: 10px;
+        font-weight: 700;
+        font-size: 1.25rem;
+    }
+
+    .qr-stage.is-full .qr-status {
+        width: min(96vw, 90vh);
+        border-width: 0.5vh;
+        font-size: min(4vw, 6vh);
+    }
+
     /* ---- The manual attendance code --------------------------------
        Black on white whatever the page theme: it is read off a projector
        from the back of a hall, where contrast is everything. */
@@ -261,7 +298,8 @@
         padding: 2vh 3vw;
     }
 
-    .qr-stage.is-full.has-manual-code .qr-image {
+    .qr-stage.is-full.has-manual-code .qr-image,
+    .qr-stage.is-full.has-manual-code .qr-status {
         width: min(56vw, 90vh);
     }
 
@@ -302,7 +340,8 @@
             flex-direction: column;
         }
 
-        .qr-stage.is-full.has-manual-code .qr-image {
+        .qr-stage.is-full.has-manual-code .qr-image,
+        .qr-stage.is-full.has-manual-code .qr-status {
             width: min(90vw, 56vh);
         }
 
@@ -329,45 +368,136 @@
     // still has a moment left just returns that same token, which reset
     // the countdown and left one code on screen for two full cycles.
     const QR_TOKEN_TTL = {{ qr_token_ttl }};
+    const QR_IMAGE_URL = "{{ url_for('get_qr_image', session_id=session.id) }}";
+    const QR_STATUS_URL = "{{ url_for('get_qr_data', session_id=session.id) }}";
+    const LOGIN_PATH = "{{ url_for('login') }}";
+    const QR_STATUS_TIMEOUT_MS = 8000;
     let timeLeft = QR_TOKEN_TTL;
     const timerEl = document.getElementById('timer');
+    const countdownEl = document.getElementById('qrCountdown');
     const qrImage = document.getElementById('qrImage');
+    const qrStatusEl = document.getElementById('qrStatus');
+    const qrStage = document.getElementById('qrStage');
     let qrTimer = null;
+    let qrRetryTimer = null;
+    let qrFailures = 0;         // loads failed in a row; while > 0 the page is reconnecting
+    let qrChecking = false;
+    let qrEnded = false;
 
-    // The class can be ended from another device — the projector laptop and
-    // the lecturer's phone are both signed in. When that happens the image
-    // endpoint answers 409 and this screen has to stop claiming to be live.
-    qrImage.addEventListener('error', () => {
+    function loadQr() {
+        clearTimeout(qrRetryTimer);
+        if (qrEnded) return;
+        // Bust browser cache by appending a timestamp so it fetches a fresh token
+        qrImage.src = QR_IMAGE_URL + "?t=" + Date.now();
+    }
+
+    function showQrMessage(message) {
+        qrStage.classList.toggle('is-qr-down', Boolean(message));
+        qrStatusEl.textContent = message || '';
+        // No countdown to a QR that is not on screen.
+        countdownEl.style.visibility = message ? 'hidden' : '';
+    }
+
+    // An image that fails to load says nothing about WHY. The class may have
+    // been ended from another device — the projector laptop and the
+    // lecturer's phone are both signed in, and the image endpoint then
+    // answers 409 — but a Wi-Fi drop, a proxy's 502 or a timeout fail it
+    // exactly the same way. So ask the server, and end only when it says the
+    // class has ended. Anything else is a blip: keep the refresh running,
+    // say so, and try again. The attendance code beside the QR works the
+    // same way (section 1c).
+    const QR_RECONNECTING = 'Reconnecting to ScanMark… The QR code will come back by itself.';
+    const QR_REFUSED = 'This screen is no longer signed in to show this class. Reload the page.';
+
+    async function onQrError() {
+        if (qrEnded || qrChecking) return;
+        qrFailures += 1;
+        clearTimeout(qrRetryTimer);
+        // Stay in full screen: the room is still meant to be scanning.
+        if (qrFailures === 1) showQrMessage(QR_RECONNECTING);
+        qrChecking = true;
+        let status = 0;          // 0: no answer at all
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), QR_STATUS_TIMEOUT_MS);
+        try {
+            const response = await fetch(QR_STATUS_URL, {
+                headers: { Accept: 'application/json' },
+                cache: 'no-store',
+                credentials: 'same-origin',
+                signal: controller.signal,
+            });
+            // A lapsed sign-in is redirected to the login page, not refused.
+            const signedOut = response.redirected && new URL(response.url).pathname === LOGIN_PATH;
+            status = signedOut ? 401 : response.status;
+        } catch (_) {
+            // Offline, timed out, connection reset: still reconnecting.
+        } finally {
+            clearTimeout(timeout);
+            qrChecking = false;
+        }
+        if (status === 409) { endQr(); return; }
+        if (qrEnded || !qrFailures) return;     // a load already succeeded meanwhile
+        // Signed out or refused: waiting alone will not fix that (signing in
+        // again in another tab will), so say what does — but keep trying.
+        showQrMessage([401, 403, 404].includes(status) ? QR_REFUSED : QR_RECONNECTING);
+        // 1s, 2s, 4s, 8s, then every 15s: back within a second of a blip,
+        // without hammering a server that is struggling.
+        qrRetryTimer = setTimeout(loadQr, Math.min(15000, 1000 * 2 ** (qrFailures - 1)));
+    }
+
+    // Only on the server's word (a 409): this screen must stop claiming to
+    // be live.
+    function endQr() {
+        qrEnded = true;
+        clearInterval(qrTimer);
+        clearTimeout(qrRetryTimer);
         showFullScreen(false);
-        if (qrTimer) clearInterval(qrTimer);
-        // Do not assume: an image can fail for a network blip too. The code
-        // endpoint answers 409 only if the class really has ended, and the
-        // panel ends itself on that; otherwise the code keeps working.
-        if (window.scanmarkManualCode) window.scanmarkManualCode.refresh();
-        timerEl.innerText = '—';
-        qrImage.alt = 'This class has ended.';
+        showQrMessage('This class has ended.');
+        // The code endpoint refuses an ended class for the same reason.
+        if (window.scanmarkManualCode) window.scanmarkManualCode.end();
         const alertEl = document.getElementById('locationAlert');
         alertEl.classList.remove('alert-success', 'alert-warning');
         alertEl.classList.add('alert-danger');
         document.getElementById('locationStatus').innerText =
             'This class has ended. No further scans will be accepted.';
+    }
+
+    qrImage.addEventListener('error', onQrError);
+    qrImage.addEventListener('load', () => {
+        if (qrEnded || !qrFailures) return;
+        // Back. Count a full cycle from this image: its token may be a few
+        // seconds old, which the scan window (QR_CODE_WINDOW) comfortably
+        // covers.
+        qrFailures = 0;
+        clearTimeout(qrRetryTimer);
+        timeLeft = QR_TOKEN_TTL;
+        timerEl.innerText = timeLeft;
+        showQrMessage(null);
+    });
+    // The machine says it is back on the network: no need to wait out the
+    // backoff.
+    window.addEventListener('online', () => {
+        if (qrFailures && !qrChecking) loadQr();
     });
 
     qrTimer = setInterval(() => {
+        // While reconnecting, the retry in onQrError owns the next load.
+        if (qrFailures) return;
         timeLeft--;
         timerEl.innerText = Math.max(0, timeLeft);
 
         if (timeLeft <= -1) {
-            // Bust browser cache by appending a timestamp so it fetches a fresh token
-            qrImage.src = "{{ url_for('get_qr_image', session_id=session.id) }}" + "?t=" + Date.now();
+            loadQr();
             timeLeft = QR_TOKEN_TTL;
         }
     }, 1000);
 
+    // The first image can fail before this script was there to hear it.
+    if (qrImage.complete && qrImage.naturalWidth === 0) onQrError();
+
 
     // --- 1b. FULL-SCREEN CODE ---
     // The same <img>, so the refresh above keeps working while it is big.
-    const qrStage = document.getElementById('qrStage');
 
     async function showFullScreen(on) {
         qrStage.classList.toggle('is-full', on);
