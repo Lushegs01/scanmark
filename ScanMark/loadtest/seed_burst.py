@@ -9,7 +9,10 @@ REDIS_URL, SECRET_KEY): importing the application creates the schema, and the
 classroom pin goes to the Redis the server reads.
 
 `students` creates st1..stN@student.funaab.edu.ng, enrolled on BURST101,
-idempotently. Their password hash uses a deliberately cheap scrypt cost: the
+idempotently, with the password in STUDENT_PASSWORD (required: there is no
+default, because the cohort includes a course coordinator and a password
+written in the repository would be a known credential wherever this ran).
+Their password hash uses a deliberately cheap scrypt cost: the
 burst harness signs every student in before the timed phase, and spending
 minutes of memory-hard hashing on test accounts measures nothing. Real
 accounts are untouched. NEVER run this against production.
@@ -38,12 +41,19 @@ ROOM = {'name': 'Burst Hall', 'lat': 7.2257, 'lon': 3.4372}
 LECTURER = 'lect@staff.funaab.edu.ng'
 
 
+def _password():
+    password = os.environ.get('STUDENT_PASSWORD', '')
+    if len(password) < 10:
+        raise SystemExit('Set STUDENT_PASSWORD (10+ characters) for the seeded accounts; '
+                         'scan_burst.py reads the same variable.')
+    return password
+
+
 def _course():
     lecturer = User.query.filter_by(email=LECTURER).first()
     if lecturer is None:
         lecturer = User(full_name='Burst Lecturer', email=LECTURER,
-                        password=generate_password_hash(os.environ.get('STUDENT_PASSWORD', 'pass1234'),
-                                                        method='scrypt:1024:8:1'),
+                        password=generate_password_hash(_password(), method='scrypt:1024:8:1'),
                         role='course coordinator', email_verified=True, institution=INSTITUTION)
         db.session.add(lecturer)
         db.session.flush()
@@ -105,6 +115,6 @@ if __name__ == '__main__':
     sub.add_parser('session')
     arguments = parser.parse_args()
     if arguments.command == 'students':
-        seed_students(arguments.count, os.environ.get('STUDENT_PASSWORD', 'pass1234'))
+        seed_students(arguments.count, _password())
     else:
         open_session()

@@ -105,6 +105,7 @@ the new code).
 To seed a disposable staging database for these runs:
 
 ```bash
+export STUDENT_PASSWORD='…'                            # required, 10+ chars; scan_burst.py reads it too
 python loadtest/seed_burst.py students --count 2000   # once; cheap test-only password hashes
 python loadtest/seed_burst.py session                  # before every run: a fresh session id
 ```

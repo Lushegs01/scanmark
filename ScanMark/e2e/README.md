@@ -39,4 +39,6 @@ E2E_BASE=http://127.0.0.1:8100 E2E_SEED=/tmp/e2e-seed.json \
 
 `SCANMARK_ENV=ci` is only so the session cookie is sent over plain
 `http://127.0.0.1`; nothing in the code path differs. Re-run `seed_e2e.py`
-before each run: it opens fresh class sessions.
+before each run: it opens fresh class sessions and sets a new random password
+on the test accounts (printed in the seed JSON; set `E2E_PASSWORD` to choose
+one), so no working credential is ever written in the repository.
