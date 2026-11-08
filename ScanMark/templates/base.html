@@ -79,9 +79,20 @@
                     </li>
                     {% endif %}
                     <li class="nav-item">
+                        {% if is_student() %}
+                        {# The student's name is the way into their profile:
+                           name, matric number and level. Shown in the phone
+                           menu too, unlike the plain staff greeting. #}
+                        <a class="nav-link nav-greeting nav-profile" href="{{ url_for('complete_profile') }}"
+                           title="Edit profile">
+                            <i class="fas fa-user-circle me-1"></i>{{ current_user.full_name }}
+                            <span class="visually-hidden">, edit profile</span>
+                        </a>
+                        {% else %}
                         <span class="nav-link nav-greeting d-none d-lg-block">
                             <i class="fas fa-user-circle me-1"></i>{{ current_user.full_name }}
                         </span>
+                        {% endif %}
                     </li>
                     <li class="nav-item d-none d-lg-block">
                         <!-- Dark Mode Toggle (desktop) -->
@@ -89,17 +100,6 @@
                             <i class="fas fa-moon" id="darkToggleIconDesktop"></i>
                         </button>
                     </li>
-                    {% if is_student() %}
-                    {# Lives in the menu beside Logout so it is one tap away on
-                       every page. Icon only on desktop; the label shows in
-                       the opened hamburger on a phone. #}
-                    <li class="nav-item">
-                        <a class="nav-link" href="{{ url_for('complete_profile') }}"
-                           title="Edit profile" aria-label="Edit profile">
-                            <i class="fas fa-user-pen me-1 me-lg-0"></i><span class="d-lg-none">Edit profile</span>
-                        </a>
-                    </li>
-                    {% endif %}
                     <li class="nav-item">
                         {# A POST, so it carries a CSRF token. As a GET, any
                            page on the internet could sign a student out
@@ -134,8 +134,8 @@
         {% with messages = get_flashed_messages(with_categories=true) %}
         {% if messages %}
         {% for category, message in messages %}
-        <div class="alert alert-{{ 'danger' if category == 'error' else 'warning' if category == 'warning' else 'success' }} alert-dismissible fade show" role="alert">
-            <i class="fas fa-{{ 'circle-xmark' if category == 'error' else 'triangle-exclamation' if category == 'warning' else 'circle-check' }} me-2"></i>
+        <div class="alert alert-{{ 'danger' if category in ('error', 'danger') else 'warning' if category == 'warning' else 'success' }} alert-dismissible fade show" role="alert">
+            <i class="fas fa-{{ 'circle-xmark' if category in ('error', 'danger') else 'triangle-exclamation' if category == 'warning' else 'circle-check' }} me-2"></i>
             {{ message }}
             <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
         </div>

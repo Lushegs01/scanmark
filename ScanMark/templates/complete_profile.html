@@ -1,53 +1,62 @@
-<!DOCTYPE html>
-<html lang="en">
+{% extends "base.html" %}
 
-<head>
-    <meta charset="UTF-8">
-    {# Without this a phone lays the form out at desktop width and shrinks it
-       to fit, so a student pinches to read the matric field. #}
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{{ 'Edit' if editing else 'Complete' }} Profile - ScanMark</title>
-    <link href="{{ static_url('vendor/bootstrap/bootstrap.min.css') }}" rel="stylesheet">
-</head>
+{# Same shell as the student dashboard: navbar, page header, cards. Reached
+   by tapping your name in the navbar, and on first sign-in when a CampOS
+   launch or a Google account did not carry a matric number and level. #}
+{% block content %}
+<div class="container page-wrap profile-wrap">
 
-<body class="bg-light d-flex align-items-center justify-content-center" style="min-height: 100vh;">
+    <!-- ===== HEADER ===== -->
+    <div class="page-header">
+        <div class="accent-line"></div>
+        {% if editing %}
+        <h1 class="page-title">Edit Profile</h1>
+        <p class="page-subtitle mb-0">Lecturers see these details on their attendance registers.</p>
+        {% else %}
+        <h1 class="page-title">Almost There! 🎓</h1>
+        <p class="page-subtitle mb-0">A few more details link your account to your institution's records.</p>
+        {% endif %}
+    </div>
 
-    <div class="card shadow-sm" style="max-width: 400px; width: 100%;">
-        <div class="card-body p-4">
-            <div class="text-center mb-4">
-                {% if editing %}
-                <h4 class="fw-bold text-success">Edit Profile</h4>
-                <p class="text-muted small">Correct your matric number or level. Lecturers see these on
-                    their attendance registers.</p>
-                {% else %}
-                <h4 class="fw-bold text-success">Almost There! 🎓</h4>
-                <p class="text-muted small">We just need a couple more details to link your Google account to your institution's
-                    records.</p>
-                {% endif %}
+    <div class="section-label">
+        <i class="fas fa-user-circle me-1"></i> Your Details
+    </div>
+
+    <div class="card">
+        <div class="card-body">
+            <div class="d-flex align-items-center gap-3 mb-4">
+                <div class="stat-icon flex-shrink-0 m-0 profile-avatar" aria-hidden="true">
+                    <i class="fas fa-user-circle"></i>
+                </div>
+                <div class="min-w-0">
+                    <h5 class="mb-0 fw-bold text-truncate" style="color: var(--text);">{{ current_user.full_name }}</h5>
+                    <p class="small mb-0 text-truncate" style="color: var(--text-muted);">{{ current_user.email }}</p>
+                </div>
             </div>
-
-            {% with messages = get_flashed_messages(with_categories=true) %}
-            {% if messages %}
-            {% for category, message in messages %}
-            <div class="alert alert-{{ category }} py-2">{{ message }}</div>
-            {% endfor %}
-            {% endif %}
-            {% endwith %}
 
             <form action="{{ url_for('complete_profile') }}" method="POST">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
 
                 <div class="mb-3">
-                    <label class="form-label fw-bold small text-muted">Matriculation Number</label>
-                    <input type="text" name="matric_no" class="form-control" placeholder="e.g. 2021/0001"
-                        value="{{ form.matric_no }}"
-                        pattern="[A-Za-z0-9/\-. ]{4,25}" maxlength="25" required>
-                    <div class="form-text">4-20 letters and digits. Separators such as / - . are ignored.</div>
+                    <label for="full_name" class="form-label">Full Name</label>
+                    <input type="text" id="full_name" name="full_name" class="form-control"
+                        value="{{ form.full_name }}" placeholder="e.g. Kemi Adebayo"
+                        autocomplete="name" minlength="2" maxlength="100" required>
+                </div>
+
+                <div class="mb-3">
+                    <label for="matric_no" class="form-label">Matric Number</label>
+                    <input type="text" id="matric_no" name="matric_no" class="form-control"
+                        placeholder="e.g. 2021/0001" value="{{ form.matric_no }}"
+                        autocapitalize="characters" autocorrect="off" spellcheck="false"
+                        pattern="[A-Za-z0-9/\-. ]{4,25}" maxlength="25" required
+                        aria-describedby="matricHelp">
+                    <div id="matricHelp" class="form-text">4-20 letters and digits. Separators such as / - . are ignored.</div>
                 </div>
 
                 <div class="mb-4">
-                    <label class="form-label fw-bold small text-muted">Current Level</label>
-                    <select name="level" class="form-select" required>
+                    <label for="level" class="form-label">Level</label>
+                    <select id="level" name="level" class="form-select" required>
                         <option value="" disabled {{ 'selected' if form.level not in levels }}>Select your level</option>
                         {% for choice in levels %}
                         <option value="{{ choice }}" {{ 'selected' if form.level == choice }}>{{ choice }} Level</option>
@@ -55,16 +64,16 @@
                     </select>
                 </div>
 
-                <button type="submit" class="btn btn-success w-100 fw-bold">
-                    {{ 'Save Changes' if editing else 'Save & Enter Dashboard' }}
+                <button type="submit" class="btn btn-scan">
+                    <i class="fas fa-check" aria-hidden="true"></i>
+                    <span>{{ 'Save Changes' if editing else 'Save & Enter Dashboard' }}</span>
                 </button>
                 {% if editing %}
-                <a href="{{ url_for('student_dashboard') }}" class="btn btn-link w-100 mt-2 text-muted">Cancel</a>
+                <a href="{{ url_for('student_dashboard') }}" class="btn btn-link w-100 mt-2 profile-cancel">Cancel</a>
                 {% endif %}
             </form>
         </div>
     </div>
 
-</body>
-
-</html>
+</div>
+{% endblock %}

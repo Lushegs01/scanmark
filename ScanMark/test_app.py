@@ -3143,7 +3143,7 @@ class TestMatricNumbersAreScopedToTheirUniversity:
         page = response.get_data(as_text=True)
         assert 'matric number is already registered' in page
         # And it points at the way to fix a typo, which is on this same page.
-        assert 'correct it with Edit profile' in page
+        assert 'tap your name at the top of this page' in page
         assert 'href="/complete_profile"' in page
         with appmod.app.app_context():
             unbound = User.query.filter_by(email='clash@gmail.com').first()
