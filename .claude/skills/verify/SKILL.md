@@ -14,7 +14,8 @@ python3 -m venv /tmp/venv && /tmp/venv/bin/pip install -r ScanMark/requirements.
 redis-server --port 6390 --dir /tmp --save '' --daemonize yes   # redis-server is preinstalled
 
 cd ScanMark
-export SECRET_KEY=verify-secret-key \
+export SCANMARK_ENV=development \
+       SECRET_KEY=verify-secret-key \
        DATABASE_URL="sqlite:////tmp/verify.db" \
        REDIS_URL=redis://127.0.0.1:6390/0 \
        MAIL_SERVER=127.0.0.1 MAIL_PORT=2525 \
@@ -41,7 +42,13 @@ export SECRET_KEY=verify-secret-key \
 - Student scan: POST `/mark_attendance` JSON `{qr_data, lat, lon}` (lat/lon only
   enforced when a class location is set in Redis).
 - Live feed: lecturer GET `/api/session/<id>/attendees` (3s Redis cache,
-  key `attendees_cache:<id>`).
+  key `attendees_cache:<id>`). Each attendee carries `method` (`qr`/`manual_code`).
+- Manual attendance code: lecturer GET `/api/session/<id>/manual_code` → `code`,
+  `expires_in_ms`; or derive it with `manual_code.ManualCodeGenerator(
+  manual_code.derive_key(SECRET_KEY)).window(sid).code` (framework-free import).
+  Student POST `/api/attendance/manual` JSON `{code, session_id, lat, lon,
+  accuracy_m, location_age_ms}` (same geofence rules as a scan). Wrong-code
+  counters live in Redis under `manual_code:*` — delete those to reset.
 
 ## Gotchas
 
@@ -49,9 +56,8 @@ export SECRET_KEY=verify-secret-key \
   routes); boot generates `.gz`/`.br` siblings in `ScanMark/static/`
   (gitignored). Dynamic responses are gzip'd by Flask-Compress — use
   `stream=True` + `response.raw.headers` to see `Content-Encoding`.
-- The weekly-report cron job is exercised by calling `run_weekly_reports()`
-  directly in a process with the same env (its surface is the scheduler);
-  run it twice to check the already-sent dedupe.
+- An undeclared environment is production, which refuses SQLite and needs
+  `PUBLIC_ORIGIN` — hence `SCANMARK_ENV=development` above.
 
 - `/login` limit counts POSTs per (IP, email); `/mark_attendance` is 10/min per user.
   Limiter counters live in Redis under `LIMIT*` keys — delete only those to reset,
@@ -65,6 +71,9 @@ export SECRET_KEY=verify-secret-key \
 
 scan success → duplicate scan → parallel duplicate race (assert 1 row) → stale-token
 expiry → forged/malformed token → unenrolled student → rate-limit 429 (JSON body) →
+manual code success / wrong code / outside geofence → QR after manual and manual
+after QR are duplicates → parallel QR+manual race (1 row) → End Class refuses both →
 attendees feed shape → second boot on the same DB (migration idempotency) →
 remember-me survives dropping the session cookie → dashboard/lecturer views render →
-CSV downloads → compression + cache headers on static → weekly reports twice.
+CSV downloads (per-session sheet ends with `Method`) → compression + cache headers
+on static.

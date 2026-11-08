@@ -49,6 +49,13 @@
             <div class="controls">
                 <button class="control-btn" id="torch-btn" title="Flashlight">💡</button>
                 <button class="control-btn" id="focus-btn" title="Manual Focus">🎯</button>
+                {% if manual_code_enabled %}
+                {# For a camera that will not read the code: close it and type
+                   the attendance code instead, without leaving the page. #}
+                <button class="control-btn" id="manual-code-btn" type="button"
+                    title="Enter the attendance code instead"
+                    aria-label="Can't scan? Enter the attendance code instead">🔢</button>
+                {% endif %}
                 <button class="control-btn" id="close-btn" title="Close Scanner" onclick="stopScanner()">❌</button>
             </div>
         </div>
@@ -399,7 +406,12 @@
         // Opens the connection the scan will be posted on while the student
         // is still aiming. Answered before Flask, sessions or the database.
         warmUrl: "{{ url_for('livez') }}",
+        // Where "enter the code instead" goes when this page has no code box.
+        manualCodeUrl: "{{ url_for('student_dashboard') }}#attendance-code",
         autoStart: {{ 'true' if scanner_config.auto_start else 'false' }}
     };
 </script>
+{# Shared with the manual attendance code: location, device label, retry
+   guidance. Must come first; both are deferred, so they run in order. #}
+<script src="{{ static_url('attendance-common.js') }}" defer></script>
 <script src="{{ static_url('scanner.js') }}" defer></script>

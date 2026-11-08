@@ -74,6 +74,17 @@ from mailconfig import BREVO, resolve_mail_settings
 from mailer import (MailSendError, check_sender_validated, describe_key_shape,
                     send_via_brevo)
 from performance import BoundedExecutor, InstrumentedQueuePool, runtime_metrics
+from manual_code import (
+    EXPIRED as MANUAL_CODE_EXPIRED,
+    GuardLimits,
+    GuardUnavailable,
+    LocalAttemptGuard,
+    ManualCodeGenerator,
+    RedisAttemptGuard,
+    derive_key as derive_manual_code_key,
+    format_code as format_manual_code,
+    normalize_code as normalize_manual_code,
+)
 from campos_integration import (
     CamposIntegrationError,
     declared_environment,
@@ -2457,6 +2468,150 @@ def verify_signed_qr(qr_text: str):
         raise ValueError("QR code has expired. Please scan again.")
 
     return int(session_part[1:]), timestamp
+
+
+# ------------------------------------------------------------------
+# MANUAL ATTENDANCE CODES — the fallback for students who cannot scan
+# ------------------------------------------------------------------
+# A rotating eight-digit code shown beside the QR, for a phone whose camera
+# is broken, will not focus, cannot decode, or is simply too far from the
+# screen. It reaches the SAME session through the SAME validation and the
+# SAME atomic insert as a scan (see _record_attendance below); only the proof
+# of "I can read the projector" differs. manual_code.py documents the
+# derivation and the exact acceptance windows.
+
+#: Kill switch. Off hides the code on the projector and refuses submissions;
+#: QR scanning is untouched either way.
+MANUAL_CODE_ENABLED = _env_flag('MANUAL_CODE_ENABLED', True)
+
+SUBMISSION_QR = 'qr'
+SUBMISSION_MANUAL_CODE = 'manual_code'
+#: Reserved for a future lecturer-confirmed path. Nothing writes it yet.
+SUBMISSION_STAFF_VERIFIED = 'staff_verified'
+SUBMISSION_METHOD_LABELS = {
+    SUBMISSION_QR: 'QR scan',
+    SUBMISSION_MANUAL_CODE: 'Manual code',
+    SUBMISSION_STAFF_VERIFIED: 'Staff verified',
+}
+
+
+def _bounded_env_number(name, default, low, high, kind=float):
+    """Read a numeric setting, refusing to boot on a nonsensical value."""
+    raw = (os.environ.get(name) or '').strip()
+    try:
+        value = kind(raw) if raw else kind(default)
+    except ValueError as error:
+        raise StartupError(f'CRITICAL: {name} must be a number, got {raw!r}') from error
+    if not low <= value <= high:
+        raise StartupError(f'CRITICAL: {name} must be between {low} and {high}, got {value}')
+    return value
+
+
+MANUAL_CODE_ROTATION_SECONDS = _bounded_env_number(
+    'MANUAL_CODE_ROTATION_SECONDS', 60, 30, 600, int)
+# The first few seconds after a rotation, during which the code that was on
+# screen a moment ago is still accepted — for the student who was mid-way
+# through typing it. Never the whole previous window.
+MANUAL_CODE_GRACE_SECONDS = _bounded_env_number(
+    'MANUAL_CODE_GRACE_SECONDS', 5, 0, 15)
+# Tolerance for one instance's clock running slightly ahead of another's:
+# the projector may be served the next code by an instance whose clock has
+# already rotated. Instances are NTP-synchronised in any sane deployment;
+# this only stops a few hundred milliseconds of drift reading as a wrong
+# guess. 0 disables it.
+MANUAL_CODE_CLOCK_SKEW_SECONDS = _bounded_env_number(
+    'MANUAL_CODE_CLOCK_SKEW_SECONDS', 2, 0, 5)
+
+# A dedicated secret is optional. Without one the key is DERIVED from
+# SECRET_KEY under its own label, so it is still never the key the QR tokens
+# are signed with. Rotating either secret changes every live code at once.
+_manual_code_secret = os.environ.get('MANUAL_CODE_SECRET') or ''
+if _manual_code_secret:
+    _require_in_production(
+        len(_manual_code_secret) >= 32,
+        'MANUAL_CODE_SECRET is shorter than 32 characters.',
+    )
+manual_code_generator = ManualCodeGenerator(
+    derive_manual_code_key(_manual_code_secret or app.config['SECRET_KEY']),
+    rotation_seconds=MANUAL_CODE_ROTATION_SECONDS,
+    grace_seconds=MANUAL_CODE_GRACE_SECONDS,
+    clock_skew_seconds=MANUAL_CODE_CLOCK_SKEW_SECONDS,
+)
+del _manual_code_secret
+
+# Wrong-code limits, per ACCOUNT (never per IP: a lecture hall shares a few
+# NAT addresses). manual_code.py explains the arithmetic: at the defaults an
+# account's chance of hitting a live code is about 4e-7 per hour, and a hit
+# still has to be enrolled and inside the geofence.
+try:
+    MANUAL_CODE_LIMITS = GuardLimits(
+        max_failures_per_session=_bounded_env_number(
+            'MANUAL_CODE_MAX_FAILURES_PER_SESSION', 5, 1, 50, int),
+        session_window_seconds=_bounded_env_number(
+            'MANUAL_CODE_SESSION_WINDOW_SECONDS', 600, 60, 86400, int),
+        session_lockout_seconds=_bounded_env_number(
+            'MANUAL_CODE_SESSION_LOCKOUT_SECONDS', 120, 10, 3600, int),
+        max_failures_per_account=_bounded_env_number(
+            'MANUAL_CODE_MAX_FAILURES_PER_ACCOUNT', 20, 1, 500, int),
+        account_window_seconds=_bounded_env_number(
+            'MANUAL_CODE_ACCOUNT_WINDOW_SECONDS', 3600, 60, 86400, int),
+    )
+except ValueError as _limits_error:
+    raise StartupError(f'CRITICAL: manual-code limits are inconsistent: {_limits_error}') \
+        from _limits_error
+
+#: Development and tests only (no Redis). Never used in production, where a
+#: per-process counter would give every worker its own set of tries.
+_local_manual_guard = LocalAttemptGuard(MANUAL_CODE_LIMITS)
+_manual_guard_cache = {'client': None, 'guard': None}
+
+
+def manual_attempt_guard():
+    """
+    The wrong-code guard for this deployment, or GuardUnavailable.
+
+    Resolved per call rather than at import so a Redis client replaced at
+    runtime (or by a test) is honoured. Fails CLOSED: production without a
+    reachable Redis has no shared counter, and verifying codes without one
+    would hand every worker a separate allowance of guesses.
+    """
+    client = redis_client
+    if client is None:
+        if IS_PRODUCTION:
+            raise GuardUnavailable('no shared attempt store is configured')
+        return _local_manual_guard
+    if _manual_guard_cache['client'] is not client:
+        _manual_guard_cache['guard'] = RedisAttemptGuard(
+            client, MANUAL_CODE_LIMITS, timed=_redis_timed)
+        _manual_guard_cache['client'] = client
+    return _manual_guard_cache['guard']
+
+
+@app.context_processor
+def inject_manual_code_flag():
+    """Whether pages offer the code at all (MANUAL_CODE_ENABLED)."""
+    return {'manual_code_enabled': MANUAL_CODE_ENABLED}
+
+
+def manual_code_payload(session_id, now=None):
+    """
+    What the projector shows: the code, and how long it has left.
+
+    ``expires_in_ms`` is measured on the SERVER's clock. The projector counts
+    it down with its own monotonic timer and never consults its wall clock,
+    so a projector laptop whose clock is minutes out still rotates on time.
+    """
+    now = manual_code_generator.now() if now is None else now
+    window = manual_code_generator.window(session_id, now)
+    return {
+        'code': window.code,
+        'display': format_manual_code(window.code),
+        'step': window.step,
+        'rotation_seconds': manual_code_generator.rotation_seconds,
+        'grace_seconds': manual_code_generator.grace_seconds,
+        'expires_in_ms': int(window.expires_in(now) * 1000),
+        'server_time_ms': int(now * 1000),
+    }
 
 
 # ------------------------------------------------------------------
@@ -4949,12 +5104,66 @@ def create_class_session(course, kind='Lecture', title=None):
     return session_row
 
 
+#: Longest End Class waits for attendance inserts already in flight before
+#: giving up and asking the lecturer to press it again. Each insert holds the
+#: session for a few milliseconds, so in practice the wait is milliseconds
+#: even mid-burst; the bound only stops a pathological backlog from hanging
+#: the lecturer's request.
+SESSION_CLOSE_LOCK_TIMEOUT_MS = _bounded_env_number(
+    'SESSION_CLOSE_LOCK_TIMEOUT_MS', 10000, 100, 60000, int)
+
+
+def _lock_session_for_close(session_row):
+    """
+    Take the session row exclusively, and re-read it, before closing it.
+
+    THE RULE, for QR and manual attendance alike: an attendance is accepted
+    if and only if its transaction commits BEFORE the transaction that ends
+    the class. There is no window in which both can be true.
+
+    It is enforced by two row locks on ``class_session`` that PostgreSQL
+    already understands:
+
+    * Every attendance INSERT locks the session row ``FOR KEY SHARE`` in the
+      same statement that checks the session is open (see
+      _insert_attendance_once). Inserts do not block one another: KEY SHARE
+      is compatible with itself, and the foreign key from attendance to
+      class_session already takes exactly this lock on every insert, so it
+      costs nothing new.
+    * Ending a class takes the row ``FOR UPDATE`` here, which conflicts with
+      KEY SHARE. It therefore WAITS for the inserts already holding the row
+      to commit (they are on the register), and any insert that reaches the
+      row after this lock blocks until the close commits — at which point
+      READ COMMITTED re-evaluates "is this session open?" against the closed
+      row and inserts nothing.
+
+    The plain ``UPDATE`` this replaces took only a NO KEY UPDATE lock, which
+    does NOT conflict with KEY SHARE: an insert that had checked "open" a
+    moment earlier could commit after the class had ended. Measured, not
+    theorised — see test_manual_code.py's concurrency tests.
+
+    SQLite (development) serialises every writer anyway, so the conditional
+    insert alone is already exact there.
+    """
+    if db.session.get_bind().dialect.name != 'postgresql':
+        return
+    # A literal, not a bind parameter: SET does not take parameters, and the
+    # value is an int this module produced.
+    db.session.execute(db.text(
+        f"SET LOCAL lock_timeout = '{int(SESSION_CLOSE_LOCK_TIMEOUT_MS)}ms'"))
+    db.session.refresh(session_row, with_for_update=True)
+
+
 def _close_session_row(session_row, reason='ended'):
     """
     Mark a meeting closed WITHOUT committing, so the caller decides the
     transaction boundary. Returns True when this call did the closing.
     """
     if session_row.ended_at is not None:
+        return False
+    _lock_session_for_close(session_row)
+    if session_row.ended_at is not None:
+        # Somebody else ended it while we waited for the lock.
         return False
     session_row.active = False
     session_row.ended_at = _utcnow()
@@ -5081,12 +5290,21 @@ def session_qr(session_id):
         if session_row.classroom_id else None
     if room is not None:
         set_class_location(session_row.id, room.latitude, room.longitude)
-    return render_template('generate_qr.html', course=course, session=session_row,
-                           qr_token_ttl=QR_TOKEN_TTL,
-                           expected_total=expected,
-                           geofence_required=GEOFENCE_REQUIRED,
-                           classroom=room, classrooms=_my_classrooms(),
-                           max_pin_accuracy_m=GEOFENCE_MAX_PIN_ACCURACY_M)
+    response = make_response(render_template(
+        'generate_qr.html', course=course, session=session_row,
+        qr_token_ttl=QR_TOKEN_TTL,
+        # Rendered into the page so the code is on screen with the first
+        # paint, not one round trip later.
+        manual_code=(manual_code_payload(session_row.id)
+                     if MANUAL_CODE_ENABLED else None),
+        expected_total=expected,
+        geofence_required=GEOFENCE_REQUIRED,
+        classroom=room, classrooms=_my_classrooms(),
+        max_pin_accuracy_m=GEOFENCE_MAX_PIN_ACCURACY_M))
+    # The page carries a live attendance code; a cached copy would show one
+    # that has already rotated (the page re-fetches it on load regardless).
+    response.headers['Cache-Control'] = 'no-store, private'
+    return response
 
 
 @app.route('/session/<int:session_id>/end', methods=['POST'])
@@ -5100,9 +5318,20 @@ def end_session(session_id):
         return redirect(url_for('dashboard'))
 
     if session_row.is_open:
-        end_class_session(session_row)
-        flash(f'"{session_row.title}" has ended. Its QR code no longer works.',
-              'success')
+        try:
+            end_class_session(session_row)
+        except OperationalError:
+            # lock_timeout: attendance inserts were still holding the session
+            # row (see _lock_session_for_close). Nothing was closed, nothing
+            # was lost; the lecturer simply presses the button again.
+            db.session.rollback()
+            app.logger.warning('End Class for session %s timed out waiting for '
+                               'in-flight attendance; not ended', session_id)
+            flash('Students are still being marked present. Press "End Class" '
+                  'again in a moment.', 'warning')
+            return redirect(url_for('session_qr', session_id=session_id))
+        flash(f'"{session_row.title}" has ended. Its QR code and attendance '
+              f'code no longer work.', 'success')
     else:
         flash(f'"{session_row.title}" had already ended.', 'info')
     return redirect(url_for('view_attendance', course_id=course.id))
@@ -5125,6 +5354,35 @@ def get_qr_data(session_id):
 
     qr_text = generate_signed_qr(session_id)
     return jsonify({"qr_text": qr_text})
+
+
+@app.route('/api/session/<int:session_id>/manual_code')
+@login_required
+@limiter.exempt
+def get_manual_code(session_id):
+    """
+    The eight-digit code for the projector, for the people teaching the class.
+
+    Independent of the QR endpoints on purpose: the two rotate on their own
+    schedules and neither can take the other down. Authorised exactly like
+    /api/qr_data — the code is a credential for this class, so only the
+    course's own teachers may read it, and never once the class has ended.
+    The projector calls this about once a minute.
+    """
+    session_row = db.get_or_404(ClassSession, session_id)
+    course = db.get_or_404(Course, session_row.course_id)
+    if not _is_course_authorized(course):
+        return jsonify({"error": "Unauthorised"}), 403
+    if not MANUAL_CODE_ENABLED:
+        return jsonify({"error": "Manual attendance codes are turned off.",
+                        "disabled": True}), 404
+    if not session_row.is_open:
+        return jsonify({"error": "This class has ended.", "ended": True}), 409
+    response = jsonify(manual_code_payload(session_id))
+    # A code must never be served from a cache — not the browser's, not a
+    # proxy's — or a projector could show a code that has already rotated.
+    response.headers['Cache-Control'] = 'no-store, private'
+    return response
 
 
 @app.route('/session/<int:session_id>/live')
@@ -5345,7 +5603,8 @@ def get_session_attendees(session_id):
                 runtime_metrics.increment('redis.feed_cache_errors')
 
     rows = (db.session.query(Attendance.id, Attendance.timestamp, User.full_name,
-                             User.matric_no, User.level)
+                             User.matric_no, User.level,
+                             Attendance.submission_method)
             .join(User, User.id == Attendance.student_id)
             .filter(Attendance.session_id == session_id,
                     Attendance.id > after_id)
@@ -5361,7 +5620,9 @@ def get_session_attendees(session_id):
         "level": level or "N/A",
         # Local time: the lecturer is watching this list in the room.
         "time": local_time_only(ts),
-    } for attendance_id, ts, full_name, matric_no, level in rows]
+        # How they marked it: 'qr' or 'manual_code'. Never the code itself.
+        "method": method or SUBMISSION_QR,
+    } for attendance_id, ts, full_name, matric_no, level, method in rows]
 
     payload = {
         "status": "success",
@@ -6228,6 +6489,12 @@ def _prime_metrics():
         'redis.location_errors', 'redis.qr_cache_errors',
         'redis.feed_cache_errors', 'redis.invalidation_errors',
         'scan.admission.shed', 'scan.admission.errors',
+        # Manual attendance codes. guard_unavailable is the one to alert on:
+        # it means codes are being refused (fail-closed) because Redis is.
+        'manual.guard_unavailable', 'manual.guard_refused',
+        'manual.invalid_code', 'manual.guard_refund_failed',
+        'attendance.closed_during_submission',
+        'attendance.recorded.qr', 'attendance.recorded.manual_code',
     ):
         runtime_metrics.increment(counter, 0)
     for gauge, value in (
@@ -6298,23 +6565,93 @@ def _parse_client_timestamp(value):
     return None
 
 
+#: The columns _insert_attendance_once writes from parameters; session_id
+#: comes from the locked class_session row itself.
+_ATTENDANCE_INSERT_COLUMNS = (
+    'student_id', 'course_id', 'device_id', 'timestamp', 'campos_state',
+    'campos_attempts', 'campos_next_attempt_at', 'submission_method',
+)
+_attendance_insert_statements = {}
+
+
+def _attendance_insert_statement(dialect):
+    """
+    The conditional, locking, conflict-ignoring INSERT — built once per
+    dialect with bind parameters, rather than re-assembled from a dozen
+    expression objects on every scan (measured: 0.13 ms of Python each time,
+    on the hottest path in the application).
+    """
+    statement = _attendance_insert_statements.get(dialect)
+    if statement is not None:
+        return statement
+    if dialect == 'postgresql':
+        from sqlalchemy.dialects.postgresql import insert as _conflict_insert
+    else:
+        from sqlalchemy.dialects.sqlite import insert as _conflict_insert
+    # Core (table) constructs, not ORM entities: an ORM insert() executed with
+    # parameters is routed into SQLAlchemy's bulk-insert path, which has no
+    # INSERT ... SELECT form.
+    attendance = Attendance.__table__
+    class_session = ClassSession.__table__
+    open_session = (
+        select(*[db.bindparam(f'att_{name}', type_=attendance.c[name].type).label(name)
+                 for name in _ATTENDANCE_INSERT_COLUMNS],
+               class_session.c.id)
+        .where(class_session.c.id == db.bindparam('att_target_session'),
+               class_session.c.active.is_(True),
+               class_session.c.ended_at.is_(None))
+    )
+    if dialect == 'postgresql':
+        # read + key_share renders FOR KEY SHARE: the weakest row lock,
+        # compatible with every other insert's, conflicting only with the
+        # FOR UPDATE that End Class takes.
+        open_session = open_session.with_for_update(read=True, key_share=True)
+    statement = (_conflict_insert(attendance)
+                 .from_select(list(_ATTENDANCE_INSERT_COLUMNS) + ['session_id'],
+                              open_session)
+                 .on_conflict_do_nothing(index_elements=['student_id', 'session_id'])
+                 .returning(attendance.c.id))
+    _attendance_insert_statements[dialect] = statement
+    return statement
+
+
 def _insert_attendance_once(student_id, course_id, session_id, device_id,
                             scanned_at, campos_state='skipped',
-                            campos_next_attempt_at=None):
+                            campos_next_attempt_at=None,
+                            submission_method=SUBMISSION_QR):
     """
-    Insert exactly one attendance row and return its id, or None if this
-    student already has a row for this class session.
+    Insert exactly one attendance row and return its id — or None when
+    nothing was inserted, because this student already has a row for this
+    class session OR the session is no longer open.
 
-    On Postgres and SQLite this is a single atomic
-    ``INSERT ... ON CONFLICT DO NOTHING ... RETURNING``, so the duplicate
-    decision is made by the database and no separate SELECT is needed. The
-    unique index on (student_id, session_id) is what makes it safe: two
-    simultaneous requests cannot both win.
+    This is the ONE place an attendance record is created, for QR scans and
+    manual codes alike. On Postgres and SQLite it is a single atomic
+
+        INSERT INTO attendance (...)
+        SELECT <values>, class_session.id FROM class_session
+         WHERE id = :session AND active AND ended_at IS NULL
+           FOR KEY SHARE                                 -- Postgres only
+        ON CONFLICT (student_id, session_id) DO NOTHING
+        RETURNING id
+
+    so every decision that matters is made by the database, in the statement
+    that writes the row, with no separate SELECT:
+
+    * DUPLICATES — the unique index on (student_id, session_id): two
+      simultaneous requests, by the same method or one of each, cannot both
+      win. A QR scan after a manual code (or the reverse) is a duplicate.
+    * END CLASS — the session must be open AT INSERT TIME, under a row lock
+      that End Class has to wait for. See _lock_session_for_close for the
+      rule this enforces. Checking "open" a few milliseconds earlier, in a
+      separate statement, is what used to let a scan land after the class
+      had ended.
+
+    Callers tell the two "nothing inserted" cases apart afterwards with
+    _existing_attendance, which only runs on that rare path.
     """
     values = {
         'student_id': student_id,
         'course_id': course_id,
-        'session_id': session_id,
         'device_id': device_id,
         'timestamp': scanned_at,
         # The outbox intent rides along in the SAME statement. This is the
@@ -6323,20 +6660,15 @@ def _insert_attendance_once(student_id, course_id, session_id, device_id,
         'campos_state': campos_state,
         'campos_attempts': 0,
         'campos_next_attempt_at': campos_next_attempt_at,
+        'submission_method': submission_method,
     }
     dialect = db.session.get_bind().dialect.name
 
     if dialect in {'postgresql', 'sqlite'}:
-        if dialect == 'postgresql':
-            from sqlalchemy.dialects.postgresql import insert as _conflict_insert
-        else:
-            from sqlalchemy.dialects.sqlite import insert as _conflict_insert
-        statement = (_conflict_insert(Attendance)
-                     .values(**values)
-                     .on_conflict_do_nothing(
-                         index_elements=['student_id', 'session_id'])
-                     .returning(Attendance.id))
-        record_id = db.session.execute(statement).scalar_one_or_none()
+        parameters = {f'att_{name}': value for name, value in values.items()}
+        parameters['att_target_session'] = session_id
+        record_id = db.session.execute(
+            _attendance_insert_statement(dialect), parameters).scalar_one_or_none()
         if record_id is None:
             db.session.rollback()
             return None
@@ -6344,15 +6676,34 @@ def _insert_attendance_once(student_id, course_id, session_id, device_id,
         return record_id
 
     # Any other dialect: fall back to insert-and-catch, which relies on the
-    # same unique index rather than an application-level check.
+    # same unique index rather than an application-level check. The session
+    # state is re-read in the same transaction, which is the best a dialect
+    # without these locking clauses offers.
     try:
-        record = Attendance(**values)
+        still_open = db.session.execute(
+            select(ClassSession.id).where(ClassSession.id == session_id,
+                                          ClassSession.active.is_(True),
+                                          ClassSession.ended_at.is_(None))
+        ).scalar_one_or_none()
+        if still_open is None:
+            db.session.rollback()
+            return None
+        record = Attendance(session_id=session_id, **values)
         db.session.add(record)
         db.session.commit()
         return record.id
     except IntegrityError:
         db.session.rollback()
         return None
+
+
+def _existing_attendance(student_id, session_id):
+    """This student's record for this session, or None. Off the hot path."""
+    return db.session.execute(
+        select(Attendance.id, Attendance.submission_method, Attendance.timestamp)
+        .where(Attendance.student_id == student_id,
+               Attendance.session_id == session_id)
+    ).mappings().one_or_none()
 
 
 # ------------------------------------------------------------------
@@ -6489,6 +6840,447 @@ SCAN_LOG_SAMPLE_RATE = max(0.0, min(1.0, float(
 )))
 
 
+# ------------------------------------------------------------------
+# ONE ATTENDANCE PIPELINE, TWO WAYS IN
+# ------------------------------------------------------------------
+# A QR scan and a typed manual code differ in exactly one respect: how the
+# student shows they can read the projector right now (a signed token read
+# by the camera, or the rotating eight-digit code). Everything after that —
+# which session, whether it is open, whether the student is on its roster
+# and at its university, the geofence, admission control, the atomic insert,
+# the CampOS outbox — is the SAME code below, so the two methods cannot
+# drift into different rules, and a manual code is never a weaker path onto
+# the register.
+
+class AttendanceRefusal(Exception):
+    """
+    One reason a submission cannot become an attendance record.
+
+    Raised by the shared validation steps and turned into the JSON contract
+    by whichever endpoint is running, so QR and manual submissions are refused
+    for the same reasons with the same status and the same ``outcome``.
+    """
+
+    def __init__(self, message, http_status, outcome, extra=None, headers=None):
+        super().__init__(outcome)
+        self.message = message
+        self.http_status = http_status
+        self.outcome = outcome
+        self.extra = extra
+        self.headers = headers
+
+
+class _AttendanceRequest:
+    """Per-request stage timing and the response contract, for one method."""
+
+    def __init__(self, metric_prefix, log_label, budgets, total_budget_ms):
+        self.metric_prefix = metric_prefix
+        self.log_label = log_label
+        self.budgets = budgets
+        self.total_budget_ms = total_budget_ms
+        self.started = time.perf_counter()
+        self._stage_started = self.started
+        self.stages = {}
+
+    def checkpoint(self, name):
+        now = time.perf_counter()
+        duration_ms = (now - self._stage_started) * 1000
+        self.stages[name] = duration_ms
+        runtime_metrics.observe_ms(f'{self.metric_prefix}.stage.{name}', duration_ms)
+        # Which stage broke its contract, counted separately from how long it
+        # took. During a rehearsal this is the difference between "scans are
+        # slow" and "db_insert is over budget and nothing else is".
+        budget = self.budgets.get(name)
+        if budget and duration_ms > budget:
+            runtime_metrics.increment(f'{self.metric_prefix}.budget_exceeded.{name}')
+        self._stage_started = now
+
+    def respond(self, status, message, http_status, outcome, headers=None, extra=None):
+        total_ms = (time.perf_counter() - self.started) * 1000
+        prefix = self.metric_prefix
+        runtime_metrics.observe_ms(f'{prefix}.response', total_ms)
+        runtime_metrics.increment(f'{prefix}.outcome.{outcome}')
+        if total_ms > self.total_budget_ms:
+            runtime_metrics.increment(f'{prefix}.budget_exceeded.total')
+        if status != 'success' or secrets.randbelow(10000) < int(SCAN_LOG_SAMPLE_RATE * 10000):
+            # Outcome and timings only. Never the submitted code, the
+            # coordinates or anything else the student sent.
+            app.logger.info('%s %s', self.log_label, json.dumps({
+                'outcome': outcome,
+                'total_ms': round(total_ms, 2),
+                'stages_ms': {key: round(value, 2) for key, value in self.stages.items()},
+            }, separators=(',', ':')))
+        # `outcome` is the machine-readable reason. The offline queue needs it:
+        # 409 covers "already marked" (a success from where the student
+        # stands) as well as "the class had ended" and "that queued scan is
+        # somebody else's", which are emphatically not.
+        body = {'status': status, 'message': message, 'outcome': outcome}
+        if extra:
+            body.update(extra)
+        response = jsonify(body)
+        if self.stages:
+            response.headers['Server-Timing'] = ', '.join(
+                f'{name};dur={value:.2f}' for name, value in self.stages.items()
+            )
+        for header, value in (headers or {}).items():
+            response.headers[header] = value
+        return response, http_status
+
+    def refuse(self, refusal):
+        return self.respond('error', refusal.message, refusal.http_status,
+                            refusal.outcome, headers=refusal.headers,
+                            extra=refusal.extra)
+
+
+def _attendance_target(session_id, student_id, include_existing=False):
+    """
+    Session, course, room AND this student's enrolment in ONE round trip.
+
+    The enrolment used to be a second statement, and on a hot path a
+    statement is not free even when the row it wants is in shared buffers: it
+    is a network round trip to Postgres, a parse/plan cache lookup, and a full
+    pass through SQLAlchemy's execution machinery. Measured at 5 SQL
+    statements per successful scan before this was merged.
+
+    The outer join is what keeps the answers distinguishable: no row at all
+    means the SESSION does not exist, a row with a NULL ``enrolled`` means it
+    exists but this student is not on the course.
+
+    ``include_existing`` also outer-joins this student's attendance row for
+    the session (served by the unique index), so the manual path can answer
+    "already marked" before spending a guess — still one statement.
+    """
+    query = (
+        select(
+            ClassSession.id.label('session_id'),
+            ClassSession.title.label('session_title'),
+            ClassSession.active.label('session_active'),
+            ClassSession.ended_at.label('session_ended_at'),
+            Course.id.label('course_id'),
+            Course.code.label('course_code'),
+            Course.title.label('course_title'),
+            Course.archived.label('course_archived'),
+            # The saved room, so a pin Redis has lost can be rebuilt without
+            # a second round trip on the scan path.
+            Classroom.latitude.label('room_lat'),
+            Classroom.longitude.label('room_lon'),
+            # This room's own geofence radius, if it was given one — the join
+            # is already happening for room_lat/room_lon, so reading it costs
+            # nothing extra here.
+            Classroom.radius_m.label('room_radius_m'),
+            # NULL unless this student is enrolled on this course.
+            enrollments.c.user_id.label('enrolled'),
+        )
+        .join(Course, Course.id == ClassSession.course_id)
+        .outerjoin(Classroom, Classroom.id == ClassSession.classroom_id)
+        .outerjoin(
+            enrollments,
+            (enrollments.c.course_id == ClassSession.course_id)
+            & (enrollments.c.user_id == student_id),
+        )
+    )
+    if include_existing:
+        query = (query
+                 .add_columns(Attendance.id.label('existing_id'),
+                              Attendance.submission_method.label('existing_method'),
+                              Attendance.timestamp.label('existing_at'))
+                 .outerjoin(Attendance,
+                            (Attendance.session_id == ClassSession.id)
+                            & (Attendance.student_id == student_id)))
+    return db.session.execute(
+        query.where(ClassSession.id == session_id)).mappings().one_or_none()
+
+
+def _refuse_unless_open(target):
+    # "End Class" has to mean something here, or it means nothing at all.
+    # The session's state is authoritative, not a token's or a code's age.
+    # This is the early, cheap answer; the insert re-checks it under the
+    # session row lock, which is what actually decides a race.
+    if not target['session_active'] or target['session_ended_at'] is not None:
+        raise AttendanceRefusal('This class has ended. Attendance is closed.',
+                                409, 'session_ended')
+    if target['course_archived']:
+        raise AttendanceRefusal('This course is archived.', 409, 'course_archived')
+
+
+def _refuse_unless_enrolled(target, name_the_course=True):
+    """
+    On this course's roster — or refused.
+
+    Enrolment IS the institution boundary, for both methods, exactly as it
+    always has been for scans: register_course only ever enrols a student on
+    an offering at their own university, so a student at one university can
+    never be on another's roster, and therefore never reaches its register by
+    either method. (Re-checking institutions here as well was tried and
+    rejected: it would refuse legacy enrolments the QR path has always
+    honoured.)
+
+    ``name_the_course`` is False when the session id came from the client
+    (the manual path): naming the course in the refusal would let a student
+    walk session ids and read every class's course code. A QR token is
+    signed, so a scan can only name a session that was really projected.
+    """
+    if target is not None and target['enrolled'] is not None:
+        return
+    message = (f"Access denied: you are not registered for {target['course_code']}."
+               if name_the_course and target is not None
+               else 'You are not registered for that class.')
+    raise AttendanceRefusal(message, 403, 'not_enrolled')
+
+
+def _admit_or_refuse(target, message=None):
+    """
+    The per-session token bucket in front of the write path.
+
+    Placed after the cheap rejections (a forged token or wrong code, a closed
+    class, a student who is not on the course should never consume a token)
+    and before anything touches the database: it shapes the arrival rate into
+    the only part of the request Postgres has to absorb. Shared by both
+    methods, because both write to the same session.
+    """
+    if not admit_scan(target['session_id']):
+        runtime_metrics.increment('scan.admission.shed')
+        raise AttendanceRefusal(
+            message or ('The class is being marked very quickly right now. '
+                        'Your scan was not lost — please try again in a moment.'),
+            429, 'admission_throttled',
+            headers={'Retry-After': str(max(1, round(SCAN_ADMISSION_RETRY_SECONDS)))},
+        )
+    runtime_metrics.increment('scan.admission.admitted')
+
+
+def _enforce_classroom_geofence(target, data, again='scan again'):
+    """
+    The classroom geofence, server-enforced, identical for both methods.
+
+    Nothing here trusts a distance the client computed or lets the client
+    switch the check off: the only inputs are the raw fix (coordinates, its
+    reported accuracy, its age) and the pin, which comes from the saved room
+    or the lecturer's own pin. `again` only changes the wording of the remedy.
+    """
+    if target['room_lat'] is not None:
+        # A meeting held in a saved room is pinned to exactly that room by
+        # every path that can set a pin — starting the class in it, moving the
+        # class into it, and the projector's periodic set_location, which
+        # defers to the room. So the row the join already returned IS the
+        # pin, and reading Redis for it was a round trip per scan to learn the
+        # same two numbers (or, on a cache miss, to write them back). The
+        # database is also the more current of the two if the room is ever
+        # corrected.
+        class_loc = {'lat': target['room_lat'], 'lon': target['room_lon']}
+    else:
+        class_loc = get_class_location(target['session_id'], target['course_id'])
+
+    if not class_loc:
+        if GEOFENCE_REQUIRED:
+            # No pinned classroom means no proof of presence, so refuse rather
+            # than silently accepting from anywhere.
+            app.logger.warning(
+                'Attendance refused: GEOFENCE_REQUIRED is on and course %s has '
+                'no pinned location', target['course_id'],
+            )
+            raise AttendanceRefusal(
+                # Naming the remedy the lecturer can actually carry out. It
+                # used to say "allow location access", which on a projector
+                # laptop is the advice that produced a pin 36km away.
+                'This class has no classroom set yet. Ask your lecturer to '
+                'choose one on the QR screen.',
+                422, 'no_class_location',
+            )
+        return
+
+    try:
+        student_lat = float(data['lat'])
+        student_lon = float(data['lon'])
+    except (KeyError, TypeError, ValueError):
+        raise AttendanceRefusal('Location required. Please allow GPS access.',
+                                422, 'missing_location') from None
+    if not (math.isfinite(student_lat) and math.isfinite(student_lon)
+            and -90 <= student_lat <= 90 and -180 <= student_lon <= 180):
+        raise AttendanceRefusal('Location coordinates are invalid.',
+                                422, 'invalid_location')
+
+    # These fields were accepted-if-present and ignored otherwise, so the way
+    # past every proximity check was to leave them out. They are required
+    # now, and a value outside its plausible range is a rejection rather than
+    # a shrug.
+    #
+    # None of this makes a browser's coordinates trustworthy — they are
+    # self-reported and a determined student can override the geolocation
+    # API. It removes the trivial paths and bounds the rest; the register is
+    # evidence of a submission, not of a body in a seat.
+    location_age_ms = data.get('location_age_ms')
+    if (not isinstance(location_age_ms, (int, float)) or isinstance(location_age_ms, bool)
+            or not math.isfinite(location_age_ms)):
+        raise AttendanceRefusal(
+            'Your device did not report how fresh its location is. '
+            f'Please allow GPS access and {again}.',
+            422, 'missing_location_age')
+    if location_age_ms < 0 or location_age_ms > GEOFENCE_MAX_LOCATION_AGE_MS:
+        raise AttendanceRefusal(f'Location fix is stale. Please {again}.',
+                                422, 'stale_location')
+
+    accuracy_m = data.get('accuracy_m')
+    if (not isinstance(accuracy_m, (int, float)) or isinstance(accuracy_m, bool)
+            or not math.isfinite(accuracy_m)):
+        raise AttendanceRefusal(
+            'Your device did not report its location accuracy. '
+            f'Please allow precise GPS access and {again}.',
+            422, 'missing_location_accuracy')
+    if accuracy_m < 0 or accuracy_m > GEOFENCE_MAX_ACCURACY_M:
+        raise AttendanceRefusal(
+            f'Your location is only accurate to {int(accuracy_m)}m, which is '
+            f'too imprecise to confirm you are in the classroom. Move '
+            f'towards a window and {again}.',
+            422, 'imprecise_location',
+            extra={'accuracy_m': round(accuracy_m),
+                   'max_accuracy_m': GEOFENCE_MAX_ACCURACY_M},
+        )
+
+    distance_m = calculate_distance(
+        class_loc['lat'], class_loc['lon'], student_lat, student_lon
+    )
+    # A saved classroom may have its own threshold; anything else (an ad-hoc
+    # pin, or a room that never set one) uses the server-wide default.
+    geofence_radius_m = target['room_radius_m'] or GEOFENCE_RADIUS_M
+    if distance_m > geofence_radius_m + geofence_allowance_m(accuracy_m, geofence_radius_m):
+        raise AttendanceRefusal(
+            f'Too far from the classroom. You are {int(distance_m)}m away '
+            f'(max {int(geofence_radius_m)}m).',
+            422, 'outside_geofence',
+            # What the client needs to tell drift (wait for a better fix and
+            # go again on its own) from being somewhere else (say so now).
+            # Nothing here the message does not already say in words.
+            extra={'distance_m': round(distance_m),
+                   'radius_m': round(geofence_radius_m),
+                   'accuracy_m': round(accuracy_m)},
+        )
+
+
+def _marked_details(submission_method, timestamp):
+    """How and when a record was made, for the student's own confirmation."""
+    method = submission_method or SUBMISSION_QR
+    return {
+        'submission_method': method,
+        'submission_method_label': SUBMISSION_METHOD_LABELS.get(method, method),
+        'marked_at': iso_utc(timestamp),
+        'marked_at_local': local_time_only(timestamp) if timestamp else None,
+    }
+
+
+def _duplicate_refusal(target, submission_method, timestamp):
+    return AttendanceRefusal(
+        'You are already marked present for this class.', 409, 'duplicate',
+        extra={'course_code': target['course_code'],
+               'course_title': target['course_title'],
+               **_marked_details(submission_method, timestamp)})
+
+
+def _record_attendance(target, user, data, submission_method, timer):
+    """
+    Write the attendance row — the one step both methods end in.
+
+    Returns ``(record_id, recorded_at)``, or raises the refusal for the two
+    ways nothing is written: already on the register (by either method), or
+    the class closed under us (see _insert_attendance_once).
+    """
+    # Read the two User columns the CampOS hand-off needs BEFORE the insert
+    # commits. SQLAlchemy expires every instance in the session on commit
+    # (expire_on_commit defaults True), so touching `current_user.matric_no`
+    # afterwards silently issued a second full `SELECT "user".*` — a whole
+    # extra round trip on every SUCCESSFUL submission, to re-read two strings
+    # that were already in memory a microsecond earlier.
+    student_matric_no = user.matric_no
+    student_email = user.email
+    student_id = user.id
+
+    scanned_at = _utcnow()
+    # 'pending' only when there is somewhere to deliver to. On a deployment
+    # with no CampOS this stays 'skipped', so the outbox does not accumulate
+    # a backlog of work that will never be owed to anyone.
+    deliver_to_campos = campos_is_configured()
+    record_id = _insert_attendance_once(
+        student_id,
+        target['course_id'],
+        target['session_id'],
+        str(data.get('device_id') or 'browser')[:200],
+        scanned_at,
+        campos_state='pending' if deliver_to_campos else 'skipped',
+        # The sweeper's earliest interest. The in-process attempt below gets
+        # this long to succeed before the row is treated as abandoned, so the
+        # two never race over a healthy delivery.
+        campos_next_attempt_at=(
+            scanned_at + timedelta(seconds=CAMPOS_FIRST_SWEEP_DELAY_SECONDS)
+            if deliver_to_campos else None),
+        submission_method=submission_method,
+    )
+    timer.checkpoint('db_insert')
+    if record_id is None:
+        # Nothing inserted: either a row already exists (a retry, a double
+        # tap, the other method a moment earlier) or the class ended while
+        # this request was in flight. One indexed read, on this path only.
+        existing = _existing_attendance(student_id, target['session_id'])
+        if existing is None:
+            runtime_metrics.increment('attendance.closed_during_submission')
+            raise AttendanceRefusal('This class has ended. Attendance is closed.',
+                                    409, 'session_ended')
+        raise _duplicate_refusal(target, existing['submission_method'],
+                                 existing['timestamp'])
+
+    # Deliberately NO cache invalidation here. The lecturer's headcount is
+    # cached for ATTENDEE_SUMMARY_TTL seconds, so it is at most that stale
+    # whether or not each submission deletes the key — and deleting it made
+    # every one of 2,000 scans do a Redis round trip inside the request, to
+    # buy back at most two seconds on a number that is already moving.
+
+    # CampOS receives the same payload however the student marked attendance;
+    # the record it describes is the same official record.
+    if deliver_to_campos and campos_executor.submit(
+        report_attendance_to_campos,
+        {
+            'attendance_id': record_id,
+            'session_id': target['session_id'],
+            'campos_attempts': 0,
+            'matric_no': student_matric_no,
+            'email': student_email,
+            'course_code': target['course_code'],
+            'course_title': target['course_title'],
+            'session_title': target['session_title'],
+            'scanned_at_iso': scanned_at.isoformat() + 'Z',
+        },
+    ) is None:
+        # No longer a lost record — just a slower one. The row is 'pending'
+        # in the database, so the sweeper will deliver it.
+        runtime_metrics.increment('campos.deferred_to_sweeper')
+        app.logger.info(
+            'CampOS delivery queue full; attendance id %s deferred to the '
+            'outbox sweeper', record_id)
+
+    # Nothing else happens on a submission. A scan used to queue a
+    # confirmation email, a WhatsApp, parent copies of both and an
+    # attendance-threshold check — five extra queries and up to four outbound
+    # jobs per student. The register is the record; students read it on
+    # their dashboard.
+    timer.checkpoint('enqueue')
+    runtime_metrics.increment(f'attendance.recorded.{submission_method}')
+    return record_id, scanned_at
+
+
+def _saturated_response(timer, noun):
+    """Pool exhausted: saturation, not a fault, and retryable."""
+    db.session.rollback()
+    runtime_metrics.increment('db.pool.exhausted')
+    app.logger.error('Attendance refused: no database connection available')
+    return timer.respond(
+        'error',
+        'The system is very busy right now. Please try again in a moment '
+        f'— your {noun} was not recorded.',
+        503, 'database_saturated',
+        headers={'Retry-After': str(max(1, int(
+            os.environ.get('DB_SATURATION_RETRY_SECONDS', 2))))},
+    )
+
+
 def _count_scan_attempt(response):
     # Server overload is not student misuse. Retrying admission shedding or
     # a database failure must not exhaust the student's minute allowance.
@@ -6503,7 +7295,7 @@ def _count_scan_attempt(response):
 @login_required
 def mark_attendance():
     """
-    Record one scan.
+    Record one QR scan.
 
     Every rejection carries a real HTTP status code, because the phone
     scanner decides whether to stop, retry or back off from that status:
@@ -6527,166 +7319,58 @@ def mark_attendance():
     status alone no longer identifies the reason: 409 covers both "you are
     already on the register" (fine) and "that class had ended" (not fine), and
     the offline queue must not report the second as a success.
+
+    Everything after the token check is the shared attendance pipeline, which
+    the manual-code endpoint uses too.
     """
-    request_started = time.perf_counter()
-    stage_started = request_started
-    stages = {}
-
-    def checkpoint(name):
-        nonlocal stage_started
-        now = time.perf_counter()
-        duration_ms = (now - stage_started) * 1000
-        stages[name] = duration_ms
-        runtime_metrics.observe_ms(f'scan.stage.{name}', duration_ms)
-        # Which stage broke its contract, counted separately from how long it
-        # took. During a rehearsal this is the difference between "scans are
-        # slow" and "db_insert is over budget and nothing else is".
-        budget = SCAN_STAGE_BUDGET_MS.get(name)
-        if budget and duration_ms > budget:
-            runtime_metrics.increment(f'scan.budget_exceeded.{name}')
-        stage_started = now
-
-    def respond(status, message, http_status, outcome, headers=None, extra=None):
-        total_ms = (time.perf_counter() - request_started) * 1000
-        runtime_metrics.observe_ms('scan.response', total_ms)
-        runtime_metrics.increment(f'scan.outcome.{outcome}')
-        if total_ms > SCAN_TOTAL_BUDGET_MS:
-            runtime_metrics.increment('scan.budget_exceeded.total')
-        if status != 'success' or secrets.randbelow(10000) < int(SCAN_LOG_SAMPLE_RATE * 10000):
-            app.logger.info('scan_performance %s', json.dumps({
-                'outcome': outcome,
-                'total_ms': round(total_ms, 2),
-                'stages_ms': {key: round(value, 2) for key, value in stages.items()},
-            }, separators=(',', ':')))
-        # `outcome` is the machine-readable reason. The offline queue needs it:
-        # 409 now covers "already marked" (a success from where the student
-        # stands) as well as "the class had ended" and "that queued scan is
-        # somebody else's", which are emphatically not.
-        body = {'status': status, 'message': message, 'outcome': outcome}
-        if extra:
-            body.update(extra)
-        response = jsonify(body)
-        if stages:
-            response.headers['Server-Timing'] = ', '.join(
-                f'{name};dur={value:.2f}' for name, value in stages.items()
-            )
-        for header, value in (headers or {}).items():
-            response.headers[header] = value
-        return response, http_status
-
-    data = request.get_json(silent=True) or {}
+    timer = _AttendanceRequest('scan', 'scan_performance',
+                               SCAN_STAGE_BUDGET_MS, SCAN_TOTAL_BUDGET_MS)
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        data = {}
 
     try:
         qr_text = data.get('qr_data')
         if not qr_text:
-            return respond('error', 'No QR data provided.', 400, 'missing_qr')
+            return timer.respond('error', 'No QR data provided.', 400, 'missing_qr')
 
         try:
             session_id, _token_timestamp = verify_signed_qr(qr_text)
         except ValueError as error:
-            return respond('error', str(error), 400, 'invalid_qr')
-        checkpoint('qr_verify')
+            return timer.respond('error', str(error), 400, 'invalid_qr')
+        timer.checkpoint('qr_verify')
 
-        # Session, course, room AND this student's enrolment in ONE round
-        # trip. The enrolment used to be a second statement, and on a hot path
-        # a statement is not free even when the row it wants is in shared
-        # buffers: it is a network round trip to Postgres, a parse/plan cache
-        # lookup, and a full pass through SQLAlchemy's execution machinery.
-        # Measured at 5 SQL statements per successful scan before this change.
-        #
-        # The outer join is what keeps the two answers distinguishable: no row
-        # at all means the SESSION does not exist (404), a row with a NULL
-        # `enrolled` means the session exists but this student is not on the
-        # course (403). Collapsing those two into one status would tell an
-        # attacker probing session ids which ones are real.
-        target = db.session.execute(
-            select(
-                ClassSession.id.label('session_id'),
-                ClassSession.title.label('session_title'),
-                ClassSession.active.label('session_active'),
-                ClassSession.ended_at.label('session_ended_at'),
-                Course.id.label('course_id'),
-                Course.code.label('course_code'),
-                Course.title.label('course_title'),
-                Course.archived.label('course_archived'),
-                # The saved room, so a pin Redis has lost can be rebuilt
-                # without a second round trip on the scan path.
-                Classroom.latitude.label('room_lat'),
-                Classroom.longitude.label('room_lon'),
-                # This room's own geofence radius, if it was given one — the
-                # join is already happening for room_lat/room_lon, so reading
-                # it costs nothing extra here.
-                Classroom.radius_m.label('room_radius_m'),
-                # NULL unless this student is enrolled on this course.
-                enrollments.c.user_id.label('enrolled'),
-            )
-            .join(Course, Course.id == ClassSession.course_id)
-            .outerjoin(Classroom, Classroom.id == ClassSession.classroom_id)
-            .outerjoin(
-                enrollments,
-                (enrollments.c.course_id == ClassSession.course_id)
-                & (enrollments.c.user_id == current_user.id),
-            )
-            .where(ClassSession.id == session_id)
-        ).mappings().one_or_none()
-        checkpoint('session_course')
+        target = _attendance_target(session_id, current_user.id)
+        timer.checkpoint('session_course')
         if target is None:
-            return respond('error', 'Invalid QR Code: Class session not found.',
-                           404, 'missing_session')
+            # A signed token naming a session that no longer exists. Told
+            # apart from "not enrolled" (403), because only a real projected
+            # token can get this far.
+            return timer.respond('error', 'Invalid QR Code: Class session not found.',
+                                 404, 'missing_session')
 
-        # "End Class" has to mean something here, or it means nothing at all.
-        # Checking the token's age alone left every code minted in the last
-        # QR_CODE_WINDOW seconds redeemable after the lecturer ended the
-        # class — including a photograph of the projector taken on the way
-        # out. The session's state is authoritative, not the token's age.
-        if not target['session_active'] or target['session_ended_at'] is not None:
-            return respond('error',
-                           'This class has ended. Attendance is closed.',
-                           409, 'session_ended')
-
-        if target['course_archived']:
-            return respond('error', 'This course is archived.',
-                           409, 'course_archived')
+        _refuse_unless_open(target)
 
         # A scan replayed from another phone's offline queue must never land
         # on whoever happens to be signed in now.
         user_marker = data.get('user_marker')
         if user_marker is not None and str(user_marker) != str(current_user.id):
-            return respond('error', 'That queued scan belongs to a different account.',
-                           409, 'wrong_user_queue')
+            return timer.respond('error', 'That queued scan belongs to a different account.',
+                                 409, 'wrong_user_queue')
 
         # Already answered by the join above; the composite primary key on
         # `enrollments` (user_id, course_id) serves the join directly.
-        checkpoint('enrollment')
-        if target['enrolled'] is None:
-            return respond(
-                'error',
-                f"Access denied: you are not registered for {target['course_code']}.",
-                403,
-                'not_enrolled',
-            )
+        timer.checkpoint('enrollment')
+        _refuse_unless_enrolled(target)
 
-        # Admission control sits here on purpose: after the cheap rejections
-        # (a forged token, a closed class, a student who is not on the course
-        # should never consume a token) and before anything touches the
-        # database. It shapes the arrival rate into the write path, which is
-        # the only part of this request that Postgres has to absorb.
-        if not admit_scan(target['session_id']):
-            runtime_metrics.increment('scan.admission.shed')
-            return respond(
-                'error',
-                'The class is being marked very quickly right now. '
-                'Your scan was not lost — please try again in a moment.',
-                429,
-                'admission_throttled',
-                headers={'Retry-After': str(max(1, round(SCAN_ADMISSION_RETRY_SECONDS)))},
-            )
-        runtime_metrics.increment('scan.admission.admitted')
-        checkpoint('admission')
+        _admit_or_refuse(target)
+        timer.checkpoint('admission')
 
         # How long ago the CLIENT says it read the code. Checked against the
         # token timestamp rather than the arrival time, so a scan that queued
         # offline is still judged on when the camera actually saw the screen.
+        # QR-only: a typed code has no camera capture time, and the manual
+        # path never relaxes or reuses this check.
         captured_epoch = _parse_client_timestamp(data.get('captured_at'))
         if captured_epoch is None:
             if REQUIRE_CAPTURED_AT:
@@ -6695,119 +7379,20 @@ def mark_attendance():
                 # `captured_at` failed to parse made omitting it the way to
                 # avoid it — the same shape of hole `accuracy_m` and
                 # `location_age_ms` had.
-                return respond('error',
-                               'Your device did not report when it read the code. '
-                               'Please reload the scan page and try again.',
-                               400, 'missing_capture_time')
+                return timer.respond('error',
+                                     'Your device did not report when it read the code. '
+                                     'Please reload the scan page and try again.',
+                                     400, 'missing_capture_time')
         else:
             capture_lag = captured_epoch - _token_timestamp
             if capture_lag > QR_CAPTURE_WINDOW or capture_lag < -QR_CAPTURE_WINDOW:
-                return respond('error',
-                               'That code was not read from the screen just now. '
-                               'Please scan the current code.',
-                               400, 'capture_out_of_window')
+                return timer.respond('error',
+                                     'That code was not read from the screen just now. '
+                                     'Please scan the current code.',
+                                     400, 'capture_out_of_window')
 
-        if target['room_lat'] is not None:
-            # A meeting held in a saved room is pinned to exactly that room by
-            # every path that can set a pin — starting the class in it,
-            # moving the class into it, and the projector's periodic
-            # set_location, which defers to the room. So the row the join
-            # already returned IS the pin, and reading Redis for it was a
-            # round trip per scan to learn the same two numbers (or, on a
-            # cache miss, to write them back). The database is also the more
-            # current of the two if the room is ever corrected.
-            class_loc = {'lat': target['room_lat'], 'lon': target['room_lon']}
-        else:
-            class_loc = get_class_location(target['session_id'], target['course_id'])
-        if class_loc:
-            try:
-                student_lat = float(data['lat'])
-                student_lon = float(data['lon'])
-            except (KeyError, TypeError, ValueError):
-                return respond('error', 'Location required. Please allow GPS access.',
-                               422, 'missing_location')
-            if not (-90 <= student_lat <= 90 and -180 <= student_lon <= 180):
-                return respond('error', 'Location coordinates are invalid.',
-                               422, 'invalid_location')
-
-            # These fields were accepted-if-present and ignored otherwise, so
-            # the way past every proximity check was to leave them out. They
-            # are required now, and a value outside its plausible range is a
-            # rejection rather than a shrug.
-            #
-            # None of this makes a browser's coordinates trustworthy — they
-            # are self-reported and a determined student can override the
-            # geolocation API. It removes the trivial paths and bounds the
-            # rest; the register is evidence of a scan, not of a body in a
-            # seat.
-            location_age_ms = data.get('location_age_ms')
-            if not isinstance(location_age_ms, (int, float)) or isinstance(location_age_ms, bool):
-                return respond('error',
-                               'Your device did not report how fresh its location is. '
-                               'Please allow GPS access and scan again.',
-                               422, 'missing_location_age')
-            if location_age_ms < 0 or location_age_ms > GEOFENCE_MAX_LOCATION_AGE_MS:
-                return respond('error', 'Location fix is stale. Please scan again.',
-                               422, 'stale_location')
-
-            accuracy_m = data.get('accuracy_m')
-            if not isinstance(accuracy_m, (int, float)) or isinstance(accuracy_m, bool):
-                return respond('error',
-                               'Your device did not report its location accuracy. '
-                               'Please allow precise GPS access and scan again.',
-                               422, 'missing_location_accuracy')
-            if accuracy_m < 0 or accuracy_m > GEOFENCE_MAX_ACCURACY_M:
-                return respond(
-                    'error',
-                    f'Your location is only accurate to {int(accuracy_m)}m, which is '
-                    f'too imprecise to confirm you are in the classroom. Move '
-                    f'towards a window and scan again.',
-                    422, 'imprecise_location',
-                    extra={'accuracy_m': round(accuracy_m),
-                           'max_accuracy_m': GEOFENCE_MAX_ACCURACY_M},
-                )
-
-            distance_m = calculate_distance(
-                class_loc['lat'], class_loc['lon'], student_lat, student_lon
-            )
-            # A saved classroom may have its own threshold; anything else
-            # (an ad-hoc pin, or a room that never set one) uses the
-            # server-wide default.
-            geofence_radius_m = target['room_radius_m'] or GEOFENCE_RADIUS_M
-            if distance_m > geofence_radius_m + geofence_allowance_m(
-                    accuracy_m, geofence_radius_m):
-                return respond(
-                    'error',
-                    f'Too far from the classroom. You are {int(distance_m)}m away '
-                    f'(max {int(geofence_radius_m)}m).',
-                    422,
-                    'outside_geofence',
-                    # What the scanner needs to tell drift (wait for a better
-                    # fix and go again on its own) from being somewhere else
-                    # (say so now). Nothing here the message does not already
-                    # say in words.
-                    extra={'distance_m': round(distance_m),
-                           'radius_m': round(geofence_radius_m),
-                           'accuracy_m': round(accuracy_m)},
-                )
-        elif GEOFENCE_REQUIRED:
-            # Opt-in strict mode: no pinned classroom means no proof of
-            # presence, so refuse rather than silently accepting from anywhere.
-            app.logger.warning(
-                'Scan refused: GEOFENCE_REQUIRED is on and course %s has no pinned location',
-                target['course_id'],
-            )
-            return respond(
-                'error',
-                # Naming the remedy the lecturer can actually carry out. It
-                # used to say "allow location access", which on a projector
-                # laptop is the advice that produced a pin 36km away.
-                'This class has no classroom set yet. Ask your lecturer to '
-                'choose one on the QR screen.',
-                422,
-                'no_class_location',
-            )
-        checkpoint('geofence')
+        _enforce_classroom_geofence(target, data)
+        timer.checkpoint('geofence')
 
         client_metrics = data.get('client_metrics')
         if isinstance(client_metrics, dict):
@@ -6817,112 +7402,395 @@ def mark_attendance():
                 if isinstance(value, (int, float)) and 0 <= value <= 120000:
                     runtime_metrics.observe_ms(f'client.{metric_name}', value)
 
-        # Read the two User columns the CampOS hand-off needs BEFORE the
-        # insert commits. SQLAlchemy expires every instance in the session on
-        # commit (expire_on_commit defaults True), so touching
-        # `current_user.matric_no` afterwards silently issued a second full
-        # `SELECT "user".*` — a whole extra round trip and a whole extra ORM
-        # materialisation on every SUCCESSFUL scan, to re-read two strings
-        # that were already in memory a microsecond earlier. Measured: 5 SQL
-        # statements per scan, of which this was the fifth.
-        student_matric_no = current_user.matric_no
-        student_email = current_user.email
-
-        scanned_at = _utcnow()
-        # 'pending' only when there is somewhere to deliver to. On a
-        # deployment with no CampOS this stays 'skipped', so the outbox does
-        # not accumulate a backlog of work that will never be owed to anyone.
-        deliver_to_campos = campos_is_configured()
-        record_id = _insert_attendance_once(
-            current_user.id,
-            target['course_id'],
-            target['session_id'],
-            str(data.get('device_id') or 'browser')[:200],
-            scanned_at,
-            campos_state='pending' if deliver_to_campos else 'skipped',
-            # The sweeper's earliest interest. The in-process attempt below
-            # gets this long to succeed before the row is treated as
-            # abandoned, so the two never race over a healthy delivery.
-            campos_next_attempt_at=(
-                scanned_at + timedelta(seconds=CAMPOS_FIRST_SWEEP_DELAY_SECONDS)
-                if deliver_to_campos else None),
-        )
-        checkpoint('db_insert')
-        if record_id is None:
-            return respond(
-                'error',
-                'You are already marked present for this class.',
-                409,
-                'duplicate',
-                extra={'course_code': target['course_code']},
-            )
-
-        # Deliberately NO cache invalidation here. The lecturer's headcount is
-        # cached for ATTENDEE_SUMMARY_TTL seconds, so it is at most that stale
-        # whether or not each scan deletes the key — and deleting it made every
-        # one of 2,000 scans do a Redis round trip inside the request, to buy
-        # back at most two seconds on a number that is already moving. Redis
-        # accelerates the lecturer's reads; it is not on the write path.
-
-        if deliver_to_campos and campos_executor.submit(
-            report_attendance_to_campos,
-            {
-                'attendance_id': record_id,
-                'session_id': target['session_id'],
-                'campos_attempts': 0,
-                'matric_no': student_matric_no,
-                'email': student_email,
-                'course_code': target['course_code'],
-                'course_title': target['course_title'],
-                'session_title': target['session_title'],
-                'scanned_at_iso': scanned_at.isoformat() + 'Z',
-            },
-        ) is None:
-            # No longer a lost record — just a slower one. The row is
-            # 'pending' in the database, so the sweeper will deliver it.
-            runtime_metrics.increment('campos.deferred_to_sweeper')
-            app.logger.info(
-                'CampOS delivery queue full; attendance id %s deferred to the '
-                'outbox sweeper', record_id)
-
-        # Nothing else happens on a scan. A scan used to queue a confirmation
-        # email, a WhatsApp, parent copies of both and an attendance-threshold
-        # check — five extra queries and up to four outbound jobs per student,
-        # all of it courtesy traffic nobody asked for. The register is the
-        # record; students read it on their dashboard.
-        checkpoint('enqueue')
+        _record_attendance(target, current_user, data, SUBMISSION_QR, timer)
 
         # Named, so the confirmation says WHICH class — and so the page can
         # bump that course's count in place instead of reloading for it.
-        return respond('success',
-                       f"Marked present for {target['course_code']}.",
-                       200, 'success',
-                       extra={'course_code': target['course_code'],
-                              'course_title': target['course_title'],
-                              'session_title': target['session_title']})
+        return timer.respond('success',
+                             f"Marked present for {target['course_code']}.",
+                             200, 'success',
+                             extra={'course_code': target['course_code'],
+                                    'course_title': target['course_title'],
+                                    'session_title': target['session_title']})
 
+    except AttendanceRefusal as refusal:
+        return timer.refuse(refusal)
     except PoolTimeoutError:
         # Saturation, not a fault. Told apart from a 500 so the scanner backs
         # off and retries instead of treating it as terminal, and so the
         # metric that fires points at the database rather than at this code.
-        db.session.rollback()
-        runtime_metrics.increment('db.pool.exhausted')
-        app.logger.error('Scan refused: no database connection available')
-        return respond(
-            'error',
-            'The system is very busy right now. Please try again in a moment '
-            '— your scan was not recorded.',
-            503, 'database_saturated',
-            headers={'Retry-After': str(max(1, int(
-                os.environ.get('DB_SATURATION_RETRY_SECONDS', 2))))},
-        )
+        return _saturated_response(timer, 'scan')
     except Exception:
         # Leave no half-finished transaction on this connection for whichever
         # request picks it up next.
         db.session.rollback()
         app.logger.exception('Server error in mark_attendance')
-        return respond('error', 'An unexpected server error occurred.',
-                       500, 'server_error')
+        return timer.respond('error', 'An unexpected server error occurred.',
+                             500, 'server_error')
+
+
+# ------------------------------------------------------------------
+# MANUAL ATTENDANCE CODE — the student side
+# ------------------------------------------------------------------
+
+#: Requests per minute per signed-in student, whatever their outcome. This
+#: only bounds request volume (a page stuck in a retry loop); WRONG CODES are
+#: bounded far more tightly by the attempt guard, which unlike this limiter
+#: fails closed.
+MANUAL_CODE_REQUEST_RATE_LIMIT = os.environ.get(
+    'MANUAL_CODE_REQUEST_RATE_LIMIT', '20 per minute')
+try:
+    from limits import parse_many as _parse_manual_limit
+    if not _parse_manual_limit(MANUAL_CODE_REQUEST_RATE_LIMIT):
+        raise ValueError('at least one limit is required')
+except ValueError as _manual_limit_error:
+    raise StartupError('CRITICAL: MANUAL_CODE_REQUEST_RATE_LIMIT is not a valid '
+                       'rate limit') from _manual_limit_error
+
+MANUAL_STAGE_BUDGET_MS = {
+    'validate': float(os.environ.get('BUDGET_MANUAL_VALIDATE_MS', 2)),
+    'session_course': float(os.environ.get('BUDGET_SESSION_COURSE_MS', 10)),
+    'guard': float(os.environ.get('BUDGET_MANUAL_GUARD_MS', 5)),
+    'code_verify': float(os.environ.get('BUDGET_MANUAL_CODE_VERIFY_MS', 1)),
+    'admission': float(os.environ.get('BUDGET_ADMISSION_MS', 5)),
+    'geofence': float(os.environ.get('BUDGET_GEOFENCE_MS', 5)),
+    'db_insert': float(os.environ.get('BUDGET_DB_INSERT_MS', 20)),
+    'enqueue': float(os.environ.get('BUDGET_ENQUEUE_MS', 5)),
+}
+
+#: How many of a student's open classes the picker lists. A student is in one
+#: room at a time; this is a sanity bound, not a feature.
+MANUAL_SESSION_LIST_LIMIT = 20
+
+# Retry guidance for a failed-closed guard: long enough not to hammer a store
+# that is down, short enough that a student tries again within the class.
+MANUAL_CODE_UNAVAILABLE_RETRY_SECONDS = 15
+
+_SESSION_ID_PATTERN = re.compile(r'[0-9]{1,10}')
+
+
+def _parse_session_id(value):
+    """A client-chosen session id: None when absent, ValueError when nonsense."""
+    if value is None or value == '':
+        return None
+    if isinstance(value, bool):
+        raise ValueError('session_id')
+    if isinstance(value, int):
+        session_id = value
+    elif isinstance(value, str) and _SESSION_ID_PATTERN.fullmatch(value.strip()):
+        session_id = int(value.strip())
+    else:
+        raise ValueError('session_id')
+    if not 1 <= session_id <= 2 ** 31 - 1:
+        raise ValueError('session_id')
+    return session_id
+
+
+def _manual_open_sessions(student):
+    """
+    The classes this student could be marking attendance for right now.
+
+    Open sessions of courses they are enrolled on, newest first, each with the record they already have, if any. One query:
+    enrolments by user (the composite primary key), sessions by
+    (course_id, active), and the student's attendance by the unique index.
+    """
+    rows = db.session.execute(
+        select(ClassSession.id.label('session_id'),
+               ClassSession.title.label('session_title'),
+               ClassSession.date_created.label('started_at'),
+               Course.code.label('course_code'),
+               Course.title.label('course_title'),
+               Attendance.submission_method.label('existing_method'),
+               Attendance.timestamp.label('existing_at'),
+               Attendance.id.label('existing_id'))
+        .join(Course, Course.id == ClassSession.course_id)
+        .join(enrollments, (enrollments.c.course_id == ClassSession.course_id)
+              & (enrollments.c.user_id == student.id))
+        .outerjoin(Attendance, (Attendance.session_id == ClassSession.id)
+                   & (Attendance.student_id == student.id))
+        .where(ClassSession.active.is_(True),
+               ClassSession.ended_at.is_(None),
+               Course.archived.is_(False))
+        .order_by(ClassSession.date_created.desc(), ClassSession.id.desc())
+        .limit(MANUAL_SESSION_LIST_LIMIT)
+    ).mappings().all()
+    sessions = []
+    for row in rows:
+        entry = {
+            'session_id': row['session_id'],
+            'course_code': row['course_code'],
+            'course_title': row['course_title'],
+            'session_title': row['session_title'],
+            'started_at': iso_utc(row['started_at']),
+            'started_at_local': local_time_only(row['started_at'])
+            if row['started_at'] else None,
+            'already_marked': row['existing_id'] is not None,
+        }
+        if row['existing_id'] is not None:
+            entry.update(_marked_details(row['existing_method'], row['existing_at']))
+        sessions.append(entry)
+    return sessions
+
+
+def _json_auth_refusal(timer):
+    """401/403 as JSON: an API answers in JSON, not with a login redirect."""
+    if not current_user.is_authenticated:
+        return timer.respond('error', 'Please sign in again to mark attendance.',
+                             401, 'not_authenticated')
+    if not user_has_role(current_user, STUDENT_ROLE):
+        return timer.respond('error', 'Only students can mark attendance with a code.',
+                             403, 'not_student')
+    return None
+
+
+def _humanize_seconds(seconds):
+    seconds = max(1, int(seconds))
+    if seconds < 90:
+        return f'{seconds} second{"" if seconds == 1 else "s"}'
+    minutes = -(-seconds // 60)
+    return f'{minutes} minute{"" if minutes == 1 else "s"}'
+
+
+@app.route('/api/attendance/manual/sessions')
+def manual_attendance_sessions():
+    """
+    Which class a typed code would be for: the student's open sessions.
+
+    Lists only the signed-in student's own courses, so it reveals nothing a
+    student does not already see on their dashboard. The manual-entry panel
+    asks for this when it is opened, so a class that started after the page
+    loaded is still offered.
+    """
+    timer = _AttendanceRequest('manual_sessions', 'manual_sessions',
+                               {}, SCAN_TOTAL_BUDGET_MS)
+    refused = _json_auth_refusal(timer)
+    if refused:
+        return refused
+    try:
+        sessions = _manual_open_sessions(current_user) if MANUAL_CODE_ENABLED else []
+    except PoolTimeoutError:
+        return _saturated_response(timer, 'request')
+    response, status = timer.respond('success', '', 200, 'success', extra={
+        'enabled': MANUAL_CODE_ENABLED,
+        'sessions': sessions,
+    })
+    response.headers['Cache-Control'] = 'no-store, private'
+    return response, status
+
+
+@app.route('/api/attendance/manual', methods=['POST'])
+@limiter.limit(lambda: MANUAL_CODE_REQUEST_RATE_LIMIT,
+               key_func=user_based_rate_limit_key,
+               deduct_when=_count_scan_attempt,
+               error_message='Too many attendance-code attempts. Please wait.')
+def submit_manual_attendance():
+    """
+    Mark attendance with the eight-digit code on the projector.
+
+    For a student whose camera cannot read the QR. Same session, same rules,
+    same record as a scan: only the proof of reading the screen differs.
+
+    Request (JSON; the student is ALWAYS the signed-in account, never a field):
+        code             "4826 9137" — spaces/hyphens allowed, 8 digits
+        session_id       optional when the student has exactly one open class
+        lat, lon, accuracy_m, location_age_ms   — as for a scan
+        device_id, user_marker                  — as for a scan
+
+    Outcomes, each with its own status so the page knows whether to retry:
+        200 success
+        400 invalid_code_format | invalid_request | session_required
+            | invalid_code (counts as a guess) | code_expired (does not)
+        401 not_authenticated     403 not_student | not_enrolled
+        404 no_active_session | manual_code_disabled
+        409 duplicate | session_ended | course_archived | wrong_user
+        422 location outcomes (identical to the QR path)
+        429 rate_limited (too many wrong codes, or the request limiter)
+            | admission_throttled
+        503 verification_unavailable (attempt store down: fails closed)
+            | database_saturated
+        500 server_error
+
+    Order matters. Enrolment is checked BEFORE the session's state, so a
+    student cannot learn anything about classes they are not on; "already
+    marked" is answered BEFORE the code is compared, so a student refreshing
+    after success never spends a guess; and a guess is reserved BEFORE the
+    code is compared, so concurrent guesses cannot exceed the limit.
+    """
+    timer = _AttendanceRequest('manual', 'manual_code_performance',
+                               MANUAL_STAGE_BUDGET_MS, SCAN_TOTAL_BUDGET_MS)
+    refused = _json_auth_refusal(timer)
+    if refused:
+        return refused
+    if not MANUAL_CODE_ENABLED:
+        return timer.respond('error', 'Attendance codes are turned off. '
+                             'Please scan the QR code instead.',
+                             404, 'manual_code_disabled')
+
+    reserved = None          # (guard, user_id, session_id) once a guess is held
+    keep_as_failure = False
+    try:
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return timer.respond('error', 'That request could not be read. '
+                                 'Reload the page and try again.',
+                                 400, 'invalid_request')
+
+        code = normalize_manual_code(data.get('code'))
+        if code is None:
+            # Malformed input is not a guess at a code, so it costs nothing.
+            return timer.respond('error', 'Enter the 8-digit code shown on the screen.',
+                                 400, 'invalid_code_format')
+        try:
+            requested_session = _parse_session_id(data.get('session_id'))
+        except ValueError:
+            return timer.respond('error', 'That class could not be found. '
+                                 'Reload the page and choose your class again.',
+                                 400, 'invalid_request')
+
+        user_marker = data.get('user_marker')
+        if user_marker is not None and str(user_marker) != str(current_user.id):
+            # The page was rendered for whoever used this phone before.
+            return timer.respond('error', 'This page was opened by a different '
+                                 'account. Reload the page and try again.',
+                                 409, 'wrong_user')
+        timer.checkpoint('validate')
+
+        if requested_session is None:
+            # Pick the class only when there is exactly one it could be.
+            # Never guess between several: a code typed into the wrong class
+            # is refused as wrong, and the student is none the wiser why.
+            open_sessions = _manual_open_sessions(current_user)
+            if not open_sessions:
+                return timer.respond(
+                    'error', 'None of your classes is taking attendance right now. '
+                    'Check that your lecturer has started the class.',
+                    404, 'no_active_session')
+            if len(open_sessions) > 1:
+                return timer.respond(
+                    'error', 'More than one of your classes is taking attendance '
+                    'right now. Choose the class you are in.',
+                    400, 'session_required', extra={'sessions': open_sessions})
+            requested_session = open_sessions[0]['session_id']
+
+        target = _attendance_target(requested_session, current_user.id,
+                                    include_existing=True)
+        timer.checkpoint('session_course')
+        # A session that does not exist and one this student is not on get
+        # the SAME answer: the id came from the client, and telling them
+        # apart would let anyone map which session ids are real.
+        _refuse_unless_enrolled(target, name_the_course=False)
+        _refuse_unless_open(target)
+        if target['existing_id'] is not None:
+            # Already on the register (by either method): answered before a
+            # guess is spent, so reloading after success can never lock
+            # anyone out.
+            raise _duplicate_refusal(target, target['existing_method'],
+                                     target['existing_at'])
+
+        try:
+            guard = manual_attempt_guard()
+            reservation = guard.reserve(current_user.id, target['session_id'])
+        except GuardUnavailable as error:
+            # FAIL CLOSED. Without the shared counter there is no limit on
+            # guesses, so no code is checked at all. The QR path does not
+            # depend on this store and keeps working.
+            runtime_metrics.increment('manual.guard_unavailable')
+            app.logger.warning('Manual attendance code refused: attempt store '
+                               'unavailable (%s)', type(error).__name__)
+            return timer.respond(
+                'error', 'Attendance codes cannot be checked right now. Please '
+                'scan the QR code, or try the code again in a moment.',
+                503, 'verification_unavailable',
+                headers={'Retry-After': str(MANUAL_CODE_UNAVAILABLE_RETRY_SECONDS)},
+                extra={'retry_after_seconds': MANUAL_CODE_UNAVAILABLE_RETRY_SECONDS})
+        if not reservation.allowed:
+            runtime_metrics.increment('manual.guard_refused')
+            wait = reservation.retry_after_seconds
+            message = (f'Too many attempts at once. Try again in {_humanize_seconds(wait)}.'
+                       if reservation.in_flight else
+                       f'Too many incorrect codes. Try again in '
+                       f'{_humanize_seconds(wait)}, or scan the QR code.')
+            return timer.respond(
+                'error', message, 429, 'rate_limited',
+                headers={'Retry-After': str(wait)},
+                extra={'retry_after_seconds': wait, 'scope': reservation.scope,
+                       'in_flight': reservation.in_flight})
+        reserved = (guard, current_user.id, target['session_id'])
+        timer.checkpoint('guard')
+
+        verification = manual_code_generator.verify(target['session_id'], code)
+        timer.checkpoint('code_verify')
+        if verification.result == MANUAL_CODE_EXPIRED:
+            # Only someone who saw a real code can send one that has expired,
+            # so this is not counted as a guess. Tell them to read it again.
+            return timer.respond(
+                'error', 'That code has just changed. Enter the new code shown '
+                'on the screen.', 400, 'code_expired')
+        if not verification.ok:
+            keep_as_failure = True
+            runtime_metrics.increment('manual.invalid_code')
+            try:
+                failure = guard.record_failure(current_user.id, target['session_id'])
+            except GuardUnavailable:
+                # The guess is already counted by the reservation; only the
+                # lockout bookkeeping was lost. Report the conservative case.
+                failure = None
+            extra = {'attempts_remaining': failure.attempts_remaining if failure else 0}
+            headers = None
+            message = 'That code is not correct. Check the code on the screen and try again.'
+            if failure and failure.locked_for_seconds:
+                extra['retry_after_seconds'] = failure.locked_for_seconds
+                headers = {'Retry-After': str(failure.locked_for_seconds)}
+                message = ('That code is not correct, and that was too many incorrect '
+                           f'codes. Try again in {_humanize_seconds(failure.locked_for_seconds)}, '
+                           'or scan the QR code.')
+            elif failure and failure.attempts_remaining <= 3:
+                left = failure.attempts_remaining
+                message += f' {left} attempt{"" if left == 1 else "s"} left.'
+            return timer.respond('error', message, 400, 'invalid_code',
+                                 headers=headers, extra=extra)
+        runtime_metrics.increment(f'manual.code_accepted.{verification.reason}')
+
+        _admit_or_refuse(target, message=(
+            'The class is being marked very quickly right now. Please press '
+            'Submit again in a moment — your attendance is not recorded yet.'))
+        timer.checkpoint('admission')
+
+        _enforce_classroom_geofence(target, data, again='try again')
+        timer.checkpoint('geofence')
+
+        _record_id, recorded_at = _record_attendance(
+            target, current_user, data, SUBMISSION_MANUAL_CODE, timer)
+
+        return timer.respond(
+            'success', f"Attendance successfully marked for {target['course_code']}.",
+            200, 'success',
+            extra={'course_code': target['course_code'],
+                   'course_title': target['course_title'],
+                   'session_title': target['session_title'],
+                   'session_id': target['session_id'],
+                   **_marked_details(SUBMISSION_MANUAL_CODE, recorded_at)})
+
+    except AttendanceRefusal as refusal:
+        return timer.refuse(refusal)
+    except PoolTimeoutError:
+        return _saturated_response(timer, 'attendance')
+    except Exception:
+        db.session.rollback()
+        app.logger.exception('Server error in submit_manual_attendance')
+        return timer.respond('error', 'An unexpected server error occurred. '
+                             'Your attendance was not recorded.',
+                             500, 'server_error')
+    finally:
+        # Give the reserved guess back unless it was a wrong code: a correct
+        # code that then failed the geofence, met a closed class or hit a
+        # busy database is not a guess.
+        if reserved is not None and not keep_as_failure:
+            guard, user_id, session_id = reserved
+            try:
+                guard.refund(user_id, session_id)
+            except GuardUnavailable:
+                runtime_metrics.increment('manual.guard_refund_failed')
 
 
 @app.route('/course/<int:course_id>/attendance')
@@ -6964,7 +7832,8 @@ def view_attendance(course_id):
     for sess in sessions:
         records_by_session[sess.id] = (
             db.session.query(Attendance.id, Attendance.timestamp,
-                             User.full_name, User.matric_no, User.level)
+                             User.full_name, User.matric_no, User.level,
+                             Attendance.submission_method)
             .join(User, User.id == Attendance.student_id)
             .filter(Attendance.session_id == sess.id)
             .order_by(Attendance.timestamp.asc(), Attendance.id.asc())
@@ -7024,7 +7893,8 @@ def session_attendance(session_id):
 
     page = max(1, request.args.get('page', default=1, type=int) or 1)
     pagination = (db.session.query(Attendance.id, Attendance.timestamp,
-                                   User.full_name, User.matric_no, User.level)
+                                   User.full_name, User.matric_no, User.level,
+                                   Attendance.submission_method)
                   .join(User, User.id == Attendance.student_id)
                   .filter(Attendance.session_id == session_id)
                   .order_by(Attendance.timestamp.asc(), Attendance.id.asc())
@@ -7060,6 +7930,15 @@ def _csv_cell(value):
     if text.startswith(_CSV_FORMULA_LEADERS):
         text = "'" + text
     return '"' + text.replace('"', '""') + '"'
+
+
+def _method_label(submission_method):
+    """'QR scan' / 'Manual code', for the people reading the register."""
+    method = submission_method or SUBMISSION_QR
+    return SUBMISSION_METHOD_LABELS.get(method, method)
+
+
+app.jinja_env.filters['attendance_method'] = _method_label
 
 
 class _StreamingCSVBuffer:
@@ -7133,8 +8012,10 @@ def download_csv(course_id):
             # current roster, which is the best evidence available.
             expected_students = list(course.students) if hasattr(course, 'students') else []
 
+        # "Method" is appended last so every column a spreadsheet or script
+        # already reads by position keeps its place.
         csv_data = _StreamingCSVBuffer(
-            "Matric Number,Full Name,Level,Status,Time Scanned,Device ID\n"
+            "Matric Number,Full Name,Level,Status,Time Scanned,Device ID,Method\n"
         )
         listed_ids = set()
         for student in sorted(expected_students,
@@ -7144,9 +8025,11 @@ def download_csv(course_id):
             if rec:
                 time_str = format_local(rec.timestamp, '%Y-%m-%d %I:%M %p') or "N/A"
                 device = rec.device_id or "N/A"
-                row = [student.matric_no, student.full_name, student.level, "Present", time_str, device]
+                row = [student.matric_no, student.full_name, student.level, "Present",
+                       time_str, device, _method_label(rec.submission_method)]
             else:
-                row = [student.matric_no, student.full_name, student.level, "Absent", "-", "-"]
+                row = [student.matric_no, student.full_name, student.level, "Absent",
+                       "-", "-", "-"]
             csv_data += ",".join(_csv_cell(v) for v in row) + "\n"
 
         # Scans from students who were not on that day's roster (kept for the
@@ -7160,7 +8043,8 @@ def download_csv(course_id):
             row = [student.matric_no if student else "UNKNOWN",
                    (student.full_name if student else "Deleted User") + " (not on roster)",
                    student.level if student else "N/A",
-                   "Present", time_str, rec.device_id or "N/A"]
+                   "Present", time_str, rec.device_id or "N/A",
+                   _method_label(rec.submission_method)]
             csv_data += ",".join(_csv_cell(v) for v in row) + "\n"
 
         date_tag = format_local(sess.date_created, '%Y-%m-%d') or "session"
@@ -8156,7 +9040,8 @@ def csrf_error_handler(error):
     """
     if request.endpoint in ('login', 'signup') and request.accept_mimetypes.best == 'application/json':
         return jsonify(outcome='csrf_expired', message='Please reload this page and try again.'), 400
-    if request.path == '/mark_attendance' and request.method == 'POST':
+    if (request.path in ('/mark_attendance', '/api/attendance/manual')
+            and request.method == 'POST'):
         # A scan from a page that outlived its form token: a scanner left
         # open through a long lecture, a dashboard the service worker served
         # from its offline copy, a session store that failed over. The stock
@@ -8346,6 +9231,15 @@ with app.app_context():
         ("attendance", "campos_state", "VARCHAR(10) DEFAULT 'skipped'"),
         ("attendance", "campos_attempts", "INTEGER DEFAULT 0"),
         ("attendance", "campos_next_attempt_at", "TIMESTAMP"),
+        # --- How each attendance was submitted (QR or manual code) ---
+        # Every row that exists before this release was a QR scan, so the
+        # constant DEFAULT is the accurate history, not a placeholder. On
+        # PostgreSQL 11+ adding a NOT NULL column with a constant default is
+        # a catalogue-only change — no table rewrite, no long lock — so this
+        # is safe on a large attendance table and during a rolling deploy:
+        # a worker still running the previous release omits the column and
+        # the server default fills it in.
+        ("attendance", "submission_method", "VARCHAR(20) NOT NULL DEFAULT 'qr'"),
     ]
     database_inspector = inspect(db.engine)
     existing_columns = {

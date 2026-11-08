@@ -117,6 +117,43 @@ All timestamps are stored as UTC and displayed in `SCANMARK_TIMEZONE`
 (`Africa/Lagos` by default). "Today" is a local day, so an evening class near
 midnight is filed on the date the people in the room would name.
 
+## Two ways to mark attendance
+
+Students mark attendance either by **scanning the QR code** on the projector
+or, when their camera cannot read it (broken, blocked, unfocusable, too far
+away), by **typing the eight-digit attendance code** shown beside it
+("Can't scan the QR? Enter this code in ScanMark."). The code rotates every
+minute on the server's clock and is bound to the class session.
+
+Both methods reach the same session through the same checks — enrolment,
+session open, the classroom geofence, admission control — and the same atomic
+insert, so a student has exactly one record per class whichever they use, and
+using one after the other is refused as "already marked". The register records
+which method was used (`attendance.submission_method`), and lecturers see it
+on the session sheet, the live window and the per-session CSV.
+
+Wrong codes are limited per account (never per IP) with an atomic Redis
+reservation taken before the code is compared; if Redis is unavailable, code
+entry fails closed while QR scanning carries on. Ending a class is linearised
+against submissions with a row lock: an attendance counts if and only if it
+commits before End Class does.
+
+| Endpoint | Who | What |
+|---|---|---|
+| `GET /api/session/<id>/manual_code` | the course's teachers | current code, `expires_in_ms` (server clock) |
+| `GET /api/attendance/manual/sessions` | students | their open classes, and whether each is already marked |
+| `POST /api/attendance/manual` | students | `{code, session_id?, lat, lon, accuracy_m, location_age_ms}` |
+
+The algorithm, the acceptance windows and the attempt guard are documented in
+`manual_code.py`; configuration, the security model and failure behaviour in
+the "Manual attendance codes" section of `DEPLOYMENT.md`. Turn the whole
+fallback off with `MANUAL_CODE_ENABLED=false`.
+
+Tests: `test_manual_code.py` (backend; the PostgreSQL race tests run when the
+suite runs against Postgres), `node --test test_manual_code_browser.cjs`
+(page logic), and `e2e/manual_code.e2e.cjs` (Playwright, against a running
+server — see `e2e/README.md`).
+
 ## Event check-in mode
 
 Walk-up check-in for orientations and other events where attendees have no

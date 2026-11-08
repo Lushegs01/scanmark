@@ -3,35 +3,12 @@
 
     const config = window.SCANMARK_SCANNER_CONFIG || {};
 
-    // A stable per-installation identifier, so "this scan came from the same
-    // phone as that one" is answerable. Every scan used to report the literal
-    // string 'browser', which made the column useless for the one thing it is
-    // good for: spotting one device marking six people present.
-    //
-    // NOT a credential. It is client-generated, client-stored and trivially
-    // forged; the server treats it as a diagnostic label and nothing else.
-    // Anything that needs to be true about who scanned comes from the session.
-    const DEVICE_ID_KEY = 'scanmark_device_id';
-
-    function deviceId() {
-        try {
-            let stored = localStorage.getItem(DEVICE_ID_KEY);
-            if (!stored) {
-                stored = (crypto.randomUUID && crypto.randomUUID()) ||
-                    // Older WebViews have getRandomValues without randomUUID.
-                    Array.from(crypto.getRandomValues(new Uint8Array(16)))
-                        .map(b => b.toString(16).padStart(2, '0')).join('');
-                localStorage.setItem(DEVICE_ID_KEY, stored);
-            }
-            return stored;
-        } catch (_) {
-            // Private mode, or storage disabled. Say so rather than inventing
-            // a fresh id per scan, which would look like many devices.
-            return 'unavailable';
-        }
-    }
-
-    const DEVICE_ID = deviceId();
+    // Location, the device label, Retry-After handling and the on-page
+    // counts are shared with the manual attendance code (manual-code.js),
+    // so the two ways of marking attendance cannot drift apart on them.
+    const shared = window.ScanMarkAttendance;
+    if (!shared) return;                  // attendance-common.js did not load
+    const DEVICE_ID = shared.deviceId();
     const analysisCanvas = document.getElementById('processing-canvas');
     if (!analysisCanvas) return;          // a page without the scanner markup
     const context = analysisCanvas.getContext('2d', { willReadFrequently: true });
@@ -94,27 +71,10 @@
 
     // ---- Location ----------------------------------------------------------
     //
-    // How old a fix may be before we look for a better one. Deliberately
-    // tighter than the server's limit, so there is room to get a fresh fix
-    // and still post inside it.
-    const POSITION_MAX_AGE_MS = 10000;
-    // What the SERVER will refuse. Sent by the page; the fallback matches
-    // GEOFENCE_MAX_LOCATION_AGE_MS's own default.
-    const SERVER_MAX_AGE_MS = Number(config.maxLocationAgeMs) > 0
-        ? Number(config.maxLocationAgeMs) : 30000;
-    // The worst accuracy the server accepts. Posting a fix it will refuse
-    // as imprecise is a wasted round trip and a red banner; waiting a few
-    // seconds for the watch to narrow is usually all it takes.
-    const MAX_ACCURACY_M = Number(config.maxLocationAccuracyM) > 0
-        ? Number(config.maxLocationAccuracyM) : 100;
-    // How long a scan waits for a usable fix before it goes with the best
-    // one it has (or explains why there is none).
-    const LOCATION_BUDGET_MS = 12000;
-    // A high-accuracy watch indoors can go quiet for a long time while it
-    // hunts for satellites. The network (Wi-Fi/cell) position answers in
-    // about a second and, inside a building with Wi-Fi, is often the more
-    // accurate of the two. Asked for after this long without any fix.
-    const NETWORK_FIX_AFTER_MS = 3000;
+    // How a fix is chosen (fresh enough, precise enough, the best of the last
+    // few seconds rather than merely the latest) lives in
+    // attendance-common.js; see createLocator below.
+    //
     // Automatic goes at a fresh fix after the server said this one was too
     // far, too vague or too old. Indoor fixes drift: the next reading is
     // often 30-60m closer to the truth, and asking the student to tap again
@@ -316,189 +276,31 @@
 
     // ---- Location ----------------------------------------------------------
 
-    const fixes = [];
-    let fixWaiters = [];
-    let watchId = null;
-    let lastLocationError = null;
-    let networkFixTimer = null;
+    // The server's own limits, so the page cannot enforce a different rule
+    // than the one that will judge the scan.
+    const locator = shared.createLocator({
+        maxLocationAgeMs: config.maxLocationAgeMs,
+        maxLocationAccuracyM: config.maxLocationAccuracyM,
+        retryHint: 'scan again'
+    });
 
     /**
-     * A problem with the fix itself, not with the network.
-     *
-     * Retrying it immediately gets the same cached fix, so these are handed
-     * back to the student with the reason rather than swallowed by the
-     * transient-retry path — which is what used to happen to a GPS permission
-     * denial, reported as "Network busy" while the network was fine.
-     */
-    function locationError(message) {
-        const error = new Error(message);
-        error.locationProblem = true;
-        return error;
-    }
-
-    function positionAge(position) {
-        // Clock skew between the fix's stamp and now can read negative; the
-        // server floors it at zero, so judge it the same way here.
-        return Math.max(0, Date.now() - position.timestamp);
-    }
-
-    function describeLocationError(error) {
-        // Three different problems with three different fixes. All three
-        // used to read "Allow GPS access" — including a timeout indoors,
-        // where permission was granted and the student could do nothing
-        // about the message they were given.
-        if (error && error.code === 1) {
-            return 'Location permission is off for this site. Allow location ' +
-                '(precise) in your browser settings, then scan again.';
-        }
-        if (error && error.code === 2) {
-            return 'Your phone could not work out where it is. Turn on Location ' +
-                '(GPS) in your phone settings, then scan again.';
-        }
-        return 'Could not get a location fix in time. Step towards a window or ' +
-            'doorway for a moment, then scan again.';
-    }
-
-    function noteFix(position) {
-        lastLocationError = null;
-        fixes.push(position);
-        // Nothing older than the server will accept is worth keeping.
-        while (fixes.length && (fixes.length > 20 || positionAge(fixes[0]) > SERVER_MAX_AGE_MS)) {
-            fixes.shift();
-        }
-        const waiters = fixWaiters;
-        fixWaiters = [];
-        waiters.forEach(resolve => resolve());
-    }
-
-    function nextFix(timeoutMs) {
-        return new Promise(resolve => {
-            fixWaiters.push(resolve);
-            setTimeout(resolve, timeoutMs);
-        });
-    }
-
-    /**
-     * The most precise recent fix, not merely the latest.
-     *
-     * A watch reports a coarse network position first and narrows from
-     * there, and indoors it wanders: one reading ±15m, the next ±60m. Taking
-     * whichever arrived last meant a scan could carry the worst reading of
-     * the last ten seconds — and be told the student was too far away.
-     */
-    function bestFix(newerThan) {
-        let best = null;
-        for (const position of fixes) {
-            if (positionAge(position) > POSITION_MAX_AGE_MS) continue;
-            if (newerThan && position.timestamp <= newerThan) continue;
-            if (!best || position.coords.accuracy < best.coords.accuracy - 1
-                || (Math.abs(position.coords.accuracy - best.coords.accuracy) <= 1
-                    && position.timestamp > best.timestamp)) {
-                best = position;
-            }
-        }
-        return best;
-    }
-
-    function requestPosition(maximumAge, highAccuracy) {
-        return new Promise((resolve, reject) => {
-            if (!navigator.geolocation) {
-                reject(locationError('Geolocation is not supported by this browser.'));
-                return;
-            }
-            navigator.geolocation.getCurrentPosition(
-                position => {
-                    noteFix(position);
-                    resolve(position);
-                },
-                error => {
-                    lastLocationError = error;
-                    reject(locationError(describeLocationError(error)));
-                },
-                { enableHighAccuracy: highAccuracy !== false, timeout: 10000, maximumAge: maximumAge }
-            );
-        });
-    }
-
-    /**
-     * Keep a fix arriving while the camera is open.
-     *
-     * A position fetched only at the moment of a scan is the slowest possible
-     * way to get one: the GPS is cold exactly when the student is waiting.
-     * Watching from camera start means there is usually a recent fix in hand
-     * before the code is even read.
+     * Keep a fix arriving while the camera is open: a position fetched only
+     * at the moment of a scan is the slowest possible way to get one.
      */
     function startWatchingLocation() {
-        if (!navigator.geolocation || watchId !== null) return;
-        watchId = navigator.geolocation.watchPosition(
-            noteFix,
-            // A watch reports errors as they happen and keeps going; only a
-            // denial is final. Waiters are woken so a denial is reported now
-            // rather than at the end of the budget.
-            error => {
-                lastLocationError = error;
-                if (error.code === 1) {
-                    const waiters = fixWaiters;
-                    fixWaiters = [];
-                    waiters.forEach(resolve => resolve());
-                }
-            },
-            { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
-        );
-        clearTimeout(networkFixTimer);
-        networkFixTimer = setTimeout(() => {
-            if (watchId !== null && !bestFix()) {
-                requestPosition(POSITION_MAX_AGE_MS, false).catch(() => {});
-            }
-        }, NETWORK_FIX_AFTER_MS);
+        locator.startWatching();
     }
 
     function stopWatchingLocation() {
-        clearTimeout(networkFixTimer);
-        if (watchId === null) return;
-        navigator.geolocation.clearWatch(watchId);
-        watchId = null;
+        locator.stopWatching();
     }
 
-    /**
-     * A fix the server will accept, or an error saying why there is none.
-     *
-     * maximumAge is a hint, not a promise: Android's fused provider hands
-     * back a last-known location — minutes or hours old — whenever it cannot
-     * get a fresh one, typically indoors, which is exactly where a lecture
-     * happens. Fixes older than the server allows are never chosen; when
-     * nothing usable has arrived halfway through the budget, one fresh
-     * reading is forced with maximumAge: 0.
-     */
-    async function acquirePosition(newerThan) {
-        if (!navigator.geolocation) {
-            throw locationError('Geolocation is not supported by this browser.');
-        }
-        startWatchingLocation();
-        const started = performance.now();
-        let forced = false;
-        for (;;) {
-            const best = bestFix(newerThan);
-            if (best && best.coords.accuracy <= MAX_ACCURACY_M) return best;
-            if (lastLocationError && lastLocationError.code === 1) {
-                throw locationError(describeLocationError(lastLocationError));
-            }
-            const waited = performance.now() - started;
-            if (waited >= LOCATION_BUDGET_MS) break;
-            status(best
-                ? `Sharpening your location (±${Math.round(best.coords.accuracy)}m)...`
-                : 'Finding your location...', 'scanning');
-            if (!forced && waited >= LOCATION_BUDGET_MS / 2) {
-                forced = true;
-                requestPosition(0).catch(() => {});
-            }
-            await nextFix(Math.min(1000, LOCATION_BUDGET_MS - waited));
-        }
-        // Out of time. The best reading there is still goes, and the server
-        // explains in its own words if it is not good enough.
-        const best = bestFix(newerThan);
-        if (best) return best;
-        throw locationError(describeLocationError(lastLocationError));
+    /** A fix the server will accept, or an error saying why there is none. */
+    function acquirePosition(newerThan) {
+        return locator.acquire(newerThan, best => status(best
+            ? `Sharpening your location (±${Math.round(best.coords.accuracy)}m)...`
+            : 'Finding your location...', 'scanning'));
     }
 
     function applyCameraSettings() {
@@ -645,7 +447,26 @@
         } catch (error) {
             if (generation !== cameraGeneration) return;
             stopScanner();
-            result(`Camera error: ${error.message || error}`, 'danger');
+            // No camera, no permission, or no usable one. The attendance code
+            // needs none of those, so point the student straight at it.
+            const hasCodeEntry = Boolean(document.getElementById('manualCodeInput'));
+            result(`Camera error: ${error.message || error}` +
+                   (hasCodeEntry ? ' You can enter the attendance code instead.' : ''),
+                   'danger');
+            window.dispatchEvent(new CustomEvent('scanmark:camera-unavailable'));
+        }
+    }
+
+    /** Leave the camera for the typed attendance code. */
+    function switchToManualCode() {
+        closeScanner();
+        const input = document.getElementById('manualCodeInput');
+        if (input) {
+            const card = document.getElementById('attendance-code') || input;
+            card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            input.focus({ preventScroll: true });
+        } else if (config.manualCodeUrl) {
+            window.location.href = config.manualCodeUrl;
         }
     }
 
@@ -1349,16 +1170,7 @@
      * tight loop.
      */
     function serverRetryDelay(response) {
-        const header = response && response.headers
-            ? response.headers.get('Retry-After') : null;
-        if (!header) return null;
-        const seconds = Number(header);
-        if (!Number.isFinite(seconds) || seconds < 0) return null;
-        const clamped = Math.min(30, seconds) * 1000;
-        // Jitter even the server's number. Every phone in the room was shed
-        // by the same response and would otherwise come back in the same
-        // millisecond.
-        return Math.max(250, Math.floor(clamped * (0.75 + Math.random() * 0.5)));
+        return shared.serverRetryDelay(response);
     }
 
     /**
@@ -1527,38 +1339,8 @@
         abandon(`${message} Tap the scan button to try again.`, 'danger');
     }
 
-    /**
-     * Show the new count straight away instead of reloading the page for it.
-     * Rows carry their numbers as data attributes; anything else is left as
-     * the server rendered it.
-     */
-    function bumpAttendance(courseCode) {
-        if (!courseCode) return;
-        document.querySelectorAll('[data-attended-for]').forEach(cell => {
-            if (cell.getAttribute('data-attended-for') !== courseCode) return;
-            const attended = Number(cell.getAttribute('data-attended')) + 1;
-            const total = Number(cell.getAttribute('data-total')) || 0;
-            cell.setAttribute('data-attended', String(attended));
-            cell.textContent = total ? `${attended} / ${total}` : String(attended);
-            const row = cell.closest('tr');
-            const badge = row && row.querySelector('[data-pct-badge]');
-            if (badge && total) {
-                const pct = Math.min(100, Math.round(attended / total * 100));
-                const onTrack = pct >= (Number(badge.getAttribute('data-threshold')) || 0);
-                badge.textContent = `${pct}% · ${onTrack ? 'On Track' : 'At Risk'}`;
-                const pill = badge.parentElement;
-                if (pill) {
-                    pill.classList.toggle('bg-danger', !onTrack);
-                    pill.style.background = onTrack ? 'rgba(0,90,43,0.12)' : '';
-                    pill.style.color = onTrack ? 'var(--green)' : '';
-                }
-            }
-        });
-        const totalAttended = document.querySelector('[data-total-attended]');
-        if (totalAttended) {
-            totalAttended.textContent = String(Number(totalAttended.textContent) + 1);
-        }
-    }
+    /** Show the new count straight away instead of reloading the page. */
+    const bumpAttendance = shared.bumpAttendance;
 
     function nudgeFocus() {
         // Only while the hunt is struggling. Re-applying continuous focus
@@ -1597,6 +1379,8 @@
     });
 
     focusButton.addEventListener('click', triggerFocus);
+    const manualCodeButton = document.getElementById('manual-code-btn');
+    if (manualCodeButton) manualCodeButton.addEventListener('click', switchToManualCode);
     window.addEventListener('pagehide', stopScanner);
     // The radio came back: do not sit out the rest of a backoff.
     window.addEventListener('online', () => {

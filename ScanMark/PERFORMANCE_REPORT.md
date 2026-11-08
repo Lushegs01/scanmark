@@ -1,4 +1,138 @@
-# ScanMark performance report — the student journey on a bad network
+# ScanMark performance report — the manual attendance code
+
+Date: 2026-11-07
+
+This round adds the eight-digit attendance code (the fallback for students
+whose camera cannot read the QR) and makes End Class linearizable with
+attendance inserts. The questions for capacity were: what does a typed code
+cost compared with a scan, does a hall mixing the two behave, did the QR path
+regress, and does "500 students mark attendance within 30–90 seconds" hold.
+
+## How this was measured
+
+`loadtest/scan_burst.py`, extended with `--mode qr|manual|mixed`,
+`--arrival-seconds` (spread a class over a lecture rather than one instant) and
+`--resource-out` (server CPU/RSS, Postgres connections from
+`pg_stat_activity`, Redis per-command cost from `INFO commandstats`, for the
+burst window only). Cohorts from `loadtest/seed_burst.py`; a fresh class
+session per run; every run verified against the database (every student
+exactly once, no duplicates, none missing) — "PASS" below means all of that
+held and every request answered 200.
+
+The server ran the **production startup path** (no declared environment:
+PostgreSQL 16, Redis 7, rate limiter on, secure cookies — the harness's
+`--proxied-https` stands where the TLS-terminating load balancer would) with
+the shipped gunicorn defaults: 8 workers × 2 threads, pool 3+2 per worker.
+App, Postgres, Redis **and the load generator** shared one 4-vCPU, 16 GB box,
+on loopback. "Before" is the previous release (`cf8bc18`) on the same box,
+same database, same settings, run in the same sitting.
+
+**What this cannot tell you.** Loopback has no network latency and no TLS;
+the load generator competes with the server for the same four cores, which is
+most of the client-side queueing below; one box is not a fleet. These numbers
+compare versions and methods under identical conditions — they are not a
+capacity figure for any production plan (the Render free plan in
+`DEPLOYMENT.md` has 0.1 CPU). Re-run the matrix on the real staging instance
+before relying on a number for a real lecture.
+
+## Results — simultaneous bursts (the whole class in one instant)
+
+Server = sum of the app's own per-stage timings (Server-Timing), excluding
+queueing in front of it. Client = what each simulated phone waited.
+
+| Run | Students | Wall | Req/s | Server p50 / p95 / p99 ms | Client p50 / p95 / p99 ms | Rows / dup / missing |
+|---|---:|---:|---:|---|---|---|
+| before · QR | 100 | 0.29 s | 340 | 8.6 / 25.1 / 36.3 | 145 / 222 / 240 | 100 / 0 / 0 |
+| before · QR | 500 | 1.19 s | 419 | 10.6 / 22.4 / 29.5 | 606 / 917 / 940 | 500 / 0 / 0 |
+| before · QR | 1,000 | 2.60 s | 385 | 11.7 / 23.1 / 29.9 | 1,204 / 1,922 / 2,029 | 1,000 / 0 / 0 |
+| before · QR (run 1) | 2,000 | 5.00 s | 400 | 11.0 / 22.6 / 29.3 | 2,467 / 3,649 / 3,797 | 2,000 / 0 / 0 |
+| before · QR (run 2) | 2,000 | 4.72 s | 424 | 11.3 / 21.6 / 27.9 | 2,480 / 3,562 / 3,713 | 2,000 / 0 / 0 |
+| after · QR | 100 | 0.27 s | 374 | 8.2 / 27.9 / 35.6 | 152 / 197 / 204 | 100 / 0 / 0 |
+| after · QR | 500 | 1.15 s | 435 | 8.7 / 19.7 / 30.3 | 558 / 875 / 911 | 500 / 0 / 0 |
+| after · QR | 1,000 | 2.28 s | 438 | 9.5 / 20.0 / 24.0 | 1,090 / 1,694 / 1,768 | 1,000 / 0 / 0 |
+| after · QR (run 1) | 2,000 | 4.97 s | 403 | 10.5 / 22.1 / 27.3 | 2,476 / 3,647 / 3,752 | 2,000 / 0 / 0 |
+| after · QR (run 2) | 2,000 | 5.43 s | 369 | 10.6 / 21.7 / 29.2 | 2,374 / 4,082 / 4,335 | 2,000 / 0 / 0 |
+| after · code | 100 | 0.36 s | 280 | 9.2 / 21.4 / 30.9 | 153 / 265 / 286 | 100 / 0 / 0 |
+| after · code | 500 | 1.32 s | 380 | 12.7 / 22.6 / 28.4 | 659 / 1,024 / 1,060 | 500 / 0 / 0 |
+| after · code | 1,000 | 2.72 s | 368 | 11.2 / 24.7 / 36.8 | 1,227 / 2,020 / 2,175 | 1,000 / 0 / 0 |
+| after · code (run 1) | 2,000 | 5.58 s | 358 | 13.5 / 26.3 / 33.7 | 2,827 / 4,199 / 4,354 | 2,000 / 0 / 0 |
+| after · code (run 2) | 2,000 | 5.34 s | 375 | 13.0 / 23.7 / 30.0 | 2,541 / 3,966 / 4,265 | 2,000 / 0 / 0 |
+| after · 50% code | 500 | 1.33 s | 375 | 11.0 / 24.4 / 32.5 | 699 / 998 / 1,050 | 500 / 0 / 0 |
+| after · 50% code | 1,000 | 2.50 s | 400 | 10.7 / 22.6 / 27.7 | 1,178 / 1,770 / 1,868 | 1,000 / 0 / 0 |
+| after · 50% code | 2,000 | 5.43 s | 368 | 11.9 / 24.4 / 30.4 | 2,741 / 3,937 / 4,181 | 2,000 / 0 / 0 |
+| after · 10% code | 2,000 | 4.99 s | 401 | 11.7 / 23.0 / 29.2 | 2,443 / 3,713 / 3,925 | 2,000 / 0 / 0 |
+
+Every one of the 19 runs passed: 22,300 submissions, every record present
+exactly once. (The "after" rows are the final code; an earlier pass before the
+insert-statement fix below also passed all 14 of its runs, and the two
+lecture-spread runs below passed too.)
+
+Server resources over the burst window (2,000 students): gunicorn CPU
+9.2–9.8 s for QR (before: 9.3–9.8 s) and 10.0–11.0 s for codes; Postgres
+2.5–2.8 s (codes 2.8–3.4 s); Redis 0.3 s (codes 0.5 s). Peak gunicorn RSS
+across 8 workers 866–892 MB in every run, before and after — the feature
+adds no measurable memory. Peak Postgres connections 17–18 (the configured
+pools), peak simultaneously active ≤ 14 at the 0.25 s sampling interval.
+
+## Results — the acceptance scenario (a class arriving over a lecture)
+
+| Run | Students | Arrivals over | Client p50 / p95 / p99 ms | Server p50 / p95 ms | Recorded |
+|---|---:|---:|---|---|---|
+| code only | 500 | 30 s | 12.9 / 16.1 / 18.5 | 5.4 / 6.9 | 500 / 500, 0 dup |
+| 50% code, 50% QR | 500 | 90 s | 12.9 / 15.9 / 19.2 | 5.1 / 6.6 | 500 / 500, 0 dup |
+
+The 90-second run spans a code rotation: phones type whatever the projector
+shows when they reach it, and nobody was refused. (A first 90-second run
+reported 123 QR refusals, "QR code has expired". That was the harness, not
+the server: in spread mode its QR phones still sent the token minted at the
+start, which the server correctly refuses after `QR_CODE_WINDOW`, 45 s. The
+harness now has each phone read the code projected when it arrives; the row
+above is the re-run.) At this arrival rate (6–17
+requests a second) the server is idle most of the time; the burst table above
+is the stress case.
+
+## What the code costs, and the QR path
+
+* **Verification itself** (`ManualCodeGenerator.verify`, five HMAC-SHA256
+  derivations and constant-time compares): 17 µs p50, identical for right and
+  wrong codes. The projector's `window()` is 7 µs.
+* **The wrong-guess guard**: two Redis script calls (reserve before the
+  compare, refund after) — 0.18 ms p50 together on loopback, 29 µs of Redis
+  CPU per call (`INFO commandstats`).
+* **Per request in a 2,000 burst**: the code path's server p50 is 2.5–3 ms
+  above QR's (13.0–13.5 vs 10.5–10.6 ms) and its app CPU about 10% higher —
+  the guard, its own request limiter and a target query that also answers
+  "already marked?". p95 stays within 2–4 ms of QR's.
+* **The QR path did not regress.** Server p50/p95 at 2,000: before
+  11.0–11.3 / 21.6–22.6 ms, after 10.5–10.6 / 21.7–22.1 ms. Throughput
+  differences at every size go both ways between runs (±8%); on this shared
+  box that is noise.
+
+One regression was found and fixed on the way. The new conditional insert
+(`INSERT … SELECT … FOR KEY SHARE … ON CONFLICT`, which is what lets End Class
+and attendance agree on who got in) first measured 0.55–0.65 ms slower than
+the old `INSERT … VALUES` per sequential insert, and 2 ms slower at server p50
+under a 2,000 burst. 0.13 ms of that was rebuilding the statement object on
+every request; building it once with bind parameters
+(`_attendance_insert_statement`) brought the sequential cost to parity
+(3.07 ms vs 3.06–3.30 ms, commit included) — the row lock itself is free,
+because the attendance→class_session foreign key already took the same lock
+on every insert.
+
+## Remaining, honestly
+
+* All figures are one 4-vCPU box with the load generator on it. A staging
+  run on the production plan, through the real proxy and TLS, is still the
+  gate before quoting any of these as capacity.
+* Real phones were not available: typing time, keyboard behaviour and GPS
+  acquisition on low-end Android are argued from the code and exercised in
+  headless Chromium (`e2e/manual_code.e2e.cjs`), not measured on devices.
+* End Class under a burst waits for in-flight inserts. Measured in the
+  PostgreSQL race test at milliseconds; a pathological backlog is bounded by
+  `SESSION_CLOSE_LOCK_TIMEOUT_MS` (the lecturer is asked to press it again).
+
+
+# Earlier round — the student journey on a bad network
 
 Date: 2026-11-04
 
