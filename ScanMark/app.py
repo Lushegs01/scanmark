@@ -3793,7 +3793,8 @@ def normalize_matric(raw):
 def complete_profile():
     """
     Fill in the student details a CampOS launch or a Google sign-in did not
-    carry. Students only — nothing else on a staff account uses these fields,
+    carry, and afterwards edit them: the student's name in the navbar links
+    here. Students only — nothing else on a staff account uses these fields,
     and a staff member who submits here would take a matric number out of
     circulation for the student it belongs to.
     """
@@ -3805,7 +3806,8 @@ def complete_profile():
     # student can correct a mistyped matric number themselves, which is what
     # the "already registered" refusals tell them to do.
     editing = bool(current_user.matric_no and current_user.level)
-    form = {'matric_no': current_user.matric_no or '',
+    form = {'full_name': current_user.full_name or '',
+            'matric_no': current_user.matric_no or '',
             'level': current_user.level or ''}
 
     def render(status=200):
@@ -3813,11 +3815,20 @@ def complete_profile():
                                editing=editing, form=form), status
 
     if request.method == 'POST':
-        form = {'matric_no': (request.form.get('matric_no') or '').strip()[:25],
+        # A form without the field (one cached from before it existed) keeps
+        # the current name rather than blanking it.
+        submitted_name = request.form.get('full_name')
+        form = {'full_name': (current_user.full_name or '' if submitted_name is None
+                              else ' '.join(submitted_name.split())[:100]),
+                'matric_no': (request.form.get('matric_no') or '').strip()[:25],
                 'level': (request.form.get('level') or '').strip()}
+        full_name = form['full_name']
         matric_no = normalize_matric(form['matric_no'])
         level = form['level']
 
+        if len(full_name) < 2:
+            flash("Enter your full name.", "danger")
+            return render(400)
         if not matric_no:
             flash("Enter a valid matric number (4-20 letters and digits).", "danger")
             return render(400)
@@ -3830,6 +3841,7 @@ def complete_profile():
         # cannot raise the unique-constraint error outside the handler.
         courses = (list(current_user.enrolled_courses)
                    if old_matric != matric_no else [])
+        current_user.full_name = full_name
         current_user.matric_no = matric_no
         current_user.level = level
         try:
@@ -4989,8 +5001,8 @@ def register_course():
                     current_user.id, course.institution)
                 flash("Your matric number is already registered at the "
                       "institution that runs this course. If you typed it "
-                      "wrong, correct it with Edit profile in the menu at the "
-                      "top of this page; otherwise contact your department.",
+                      "wrong, tap your name at the top of this page to correct "
+                      "it; otherwise contact your department.",
                       "danger")
                 return redirect(url_for('student_dashboard'))
 

@@ -961,14 +961,18 @@ class TestCompleteProfile:
         assert 'Edit profile' in page
         assert '20200001' in page
 
-    def test_edit_profile_sits_in_the_navbar_beside_logout(self, appmod, seed, login):
-        """In the hamburger menu, so it is reachable from every page."""
+    def test_the_students_name_in_the_navbar_opens_the_profile(self, appmod, seed, login):
+        """Tapping your name is how you edit your profile, on a phone too."""
         kemi = login(seed['student_email'])
         page = kemi.get('/student_dashboard').get_data(as_text=True)
         nav = page[page.index('id="navbarNav"'):page.index('</nav>')]
-        assert 'href="/complete_profile"' in nav
-        assert 'fa-user-pen' in nav
-        assert nav.index('/complete_profile') < nav.index('/logout')
+        link = nav[nav.index('<a class="nav-link nav-greeting nav-profile"'):]
+        link = link[:link.index('</a>')]
+        assert 'href="/complete_profile"' in link
+        assert 'Kemi Student' in link
+        assert 'fa-user-circle' in link
+        assert 'd-none' not in link          # visible in the phone menu
+        assert 'fa-user-pen' not in nav      # no separate icon any more
 
     def test_staff_do_not_get_an_edit_profile_link(self, appmod, seed, login):
         """/complete_profile refuses every role but student."""
@@ -996,6 +1000,48 @@ class TestCompleteProfile:
             kemi_row = db.session.get(User, seed['student_id'])
             assert kemi_row.matric_no == '20200011'
             assert kemi_row.level == '400'
+
+    def test_a_student_can_change_their_name(self, appmod, seed, login):
+        from models import db, User
+
+        kemi = login(seed['student_email'])
+        response = kemi.post('/complete_profile',
+                             data={'full_name': '  Kemi   Adebayo ',
+                                   'matric_no': '20200001', 'level': '300'},
+                             follow_redirects=True)
+        assert response.status_code == 200
+        assert 'Kemi Adebayo' in response.get_data(as_text=True)
+        with appmod.app.app_context():
+            assert db.session.get(User, seed['student_id']).full_name == 'Kemi Adebayo'
+
+    def test_a_blank_name_is_refused(self, appmod, seed, login):
+        from models import db, User
+
+        kemi = login(seed['student_email'])
+        response = kemi.post('/complete_profile',
+                             data={'full_name': '   ', 'matric_no': '20200001',
+                                   'level': '300'})
+        assert response.status_code == 400
+        assert 'Enter your full name' in response.get_data(as_text=True)
+        with appmod.app.app_context():
+            assert db.session.get(User, seed['student_id']).full_name == 'Kemi Student'
+
+    def test_the_profile_form_has_the_name_and_the_app_shell(self, appmod, seed, login):
+        kemi = login(seed['student_email'])
+        page = kemi.get('/complete_profile').get_data(as_text=True)
+        assert 'name="full_name"' in page
+        assert 'value="Kemi Student"' in page
+        assert 'navbar-custom' in page       # rendered inside base.html
+        assert 'page-title' in page
+
+    def test_a_refused_edit_is_shown_as_an_error(self, appmod, seed, login):
+        """Flashes in the 'danger' category used to render as green success."""
+        kemi = login(seed['student_email'])
+        page = kemi.post('/complete_profile',
+                         data={'matric_no': '20200002', 'level': '300'}
+                         ).get_data(as_text=True)
+        assert 'class="alert alert-danger alert-dismissible' in page
+        assert 'class="alert alert-success alert-dismissible' not in page
 
     def test_a_refused_edit_keeps_what_was_typed(self, appmod, seed, login):
         from models import db, User

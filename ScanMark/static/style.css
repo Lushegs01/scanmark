@@ -161,6 +161,33 @@ h1, h2, h3, h4, h5, h6 { font-weight: 700; }
   font-weight: 400;
 }
 
+/* A student's name links to their profile: give it a pill so it reads as
+   tappable, in the phone menu and on desktop. */
+.nav-profile {
+  display: inline-flex !important;
+  align-items: center;
+  background: rgba(255,255,255,0.08);
+  border-radius: 20px;
+  padding: 6px 14px !important;
+  color: rgba(255,255,255,0.9) !important;
+  font-weight: 500;
+}
+.nav-profile:hover, .nav-profile:focus-visible {
+  background: rgba(255,215,0,0.15);
+  color: var(--gold) !important;
+}
+
+/* --- PROFILE PAGE --- */
+.profile-wrap { max-width: 640px; }
+.stat-icon.profile-avatar {
+  background: linear-gradient(135deg, var(--green), var(--green-mid));
+  color: white;
+  font-size: 1.4rem;
+}
+.profile-cancel { color: var(--text-muted); text-decoration: none; }
+.profile-cancel:hover { color: var(--green); }
+.min-w-0 { min-width: 0; }
+
 /* --- GLASS CARD --- */
 .glass-card {
   background: var(--surface);
